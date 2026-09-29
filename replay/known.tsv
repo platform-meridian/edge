@@ -1,0 +1,4 @@
+# Differences between edge-state and etcd (the pinned etcd in conformance/gate_test.go)
+# that are understood and accepted.
+# method suffix<TAB>normalised path (regexp, whole path)<TAB>why
+Cluster/MemberList	\.resp\.header\.revision	etcd leaves the revision out of MemberList headers; edge-state sends the current one

@@ -1,0 +1,27 @@
+# Repairs image layers a power cut truncated, before the kubelet starts. Needs
+# containerd's discard_unpacked_layers off, or there is no blob to repair from.
+name: edge-layers
+depends:
+  # containerd's root on EPHEMERAL: the path does not exist until it is mounted.
+  - path: /var/lib/containerd
+# A one-shot: non-zero only when a repair failed, usually on a blob still being written.
+restart: untilSuccess
+container:
+  entrypoint: /edge-layers
+  args:
+    - repair
+  mounts:
+    # rshared: a repaired file must land on the host's mount.
+    - source: /var/lib
+      destination: /var/lib
+      type: bind
+      options: [bind, rshared, rw]
+    # Talos's own images' blobs survive only in the image cache.
+    - source: /system/imagecache
+      destination: /system/imagecache
+      type: bind
+      options: [rbind, rslave, ro]
+  security:
+    writeableRootfs: false
+    writeableSysfs: false
+    rootfsPropagation: shared

@@ -1,0 +1,85 @@
+// The corner of the CRI runtime service (kubernetes/cri-api
+// pkg/apis/runtime/v1/api.proto) that edge-scope uses: list, stop, remove.
+// Names and field numbers are the upstream ones, so it is the same wire
+// protocol; fields left out are skipped by the decoder, and requests without
+// a filter list everything.
+syntax = "proto3";
+
+package runtime.v1;
+
+service RuntimeService {
+    rpc StopPodSandbox(StopPodSandboxRequest) returns (StopPodSandboxResponse) {}
+    rpc RemovePodSandbox(RemovePodSandboxRequest) returns (RemovePodSandboxResponse) {}
+    rpc ListPodSandbox(ListPodSandboxRequest) returns (ListPodSandboxResponse) {}
+    rpc RemoveContainer(RemoveContainerRequest) returns (RemoveContainerResponse) {}
+    rpc ListContainers(ListContainersRequest) returns (ListContainersResponse) {}
+}
+
+message PodSandboxMetadata {
+    string name = 1;
+    string uid = 2;
+    string namespace = 3;
+    uint32 attempt = 4;
+}
+
+enum PodSandboxState {
+    SANDBOX_READY    = 0;
+    SANDBOX_NOTREADY = 1;
+}
+
+message PodSandbox {
+    string id = 1;
+    PodSandboxMetadata metadata = 2;
+    PodSandboxState state = 3;
+    int64 created_at = 4;
+}
+
+message ListPodSandboxRequest {}
+
+message ListPodSandboxResponse {
+    repeated PodSandbox items = 1;
+}
+
+message StopPodSandboxRequest {
+    string pod_sandbox_id = 1;
+}
+
+message StopPodSandboxResponse {}
+
+message RemovePodSandboxRequest {
+    string pod_sandbox_id = 1;
+}
+
+message RemovePodSandboxResponse {}
+
+message ContainerMetadata {
+    string name = 1;
+    uint32 attempt = 2;
+}
+
+enum ContainerState {
+    CONTAINER_CREATED = 0;
+    CONTAINER_RUNNING = 1;
+    CONTAINER_EXITED  = 2;
+    CONTAINER_UNKNOWN = 3;
+}
+
+message Container {
+    string id = 1;
+    string pod_sandbox_id = 2;
+    ContainerMetadata metadata = 3;
+    ContainerState state = 6;
+    int64 created_at = 7;
+}
+
+message ListContainersRequest {}
+
+message ListContainersResponse {
+    repeated Container containers = 1;
+}
+
+message RemoveContainerRequest {
+    string container_id = 1;
+}
+
+message RemoveContainerResponse {}

@@ -1,0 +1,23 @@
+[package]
+name = "edge-gateway-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[workspace]
+
+[[bin]]
+name = "path_canonical"
+path = "fuzz_targets/path_canonical.rs"
+test = false
+doc = false
+bench = false

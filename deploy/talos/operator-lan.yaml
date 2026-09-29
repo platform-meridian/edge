@@ -1,0 +1,12 @@
+# An extension service, so it is up whatever state Kubernetes is in. Its
+# ExtensionServiceConfig supplies EDGE_DHCP_ADDR (address/prefix) and
+# EDGE_DHCP_DOMAIN; machined grants the host network and binding :53 and :67.
+name: operator-lan
+depends:
+  - configuration: true
+restart: always
+container:
+  entrypoint: /edge-dhcp
+  security:
+    writeableRootfs: false
+    writeableSysfs: false

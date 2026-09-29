@@ -1,0 +1,23 @@
+[package]
+name = "edge-idle"
+version.workspace = true
+description = "Meridian Edge: throttles the control plane while the cluster is idle"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time"] }
+edge-common = { path = "../edge-common" }
+edge-kube = { path = "../edge-kube" }
+futures.workspace = true
+rustls.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
+serde = { workspace = true }
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+nix.workspace = true

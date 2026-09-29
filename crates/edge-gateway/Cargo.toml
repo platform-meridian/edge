@@ -1,0 +1,38 @@
+[package]
+name = "edge-gateway"
+version.workspace = true
+description = "Meridian Edge: fail-closed Gateway API ingress"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edge-common = { path = "../edge-common" }
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+tonic.workspace = true
+envoy-types.workspace = true
+http.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types = { version = "1", features = ["std"] }
+kube.workspace = true
+k8s-openapi.workspace = true
+futures.workspace = true
+arc-swap.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+rcgen = "0.14"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }

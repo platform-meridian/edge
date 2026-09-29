@@ -1,0 +1,16 @@
+[package]
+name = "edge-kube"
+version.workspace = true
+description = "Meridian Edge: shared Service, EndpointSlice and NetworkPolicy view"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+edge-common = { path = "../edge-common" }
+futures.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+tracing.workspace = true

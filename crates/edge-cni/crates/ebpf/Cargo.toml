@@ -1,0 +1,19 @@
+[package]
+name = "edge-cni-ebpf"
+version = "0.1.0"
+description = "Meridian Edge: edge-cni's BPF programs"
+publish = false
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+aya-ebpf = "0.2"
+edge-cni-common = { path = "../common" }
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = 2
+
+[workspace]

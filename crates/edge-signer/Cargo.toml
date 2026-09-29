@@ -1,0 +1,33 @@
+[package]
+name = "edge-signer"
+version.workspace = true
+description = "Meridian Edge: pod certificate signer"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edge-common = { path = "../edge-common" }
+edge-kube = { path = "../edge-kube" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time"] }
+futures.workspace = true
+rustls.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+nix = { workspace = true, features = ["time"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+time = "0.3"
+x509-parser = "0.18"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true

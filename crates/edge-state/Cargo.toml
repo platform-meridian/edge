@@ -1,0 +1,29 @@
+[package]
+name = "edge-state"
+version.workspace = true
+description = "Meridian Edge: power-cut-safe etcd v3 store with revision history"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edge-common = { path = "../edge-common" }
+anyhow.workspace = true
+crc32fast.workspace = true
+libc = "0.2"
+tonic = { workspace = true, features = ["tls-ring"] }
+tonic-prost.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing.workspace = true
+tokio-stream = "0.1"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }

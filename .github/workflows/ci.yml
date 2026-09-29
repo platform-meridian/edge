@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: kubectl kustomize deploy > /dev/null
+      - run: sudo apt-get install -y dhcpcd-base uidmap
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: actions-rust-lang/rustfmt@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker@0.11.1,cargo-nextest
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo nextest run --locked
+      - run: cargo nextest run --locked --run-ignored only -E 'package(edge-cni)'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [TestAPIServer, TestRobustness/edge-state, TestReplay]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: conformance/go.mod
+          cache-dependency-path: "**/go.sum"
+      - run: go test -timeout 0 -run '${{ matrix.gate }}' .
+        working-directory: conformance
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: crates/edge-state, target: record_decode }
+          - { dir: crates/edge-state, target: entry_decode }
+          - { dir: crates/edge-gateway, target: path_canonical }
+          - { dir: crates/edge-dns, target: request }
+          - { dir: crates/edge-dhcp, target: dhcp }
+          - { dir: crates/edge-dhcp, target: dns }
+          - { dir: crates/edge-scope, target: log_line }
+          - { dir: crates/edge-cni/crates/cni, target: nft_dump }
+          - { dir: crates/edge-cni/crates/cni, target: rtnl_message }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          rust-src-dir: ${{ matrix.dir }}/fuzz
+          cache-workspaces: ${{ matrix.dir }}/fuzz
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker@0.11.1,cargo-fuzz
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2048
+        working-directory: ${{ matrix.dir }}/fuzz
+
+  build:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get install -y musl-tools
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker@0.11.1,cargo-auditable
+      - run: cargo auditable build --release --locked --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin
+          path: |
+            target/x86_64-unknown-linux-musl/release/edge-*
+            !target/x86_64-unknown-linux-musl/release/*.d
+
+  image:
+    needs: [check, deny, conformance, fuzz, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        name: [edge-cni, edge-dhcp, edge-dns, edge-gateway, edge-idle, edge-layers, edge-scope, edge-signer, edge-state, edge-watch]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: bin
+          path: dist/amd64
+      - uses: anchore/sbom-action@v0
+        with:
+          file: dist/amd64/${{ matrix.name }}
+          format: spdx-json
+          artifact-name: ${{ matrix.name }}.spdx.json
+          output-file: ${{ matrix.name }}.spdx.json
+      - uses: redhat-actions/buildah-build@v3
+        with:
+          image: ${{ matrix.name }}
+          tags: ${{ github.sha }} ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          containerfiles: crates/${{ matrix.name }}/Containerfile
+          context: dist
+          build-args: |
+            TARGETARCH=amd64
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+      - uses: redhat-actions/podman-login@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: redhat-actions/push-to-registry@v3
+        id: push
+        with:
+          image: ${{ matrix.name }}
+          tags: ${{ github.sha }} ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          registry: ghcr.io/${{ github.repository_owner }}
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - uses: actions/attest-sbom@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          sbom-path: ${{ matrix.name }}.spdx.json

@@ -1,0 +1,29 @@
+[package]
+name = "edge-cni"
+version.workspace = true
+description = "Meridian Edge: CNI plugin and daemon, with services and NetworkPolicy in BPF"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edge-common = { path = "../../../edge-common" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rtnetlink.workspace = true
+netlink-packet-route.workspace = true
+nix.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "sync"] }
+futures.workspace = true
+aya = { workspace = true }
+rustls.workspace = true
+edge-cni-common = { path = "../common", features = ["user"] }
+kube.workspace = true
+edge-kube = { path = "../../../edge-kube" }
+k8s-openapi.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1"

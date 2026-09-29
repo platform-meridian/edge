@@ -1,0 +1,17 @@
+# Meridian Edge's workloads. The consumer supplies, before applying:
+#   @OPERATOR_DOMAIN@, @OPERATOR_ADDR@  the domain and address the unit is reached by
+#   @NODE_HOSTNAME@                     the node's name
+#   @APISERVER_HOST@, @APISERVER_PORT@  the node's own apiserver
+#   @CLUSTER_DNS@                       the kubelet's clusterDNS address
+#   edge-<name>:appliance               each image, by an images: transformer
+#   the Gateway API CRDs
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - edge-cni.yaml
+  - edge-dns.yaml
+  - edge-idle.yaml
+  - edge-signer.yaml
+  - edge-gateway.yaml

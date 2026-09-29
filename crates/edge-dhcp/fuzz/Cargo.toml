@@ -1,0 +1,29 @@
+[package]
+name = "edge-dhcp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+edge-dhcp = { path = ".." }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+
+[workspace]
+
+[[bin]]
+name = "dhcp"
+path = "fuzz_targets/dhcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,8 @@
+# Tests of k8s.io/apiserver v0.37.1 ./pkg/storage/etcd3 expected to fail, one per
+# line: <arm> <leaf test name> # reason. TestAPIServer fails on any failure not
+# listed here and on any listed test that passes.
+#
+# Empty: edge-state and etcd v3.7.2 both pass all 509. The failures once seen on
+# stock etcd (TestCompact, TestListContinuation*) are timing: they, and the
+# WatchSemantics 150 ms windows, fail on edge-state too when its data sits on a
+# disk with slow fsync, which is why the gate keeps store data on tmpfs.

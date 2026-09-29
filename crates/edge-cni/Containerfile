@@ -1,0 +1,16 @@
+FROM scratch
+ARG TARGETARCH
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION
+
+LABEL org.opencontainers.image.title="edge-cni" \
+    org.opencontainers.image.description="CNI plugin and dataplane" \
+    org.opencontainers.image.vendor="Meridian" \
+    org.opencontainers.image.licenses="MPL-2.0" \
+    org.opencontainers.image.created="${BUILD_DATE}" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${VCS_REF}"
+
+COPY --chmod=0755 ${TARGETARCH}/edge-cni /usr/local/bin/edge-cni
+ENTRYPOINT ["/usr/local/bin/edge-cni", "daemon"]

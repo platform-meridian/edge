@@ -1,0 +1,14 @@
+[package]
+name = "edge-cni-common"
+version.workspace = true
+description = "Meridian Edge: types shared by edge-cni and its BPF programs"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+user = ["dep:aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }

@@ -1,0 +1,95 @@
+# The cluster DNS, replacing CoreDNS and its kube-dns Service.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-dns
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-dns
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edge-dns
+subjects:
+  - kind: ServiceAccount
+    name: edge-dns
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      serviceAccountName: edge-dns
+      # The host's upstreams: the cluster resolver would be this pod itself.
+      dnsPolicy: Default
+      priorityClassName: system-cluster-critical
+      # DNS comes up before the node is fully Ready.
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          effect: NoSchedule
+      containers:
+        - name: edge-dns
+          image: "edge-dns:appliance"
+          securityContext:
+            capabilities:
+              add: [NET_BIND_SERVICE]
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            seccompProfile: { type: RuntimeDefault }
+          ports:
+            - { name: dns, containerPort: 53, protocol: UDP }
+            - { name: dns-tcp, containerPort: 53, protocol: TCP }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          readinessProbe:
+            # Both sockets are bound; the zone fills from the watch a moment later.
+            tcpSocket: { port: 53 }
+            initialDelaySeconds: 1
+            periodSeconds: 5
+---
+# The kubelet's clusterDNS; edge-cni's connect4 rewrites it to the pod behind
+# this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/name: KubeDNS
+spec:
+  clusterIP: "@CLUSTER_DNS@"
+  selector:
+    k8s-app: kube-dns
+  ports:
+    - { name: dns, port: 53, protocol: UDP, targetPort: 53 }
+    - { name: dns-tcp, port: 53, protocol: TCP, targetPort: 53 }

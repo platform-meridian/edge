@@ -1,0 +1,365 @@
+diff -ruN orig/robustness/client/client.go patched/robustness/client/client.go
+--- orig/robustness/client/client.go	2026-09-27 19:45:11.058654558 +0800
++++ patched/robustness/client/client.go	2026-09-27 19:46:03.270209272 +0800
+@@ -16,6 +16,7 @@
+ 
+ import (
+ 	"context"
++	"crypto/tls"
+ 	"errors"
+ 	"fmt"
+ 	"sync"
+@@ -55,8 +56,12 @@
+ 	Time time.Duration
+ }
+ 
++// TLS, when set, is used by every client created afterwards.
++var TLS *tls.Config
++
+ func NewRecordingClient(endpoints []string, ids identity.Provider, baseTime time.Time) (*RecordingClient, error) {
+ 	cc, err := clientv3.New(clientv3.Config{
++		TLS:                  TLS,
+ 		Endpoints:            endpoints,
+ 		Logger:               zap.NewNop(),
+ 		DialKeepAliveTime:    10 * time.Second,
+@@ -204,6 +209,53 @@
+ 	return resp, err
+ }
+ 
++// MutexAcquire is concurrency.Mutex's tryAcquire, as Talos takes it: if myKey
++// does not exist, put it under the session lease; either way read the owner, the
++// prefix's first key by create revision.
++func (c *RecordingClient) MutexAcquire(ctx context.Context, pfx, myKey, value string, lease int64) (*clientv3.TxnResponse, error) {
++	cmp := clientv3.Compare(clientv3.CreateRevision(myKey), "=", 0)
++	put := clientv3.OpPut(myKey, value, clientv3.WithLease(clientv3.LeaseID(lease)))
++	get := clientv3.OpGet(myKey)
++	getOwner := clientv3.OpGet(pfx, clientv3.WithFirstCreate()...)
++	owner := model.EtcdOperation{Type: model.RangeOperation, Range: model.RangeOptions{
++		Start: pfx, End: clientv3.GetPrefixRangeEnd(pfx), Limit: 1, SortCreate: "ascend",
++	}}
++	request := model.EtcdRequest{Type: model.Txn, Txn: &model.TxnRequest{
++		Conditions: []model.EtcdCondition{{Key: myKey, CompareCreate: true}},
++		OperationsOnSuccess: []model.EtcdOperation{
++			{Type: model.PutOperation, Put: model.PutOptions{Key: myKey, Value: model.ToValueOrHash(value), LeaseID: lease}},
++			owner,
++		},
++		OperationsOnFailure: []model.EtcdOperation{
++			{Type: model.RangeOperation, Range: model.RangeOptions{Start: myKey}},
++			owner,
++		},
++	}}
++	c.kvMux.Lock()
++	defer c.kvMux.Unlock()
++	callTime := time.Since(c.baseTime)
++	resp, err := c.client.Txn(ctx).If(cmp).Then(put, getOwner).Else(get, getOwner).Commit()
++	returnTime := time.Since(c.baseTime)
++	c.kvOperations.AppendModelTxn(request, callTime, returnTime, resp, err)
++	return resp, err
++}
++
++// MutexWaiters is concurrency.Mutex's waitDeletes read: the newest key in the
++// prefix created before maxCreateRev.
++func (c *RecordingClient) MutexWaiters(ctx context.Context, pfx string, maxCreateRev int64) (*clientv3.GetResponse, error) {
++	opts := append(clientv3.WithLastCreate(), clientv3.WithMaxCreateRev(maxCreateRev))
++	request := model.EtcdRequest{Type: model.Range, Range: &model.RangeRequest{RangeOptions: model.RangeOptions{
++		Start: pfx, End: clientv3.GetPrefixRangeEnd(pfx), Limit: 1, SortCreate: "descend", MaxCreateRevision: maxCreateRev,
++	}}}
++	c.kvMux.Lock()
++	defer c.kvMux.Unlock()
++	callTime := time.Since(c.baseTime)
++	resp, err := c.client.Get(ctx, pfx, opts...)
++	returnTime := time.Since(c.baseTime)
++	c.kvOperations.AppendModelRange(request, callTime, returnTime, resp, err)
++	return resp, err
++}
++
+ func (c *RecordingClient) Txn(ctx context.Context) clientv3.Txn {
+ 	return &wrappedTxn{txn: c.client.Txn(ctx), c: c}
+ }
+@@ -400,9 +452,10 @@
+ 
+ 	if event.PrevKv != nil {
+ 		watch.PrevValue = &model.ValueRevision{
+-			Value:       model.ToValueOrHash(string(event.PrevKv.Value)),
+-			ModRevision: event.PrevKv.ModRevision,
+-			Version:     event.PrevKv.Version,
++			Value:          model.ToValueOrHash(string(event.PrevKv.Value)),
++			ModRevision:    event.PrevKv.ModRevision,
++			Version:        event.PrevKv.Version,
++			CreateRevision: event.PrevKv.CreateRevision,
+ 		}
+ 	}
+ 	watch.IsCreate = event.IsCreate()
+diff -ruN orig/robustness/model/describe.go patched/robustness/model/describe.go
+--- orig/robustness/model/describe.go	2026-09-27 19:45:11.064454911 +0800
++++ patched/robustness/model/describe.go	2026-09-27 19:46:12.410231329 +0800
+@@ -159,7 +159,9 @@
+ func describeEtcdConditions(conds []EtcdCondition) string {
+ 	opsDescription := make([]string, len(conds))
+ 	for i, cond := range conds {
+-		if cond.ExpectedVersion > 0 {
++		if cond.CompareCreate {
++			opsDescription[i] = fmt.Sprintf("create_rev(%s)==%d", cond.Key, cond.ExpectedCreateRevision)
++		} else if cond.ExpectedVersion > 0 {
+ 			opsDescription[i] = fmt.Sprintf("ver(%s)==%d", cond.Key, cond.ExpectedVersion)
+ 		} else {
+ 			opsDescription[i] = fmt.Sprintf("mod_rev(%s)==%d", cond.Key, cond.ExpectedRevision)
+diff -ruN orig/robustness/model/deterministic.go patched/robustness/model/deterministic.go
+--- orig/robustness/model/deterministic.go	2026-09-27 19:45:11.064454911 +0800
++++ patched/robustness/model/deterministic.go	2026-09-27 19:45:38.468632991 +0800
+@@ -179,7 +179,12 @@
+ 		if !ok {
+ 			val = &ValueRevision{}
+ 		}
+-		if cond.ExpectedVersion > 0 {
++		if cond.CompareCreate {
++			if val.CreateRevision != cond.ExpectedCreateRevision {
++				failure = true
++				break
++			}
++		} else if cond.ExpectedVersion > 0 {
+ 			if val.Version != cond.ExpectedVersion {
+ 				failure = true
+ 				break
+@@ -210,13 +215,16 @@
+ 				leaseID = &op.Put.LeaseID
+ 			}
+ 			ver := int64(1)
++			create := newState.Revision + 1
+ 			if val, exists := newState.GetValue(op.Put.Key); exists && val.Version > 0 {
+ 				ver = val.Version + 1
++				create = val.CreateRevision
+ 			}
+ 			newState.setValueLease(op.Put.Key, ValueRevision{
+-				Value:       op.Put.Value,
+-				ModRevision: newState.Revision + 1,
+-				Version:     ver,
++				Value:          op.Put.Value,
++				ModRevision:    newState.Revision + 1,
++				Version:        ver,
++				CreateRevision: create,
+ 			}, leaseID)
+ 			increaseRevision = true
+ 		case DeleteOperation:
+@@ -296,18 +304,32 @@
+ 			}
+ 			k := s.Keys[i]
+ 			if k >= options.Start && k < options.End {
++				count++
++				// etcd counts the range before it applies the create-revision filter.
++				if options.MaxCreateRevision > 0 && v.CreateRevision > options.MaxCreateRevision {
++					continue
++				}
+ 				kv := KeyValue{Key: k, ValueRevision: *v}
+ 				if options.KeysOnly {
+ 					kv.ValueRevision.Value = ValueOrHash{}
+ 				}
+ 				response.KVs = append(response.KVs, kv)
+-				count++
+ 			}
+ 		}
+ 		sort.Slice(response.KVs, func(j, k int) bool {
+ 			return response.KVs[j].Key < response.KVs[k].Key
+ 		})
+-		if options.Limit != 0 && count > options.Limit {
++		switch options.SortCreate {
++		case "ascend":
++			sort.SliceStable(response.KVs, func(j, k int) bool {
++				return response.KVs[j].CreateRevision < response.KVs[k].CreateRevision
++			})
++		case "descend":
++			sort.SliceStable(response.KVs, func(j, k int) bool {
++				return response.KVs[j].CreateRevision > response.KVs[k].CreateRevision
++			})
++		}
++		if options.Limit != 0 && int64(len(response.KVs)) > options.Limit {
+ 			response.KVs = response.KVs[:options.Limit]
+ 		}
+ 		response.Count = count
+diff -ruN orig/robustness/model/history.go patched/robustness/model/history.go
+--- orig/robustness/model/history.go	2026-09-27 19:45:11.064454911 +0800
++++ patched/robustness/model/history.go	2026-09-27 19:45:56.495210210 +0800
+@@ -209,6 +209,10 @@
+ 	case compare.GetResult() == etcdserverpb.Compare_EQUAL && compare.GetTarget() == etcdserverpb.Compare_MOD:
+ 		cond.Key = string(cmp.KeyBytes())
+ 		cond.ExpectedRevision = compare.GetTargetUnion().(*etcdserverpb.Compare_ModRevision).ModRevision
++	case compare.GetResult() == etcdserverpb.Compare_EQUAL && compare.GetTarget() == etcdserverpb.Compare_CREATE:
++		cond.Key = string(cmp.KeyBytes())
++		cond.CompareCreate = true
++		cond.ExpectedCreateRevision = compare.GetTargetUnion().(*etcdserverpb.Compare_CreateRevision).CreateRevision
+ 	case compare.GetResult() == etcdserverpb.Compare_EQUAL && compare.GetTarget() == etcdserverpb.Compare_VERSION:
+ 		cond.ExpectedVersion = compare.GetTargetUnion().(*etcdserverpb.Compare_Version).Version
+ 		cond.Key = string(cmp.KeyBytes())
+@@ -252,9 +256,10 @@
+ 			kvs[i] = KeyValue{
+ 				Key: string(kv.Key),
+ 				ValueRevision: ValueRevision{
+-					Value:       ToValueOrHash(string(kv.Value)),
+-					ModRevision: kv.ModRevision,
+-					Version:     kv.Version,
++					Value:          ToValueOrHash(string(kv.Value)),
++					ModRevision:    kv.ModRevision,
++					Version:        kv.Version,
++					CreateRevision: kv.CreateRevision,
+ 				},
+ 			}
+ 		}
+@@ -385,9 +390,10 @@
+ 		result.KVs[i] = KeyValue{
+ 			Key: string(kv.Key),
+ 			ValueRevision: ValueRevision{
+-				Value:       ToValueOrHash(string(kv.Value)),
+-				ModRevision: kv.ModRevision,
+-				Version:     kv.Version,
++				Value:          ToValueOrHash(string(kv.Value)),
++				ModRevision:    kv.ModRevision,
++				Version:        kv.Version,
++				CreateRevision: kv.CreateRevision,
+ 			},
+ 		}
+ 	}
+@@ -549,3 +555,38 @@
+ 	}
+ 	return maxRevision
+ }
++
++// AppendModelTxn records a transaction the caller describes directly, for shapes
++// (leases on txn puts, sorted ranges) that clientv3.Op does not expose.
++func (h *AppendableHistory) AppendModelTxn(request EtcdRequest, start, end time.Duration, resp *clientv3.TxnResponse, err error) {
++	if err != nil {
++		h.appendFailed(request, start, end, err)
++		return
++	}
++	var revision int64
++	var memberID MemberID
++	if resp.Header != nil {
++		revision = resp.Header.Revision
++		memberID = MemberID(resp.Header.MemberId)
++	}
++	results := []EtcdOperationResult{}
++	for _, r := range resp.Responses {
++		results = append(results, toEtcdOperationResult(r))
++	}
++	h.appendSuccessful(request, start, end, txnResponseWithMemberID(results, resp.Succeeded, revision, memberID))
++}
++
++// AppendModelRange records a range the caller describes directly.
++func (h *AppendableHistory) AppendModelRange(request EtcdRequest, start, end time.Duration, resp *clientv3.GetResponse, err error) {
++	if err != nil {
++		h.appendFailed(request, start, end, err)
++		return
++	}
++	var revision int64
++	var memberID uint64
++	if resp.Header != nil {
++		revision = resp.Header.Revision
++		memberID = resp.Header.MemberId
++	}
++	h.appendSuccessful(request, start, end, rangeResponseWithMemberID(resp.Kvs, resp.Count, revision, MemberID(memberID)))
++}
+diff -ruN orig/robustness/model/replay.go patched/robustness/model/replay.go
+--- orig/robustness/model/replay.go	2026-09-27 19:45:11.064454911 +0800
++++ patched/robustness/model/replay.go	2026-09-27 19:57:45.100059869 +0800
+@@ -206,3 +206,8 @@
+ 	slices.Sort(keys)
+ 	return keys
+ }
++
++// NewState is the empty store the replay starts from, over the given keys.
++func NewState(keys []string) EtcdState {
++	return freshEtcdState(keys)
++}
+diff -ruN orig/robustness/model/types.go patched/robustness/model/types.go
+--- orig/robustness/model/types.go	2026-09-27 19:45:11.064454911 +0800
++++ patched/robustness/model/types.go	2026-09-27 19:45:56.497210210 +0800
+@@ -75,6 +75,9 @@
+ 	End      string
+ 	Limit    int64
+ 	KeysOnly bool
++	// SortCreate is "", "ascend" or "descend": concurrency.Mutex's WithFirstCreate/WithLastCreate.
++	SortCreate        string `json:",omitempty"`
++	MaxCreateRevision int64  `json:",omitempty"`
+ }
+ 
+ type PutOptions struct {
+@@ -101,6 +104,9 @@
+ 	Key              string
+ 	ExpectedRevision int64
+ 	ExpectedVersion  int64
++	// CompareCreate compares the key's CreateRevision with ExpectedCreateRevision.
++	CompareCreate          bool  `json:",omitempty"`
++	ExpectedCreateRevision int64 `json:",omitempty"`
+ }
+ 
+ type EtcdOperation struct {
+@@ -222,9 +228,10 @@
+ }
+ 
+ type ValueRevision struct {
+-	Value       ValueOrHash `json:",omitempty"`
+-	ModRevision int64       `json:",omitempty"`
+-	Version     int64       `json:",omitempty"`
++	Value          ValueOrHash `json:",omitempty"`
++	ModRevision    int64       `json:",omitempty"`
++	Version        int64       `json:",omitempty"`
++	CreateRevision int64       `json:",omitempty"`
+ }
+ 
+ type ValueOrHash struct {
+diff -ruN orig/robustness/report/wal.go patched/robustness/report/wal.go
+--- orig/robustness/report/wal.go	2026-09-27 19:45:11.069995828 +0800
++++ patched/robustness/report/wal.go	2026-09-27 19:45:38.480156601 +0800
+@@ -304,6 +304,12 @@
+ 					Key:             string(cmp.Key),
+ 					ExpectedVersion: cmp.GetVersion(),
+ 				})
++			case cmp.Result == pb.Compare_EQUAL && cmp.Target == pb.Compare_CREATE:
++				txn.Conditions = append(txn.Conditions, model.EtcdCondition{
++					Key:                    string(cmp.Key),
++					CompareCreate:          true,
++					ExpectedCreateRevision: cmp.GetCreateRevision(),
++				})
+ 			case cmp.Result == pb.Compare_EQUAL && cmp.Target == pb.Compare_MOD:
+ 				txn.Conditions = append(txn.Conditions, model.EtcdCondition{
+ 					Key:              string(cmp.Key),
+@@ -340,6 +346,16 @@
+ 				End:      string(rangeOp.RangeEnd),
+ 				Limit:    rangeOp.Limit,
+ 				KeysOnly: rangeOp.GetKeysOnly(),
++				SortCreate: func() string {
++					if rangeOp.SortTarget != pb.RangeRequest_CREATE {
++						return ""
++					}
++					if rangeOp.SortOrder == pb.RangeRequest_DESCEND {
++						return "descend"
++					}
++					return "ascend"
++				}(),
++				MaxCreateRevision: rangeOp.MaxCreateRevision,
+ 			},
+ 		}
+ 	case op.GetRequestPut() != nil:
+@@ -347,8 +363,9 @@
+ 		operation = model.EtcdOperation{
+ 			Type: model.PutOperation,
+ 			Put: model.PutOptions{
+-				Key:   string(putOp.Key),
+-				Value: model.ToValueOrHash(string(putOp.Value)),
++				Key:     string(putOp.Key),
++				Value:   model.ToValueOrHash(string(putOp.Value)),
++				LeaseID: putOp.Lease,
+ 			},
+ 		}
+ 	case op.GetRequestDeleteRange() != nil:
+diff -ruN orig/robustness/report/export.go patched/robustness/report/export.go
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ patched/robustness/report/export.go	2026-09-28 04:00:00.000000000 +0800
+@@ -0,0 +1,8 @@
++package report
++
++import "go.uber.org/zap"
++
++// PersistClientReports saves reports where LoadClientReports reads them.
++func PersistClientReports(lg *zap.Logger, path string, reports []ClientReport) error {
++	return persistClientReports(lg, path, reports)
++}

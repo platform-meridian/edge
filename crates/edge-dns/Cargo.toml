@@ -1,0 +1,27 @@
+[package]
+name = "edge-dns"
+version.workspace = true
+description = "Meridian Edge: cluster DNS and upstream forwarder"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edge-common = { path = "../edge-common" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
+futures.workspace = true
+arc-swap.workspace = true
+async-trait.workspace = true
+rustls.workspace = true
+kube.workspace = true
+edge-kube = { path = "../edge-kube" }
+k8s-openapi.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+hickory-server.workspace = true
+hickory-proto.workspace = true
+hickory-resolver.workspace = true
+
+[dev-dependencies]
+proptest = "1"

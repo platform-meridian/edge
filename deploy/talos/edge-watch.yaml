@@ -1,0 +1,33 @@
+# The hardware watchdog, armed before the kubelet. Its checks are the files its
+# ExtensionServiceConfig puts in /etc/edge-watch, one fragment each.
+name: edge-watch
+depends:
+  - path: /var/mnt
+  - configuration: true
+restart: always
+container:
+  entrypoint: /edge-watch
+  environment:
+    - EDGE_WATCH_CONFIG=/etc/edge-watch
+    - EDGE_WATCH_DEVICE=/host/dev/watchdog0
+    - EDGE_WATCH_STATE=/var/mnt/edge-evidence/edge-watch
+    - EDGE_EVIDENCE=/var/mnt/edge-evidence
+  mounts:
+    # rslave: the edge-evidence volume may be mounted after this starts, and
+    # an EPHEMERAL wipe never takes the record.
+    - source: /var/mnt
+      destination: /var/mnt
+      type: bind
+      options: [rbind, rslave, rw]
+    - source: /dev
+      destination: /host/dev
+      type: bind
+      options: [rbind, ro]
+    # machined's socket: the repair asks it to wipe EPHEMERAL.
+    - source: /system/run/machined
+      destination: /system/run/machined
+      type: bind
+      options: [rbind, ro]
+  security:
+    writeableRootfs: false
+    writeableSysfs: false

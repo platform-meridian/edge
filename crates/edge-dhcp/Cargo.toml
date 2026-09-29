@@ -1,0 +1,18 @@
+[package]
+name = "edge-dhcp"
+version.workspace = true
+description = "Meridian Edge: DHCP and local DNS for the operator port"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edge-common = { path = "../edge-common" }
+hickory-proto = { workspace = true, features = ["std"] }
+nix = { workspace = true, features = ["socket", "net", "uio"] }
+tracing.workspace = true
+
+[dev-dependencies]
+nix = { workspace = true, features = ["signal", "sched"] }
+proptest = "1"

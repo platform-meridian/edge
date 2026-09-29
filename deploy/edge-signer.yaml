@@ -1,0 +1,86 @@
+# Signs pod certificates for edge.meridian/appliance from the CA the consumer writes
+# to /etc/edge-signer/ca.pem.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-signer
+  namespace: edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-signer
+rules:
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["podcertificaterequests"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["podcertificaterequests/status"]
+    verbs: ["patch"]
+  # sign: answering a request for this signer. attest: publishing its bundle.
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    resourceNames: ["edge.meridian/appliance"]
+    verbs: ["sign", "attest"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["clustertrustbundles"]
+    verbs: ["create", "patch"]
+  # A pod whose certificate starts in the future is recreated.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-signer
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edge-signer }
+subjects:
+  - { kind: ServiceAccount, name: edge-signer, namespace: edge }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: edge-signer
+  namespace: edge
+  labels: { app: edge-signer }
+spec:
+  selector:
+    matchLabels: { app: edge-signer }
+  template:
+    metadata:
+      labels: { app: edge-signer }
+    spec:
+      # The door's certificate must not wait on the pod network.
+      hostNetwork: true
+      serviceAccountName: edge-signer
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: edge-signer
+          image: "edge-signer:appliance"
+          env:
+            - { name: EDGE_SIGNER_CA, value: /etc/edge-signer/ca.pem }
+            - { name: EDGE_SIGNER_DOMAIN, value: "@OPERATOR_DOMAIN@" }
+            - { name: EDGE_SIGNER_ADDRESSES, value: "@OPERATOR_ADDR@" }
+          resources:
+            requests: { cpu: 5m, memory: 8Mi }
+            limits: { memory: 32Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          livenessProbe:
+            exec: { command: ["/edge-signer", "check"] }
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - { name: ca, mountPath: /etc/edge-signer, readOnly: true }
+            - { name: heartbeat, mountPath: /run/edge-signer }
+      volumes:
+        - name: ca
+          # The directory: a file replaced by rename stays visible. No type: the
+          # kubelet may not see the host's /etc/edge-signer to check it.
+          hostPath: { path: /etc/edge-signer }
+        - name: heartbeat
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }

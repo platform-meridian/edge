@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+exclude = ["crates/edge-cni/crates/ebpf"]
+members = [
+    "crates/edge-cni/crates/common",
+    "crates/edge-cni/crates/cni",
+    "crates/edge-dns",
+    "crates/edge-kube",
+    "crates/edge-gateway",
+    "crates/edge-state",
+    "crates/edge-idle",
+    "crates/edge-signer",
+    "crates/edge-scope",
+    "crates/edge-watch",
+    "crates/edge-layers",
+    "crates/edge-dhcp",
+    "crates/edge-common",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MPL-2.0"
+rust-version = "1.98"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+serde_json = "1"
+rtnetlink = "0.23"
+aya = { git = "https://github.com/aya-rs/aya", rev = "c0f9940" }
+netlink-packet-route = "0.33"
+nix = { version = "0.31", features = ["sched", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+protox = "0.9"
+prost = "0.14"
+envoy-types = "0.7"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+kube = { version = "4", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
+futures = "0.3"
+arc-swap = "1"
+crc32fast = "1"
+flate2 = "1"
+tar = "0.4"
+async-trait = "0.1"
+hickory-server = { version = "0.26", default-features = false }
+hickory-proto = { version = "0.26", default-features = false }
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+
+[profile.release]
+strip = true

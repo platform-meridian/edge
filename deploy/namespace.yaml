@@ -1,0 +1,11 @@
+# edge-cni and edge-dns live in kube-system, beside the CNI and cluster DNS they
+# replace. Privileged: the gateway's host network, edge-idle's hostPID and host
+# paths, and edge-signer's host path are each rejected by `baseline`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

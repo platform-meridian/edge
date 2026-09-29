@@ -1,0 +1,36 @@
+// The corner of Talos's machine API (siderolabs/talos api/machine/machine.proto)
+// that edge-watch uses: Reset. Names and field numbers are upstream's; fields
+// left out are skipped by the decoder.
+syntax = "proto3";
+
+package machine;
+
+service MachineService {
+    rpc Reset(ResetRequest) returns (ResetResponse);
+}
+
+message ResetPartitionSpec {
+    string label = 1;
+    bool wipe = 2;
+}
+
+message ResetRequest {
+    enum WipeMode {
+        ALL = 0;
+        SYSTEM_DISK = 1;
+        USER_DISKS = 2;
+    }
+    bool graceful = 1;
+    bool reboot = 2;
+    repeated ResetPartitionSpec system_partitions_to_wipe = 3;
+    repeated string user_disks_to_wipe = 4;
+    WipeMode mode = 5;
+}
+
+message Reset {
+    string actor_id = 2;
+}
+
+message ResetResponse {
+    repeated Reset messages = 1;
+}

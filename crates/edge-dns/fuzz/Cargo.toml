@@ -1,0 +1,27 @@
+[package]
+name = "edge-dns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+edge-dns = { path = ".." }
+edge-kube = { path = "../../edge-kube" }
+k8s-openapi = { version = "0.28", features = ["latest"] }
+hickory-proto = { version = "0.26", default-features = false }
+hickory-server = { version = "0.26", default-features = false }
+tokio = { version = "1", features = ["rt"] }
+async-trait = "0.1"
+
+[workspace]
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false

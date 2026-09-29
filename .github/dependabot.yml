@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /crates/edge-cni/crates/ebpf
+      - /crates/edge-state/fuzz
+      - /crates/edge-gateway/fuzz
+      - /crates/edge-dns/fuzz
+      - /crates/edge-dhcp/fuzz
+      - /crates/edge-cni/crates/cni/fuzz
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directories:
+      - /replay
+      - /conformance
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        patterns: ["*"]

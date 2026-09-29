@@ -1,0 +1,77 @@
+# Throttles the scheduler and controller-manager while nothing they watch changes.
+# Both need leader election off: client-go exits on a lost lease.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-idle
+  namespace: edge
+---
+# Read-only: what it acts on is a cgroup.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-idle
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-idle
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edge-idle
+subjects:
+  - kind: ServiceAccount
+    name: edge-idle
+    namespace: edge
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: edge-idle
+  namespace: edge
+  labels: { app: edge-idle }
+spec:
+  selector:
+    matchLabels: { app: edge-idle }
+  template:
+    metadata:
+      labels: { app: edge-idle }
+    spec:
+      # It reaches the apiserver on loopback.
+      hostNetwork: true
+      # To find the static pods' processes.
+      hostPID: true
+      serviceAccountName: edge-idle
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: edge-idle
+          image: "edge-idle:appliance"
+          env:
+            - { name: EDGE_IDLE_PROC, value: /host/proc }
+            - { name: EDGE_IDLE_CGROUP, value: /host/sys/fs/cgroup }
+            # Longer than a normal reconcile burst.
+            - { name: EDGE_IDLE_AFTER, value: "120" }
+          # Root owns the cpu.max files and /proc is world-readable: no capability.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            requests: { cpu: 5m, memory: 8Mi }
+            limits: { memory: 32Mi }
+          volumeMounts:
+            - { name: proc,   mountPath: /host/proc }
+            - { name: cgroup, mountPath: /host/sys/fs/cgroup }
+      volumes:
+        - { name: proc,   hostPath: { path: /proc } }
+        - { name: cgroup, hostPath: { path: /sys/fs/cgroup } }

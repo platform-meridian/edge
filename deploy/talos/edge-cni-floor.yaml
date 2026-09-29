@@ -1,0 +1,26 @@
+# edge-cni's plugin and conflist, kept on disk without the kubelet: pod teardown
+# needs the CNI, and the DaemonSet that writes it is itself a pod. `floor` only
+# installs; the full daemon here would fight the DaemonSet for the dataplane.
+name: edge-cni-floor
+depends:
+  # A Talos tmpfs: written before the mount, the conflist would be hidden under it.
+  - path: /etc/cni
+  - path: /opt
+restart: always
+container:
+  entrypoint: /usr/local/bin/edge-cni
+  args:
+    - floor
+  mounts:
+    - source: /etc/cni
+      destination: /etc/cni
+      type: bind
+      options: [bind, rshared, rw]
+    - source: /opt
+      destination: /opt
+      type: bind
+      options: [bind, rshared, rw]
+  security:
+    writeableRootfs: false
+    writeableSysfs: false
+    rootfsPropagation: shared

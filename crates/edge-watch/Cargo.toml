@@ -1,0 +1,30 @@
+[package]
+name = "edge-watch"
+version.workspace = true
+description = "Meridian Edge: hardware watchdog tied to workload liveness"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "net", "time", "io-util"] }
+serde = { workspace = true }
+serde_json.workspace = true
+serde_yaml.workspace = true
+nix = { workspace = true, features = ["fs", "ioctl", "time"] }
+edge-common = { path = "../edge-common" }
+anyhow.workspace = true
+tracing.workspace = true
+tonic = { workspace = true, features = ["router"] }
+tonic-prost.workspace = true
+prost.workspace = true
+tower = "0.5"
+hyper-util.workspace = true
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true

@@ -1,0 +1,36 @@
+# The flight recorder, as a Talos extension service: it acts before etcd and
+# the kubelet. The consumer supplies @BUILD_EPOCH@, the clock's floor until the
+# ring proves a later one.
+name: edge-scope
+depends:
+  - path: /var/lib/containerd
+restart: always
+container:
+  entrypoint: /edge-scope
+  environment:
+    - EDGE_SCOPE_BUILD_EPOCH=@BUILD_EPOCH@
+    - EDGE_SCOPE_DEV=/host/dev
+    - EDGE_SCOPE_RING=/var/mnt/edge-evidence/edge-scope/ring.bin
+    - EDGE_WATCH_STATE=/var/mnt/edge-evidence/edge-watch
+    - EDGE_EVIDENCE=/var/mnt/edge-evidence
+  mounts:
+    # rslave: the edge-evidence volume may be mounted after this starts.
+    - source: /var/mnt
+      destination: /var/mnt
+      type: bind
+      options: [rbind, rslave, rw]
+    # The directory, not the socket: containerd recreates it on every restart.
+    - source: /run/containerd
+      destination: /run/containerd
+      type: bind
+      options: [rbind, rw]
+    # Extension services get device access but not the host's device nodes.
+    - source: /dev
+      destination: /host/dev
+      type: bind
+      options: [rbind, ro]
+  # No capabilities to list: machined grants extension services all of them
+  # (CAP_SYS_TIME for the clock, CAP_SYS_ADMIN for the SMART log).
+  security:
+    writeableRootfs: false
+    writeableSysfs: false

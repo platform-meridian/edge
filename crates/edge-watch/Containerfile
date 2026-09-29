@@ -1,0 +1,16 @@
+FROM scratch
+ARG TARGETARCH
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION
+
+LABEL org.opencontainers.image.title="edge-watch" \
+    org.opencontainers.image.description="Workload-aware watchdog" \
+    org.opencontainers.image.vendor="Meridian" \
+    org.opencontainers.image.licenses="MPL-2.0" \
+    org.opencontainers.image.created="${BUILD_DATE}" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${VCS_REF}"
+
+COPY --chmod=0755 ${TARGETARCH}/edge-watch /edge-watch
+ENTRYPOINT ["/edge-watch"]

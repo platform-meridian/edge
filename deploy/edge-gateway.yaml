@@ -1,0 +1,140 @@
+# The one TCP door, :443 on the host. Static routes and their authz service are
+# fragments a consumer projects into routes.d/*.yaml; loopback backends go there.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-gateway
+  namespace: edge
+data:
+  edge-gateway.yaml: |
+    listen: "0.0.0.0:443"
+    # The pod certificate's bundle holds key and chain, so a rotation is never
+    # read half-done.
+    tls:
+      cert: /tls/credentialbundle.pem
+      key: /tls/credentialbundle.pem
+    routes: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-gateway
+  namespace: edge
+spec:
+  replicas: 1
+  # A replacement cannot bind :443 while the old pod holds it.
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: edge-gateway } }
+  template:
+    metadata:
+      labels: { app: edge-gateway }
+    spec:
+      serviceAccountName: edge-gateway
+      hostNetwork: true
+      # HTTPRoute backends resolve as <svc>.<ns>.svc.cluster.local.
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: edge-gateway
+          image: "edge-gateway:appliance"
+          args: ["/config/edge-gateway.yaml"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          ports:
+            - { name: https, containerPort: 443, protocol: TCP }
+          livenessProbe:
+            tcpSocket: { port: https }
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - { name: config, mountPath: /config }
+            - { name: tls, mountPath: /tls, readOnly: true }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          # Binding :443 without a capability needs net.ipv4.ip_unprivileged_port_start <= 443.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: config
+          projected:
+            sources:
+              - configMap: { name: edge-gateway }
+        - name: tls
+          projected:
+            sources:
+              - podCertificate:
+                  signerName: edge.meridian/appliance
+                  keyType: ECDSAP256
+                  maxExpirationSeconds: 864000
+                  credentialBundlePath: credentialbundle.pem
+                  userAnnotations:
+                    edge.meridian/dns-names: "*.@OPERATOR_DOMAIN@,@OPERATOR_DOMAIN@,localhost"
+                    edge.meridian/ip-addresses: "@OPERATOR_ADDR@,127.0.0.1"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-gateway
+  namespace: edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-gateway
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "gateways", "gatewayclasses"]
+    verbs: ["get", "list", "watch"]
+  # Without these every cross-namespace backendRef is refused.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["list", "watch"]
+  # Without these a route to a missing Service is served until it 502s.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  # Without these a rejected route is absent and nothing says why.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-gateway
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edge-gateway }
+subjects:
+  - { kind: ServiceAccount, name: edge-gateway, namespace: edge }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: edge
+spec:
+  controllerName: edge.meridian/gateway
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: edge
+spec:
+  gatewayClassName: edge
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      allowedRoutes:
+        namespaces: { from: All }
+      # The gateway serves its pod certificate, not a Secret.
+      tls:
+        mode: Terminate
+        options:
+          edge.meridian/certificate: pod-certificate

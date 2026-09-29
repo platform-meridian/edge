@@ -1,0 +1,30 @@
+[package]
+name = "edge-cni-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+edge-cni = { path = ".." }
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.33"
+
+[workspace]
+
+[[bin]]
+name = "nft_dump"
+path = "fuzz_targets/nft_dump.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtnl_message"
+path = "fuzz_targets/rtnl_message.rs"
+test = false
+doc = false
+bench = false
