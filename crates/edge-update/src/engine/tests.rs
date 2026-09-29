@@ -14,7 +14,7 @@ use super::*;
 use crate::bundle::testkit;
 use crate::unit::{Ref, Stack};
 
-const OLD_TAG: &str = "update-old";
+pub(crate) const OLD_TAG: &str = "update-old";
 const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 const UNIT_CONFIG: &str = "version: v1alpha1
@@ -44,7 +44,7 @@ enum Verdict {
     WrongDigest,
 }
 
-struct World {
+pub(crate) struct World {
     version: String,
     entries: BTreeMap<String, String>,
     default: String,
@@ -62,7 +62,7 @@ struct World {
     url: String,
     tag: String,
     lock: BTreeMap<String, String>,
-    judge: BTreeMap<String, String>,
+    pub(crate) judge: BTreeMap<String, String>,
     judge_ticks: u32,
     verdict: Verdict,
     seeded: bool,
@@ -82,6 +82,8 @@ struct World {
     never_ready: bool,
     seed_stuck: bool,
     judge_idle: bool,
+    apid_down: bool,
+    apiserver_down: bool,
 }
 
 impl World {
@@ -125,6 +127,8 @@ impl World {
             never_ready: false,
             seed_stuck: false,
             judge_idle: false,
+            apid_down: false,
+            apiserver_down: false,
         }
     }
 
@@ -226,6 +230,7 @@ impl Talos for FakeTalos {
     async fn version(&self) -> anyhow::Result<String> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
+        anyhow::ensure!(!w.apid_down, "apid is not answering");
         Ok(w.version.clone())
     }
     async fn read(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -293,6 +298,13 @@ impl Talos for FakeTalos {
         w.power_cycle();
         w.change("reboot".into())
     }
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        // Off, then on again whenever someone powers it.
+        w.power_cycle();
+        w.change("shutdown".into())
+    }
 }
 
 #[async_trait]
@@ -312,6 +324,7 @@ impl Cluster for FakeCluster {
     async fn sync(&self, _: &Ref) -> anyhow::Result<(String, String)> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
+        anyhow::ensure!(!w.apiserver_down, "the apiserver is not answering");
         Ok((w.url.clone(), w.tag.clone()))
     }
     async fn repoint(&self, _: &Ref, url: &str, tag: &str, _: Option<&str>) -> anyhow::Result<()> {
@@ -397,16 +410,16 @@ impl Registry for FakeRegistry {
     }
 }
 
-struct Harness {
-    world: Shared,
+pub(crate) struct Harness {
+    pub(crate) world: Shared,
     dir: tempfile::TempDir,
     key: PathBuf,
     public: String,
     clock: Arc<AtomicI64>,
-    engine: Option<Engine>,
+    pub(crate) engine: Option<Engine>,
 }
 
-struct Spec {
+pub(crate) struct Spec {
     tag: String,
     epoch: i64,
     talos: String,
@@ -416,7 +429,7 @@ struct Spec {
 }
 
 impl Spec {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         Self {
             tag: tag.into(),
             epoch: 2000,
@@ -446,7 +459,7 @@ fn settings(public: &str) -> Settings {
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (key, public) = testkit::keygen(dir.path(), "update");
         let mut h = Self {
@@ -548,7 +561,7 @@ impl Harness {
         panic!("the engine did not settle: {:?}", self.e().record.phase);
     }
 
-    async fn verify(&mut self, s: &Spec) -> Option<Entry> {
+    pub(crate) async fn verify(&mut self, s: &Spec) -> Option<Entry> {
         let sha = self.upload(s);
         self.e().request_verify(&sha).unwrap();
         self.run(|_, _| {}).await;
@@ -1015,4 +1028,141 @@ async fn a_stack_rolled_back_once_can_be_applied_again() {
         1,
         "the committed OS was installed again"
     );
+}
+
+/// Steps until `phase` is reached, waiting as the engine asks.
+async fn step_until(h: &mut Harness, at: impl Fn(&Phase) -> bool) {
+    for _ in 0..500 {
+        if at(&h.e().record.phase) {
+            return;
+        }
+        match h.e().step().await.unwrap() {
+            Tick::Wait(d) => {
+                h.clock.fetch_add(d.as_secs() as i64, Ordering::SeqCst);
+            }
+            Tick::Idle => panic!("idle before the phase"),
+            Tick::Moved => {}
+        }
+    }
+    panic!("never reached the phase");
+}
+
+async fn applied(h: &mut Harness, s: &Spec) {
+    assert!(h.verify(s).await.is_none());
+    h.e().request_apply(&s.tag).unwrap();
+}
+
+#[tokio::test]
+async fn the_unit_is_read_whatever_the_engine_does() {
+    let mut h = Harness::new();
+    {
+        let mut w = h.w();
+        w.judge.insert("previous".into(), "update-older".into());
+        w.judge.insert("trial".into(), "update-next".into());
+        w.judge.insert(
+            "rolled_back".into(),
+            "update-bad 2026-09-01T00:00:00Z".into(),
+        );
+    }
+    assert!(h.e().refresh_unit().await);
+    let read = Unit {
+        talos_version: "v1.14.1".into(),
+        stack_tag: OLD_TAG.into(),
+        good: OLD_TAG.into(),
+        previous: "update-older".into(),
+        trial: "update-next".into(),
+        rolled_back: "update-bad 2026-09-01T00:00:00Z".into(),
+        os_trial: false,
+    };
+    assert_eq!(h.e().unit, read);
+    assert!(!h.e().refresh_unit().await, "nothing changed");
+
+    {
+        let mut w = h.w();
+        w.selected = "Talos-v1.14.1~9.efi".into();
+        w.tag = "update-next".into();
+        w.apiserver_down = true;
+    }
+    assert!(h.e().refresh_unit().await);
+    assert!(h.e().unit.os_trial);
+    assert_eq!(
+        h.e().unit.stack_tag,
+        OLD_TAG,
+        "an unread part keeps its reading"
+    );
+
+    {
+        let mut w = h.w();
+        w.apiserver_down = false;
+        w.apid_down = true;
+    }
+    assert!(h.e().refresh_unit().await);
+    let u = h.e().unit.clone();
+    assert_eq!(u.stack_tag, "update-next");
+    assert_eq!(
+        (u.talos_version.as_str(), u.os_trial),
+        ("v1.14.1", true),
+        "an unread part keeps its reading"
+    );
+}
+
+#[tokio::test]
+async fn power_is_refused_while_an_update_runs() {
+    let mut h = Harness::new();
+    applied(&mut h, &Spec::new("update-new")).await;
+    for at in [Phase::Importing, Phase::Settling] {
+        step_until(&mut h, |p| *p == at).await;
+        for p in [Power::Reboot, Power::Shutdown] {
+            let e = h.e().power(p).await.unwrap_err();
+            assert!(
+                e.to_string().contains("update-new is under way"),
+                "{at:?}: {e}"
+            );
+        }
+    }
+    h.run(|_, _| {}).await;
+    assert_eq!(h.e().record.history[0].outcome, Outcome::Committed);
+    let w = h.w();
+    assert!(!w.log.iter().any(|l| l == "shutdown"));
+    assert_eq!(w.log.iter().filter(|l| *l == "reboot").count(), 1);
+}
+
+#[tokio::test]
+async fn a_reboot_on_the_os_trial_backs_the_update_out() {
+    let mut h = Harness::new();
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| *p == Phase::Trial).await;
+    let said = h.e().power(Power::Reboot).await.unwrap();
+    assert_eq!(
+        said,
+        "rebooting: the OS on trial, Talos-v1.14.1~1.efi, is backed out and the unit boots Talos-v1.14.1.efi again"
+    );
+    h.reopen();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Failed);
+    assert!(
+        e.detail.contains("an operator backed the new OS out"),
+        "{}",
+        e.detail
+    );
+    let w = h.w();
+    assert_eq!(
+        (w.tag.as_str(), w.selected.as_str()),
+        (OLD_TAG, "Talos-v1.14.1.efi")
+    );
+}
+
+#[tokio::test]
+async fn power_when_idle_says_what_boots_next() {
+    let mut h = Harness::new();
+    assert_eq!(h.e().power(Power::Shutdown).await.unwrap(), "shutting down");
+    assert_eq!(h.w().log, ["shutdown"]);
+    h.w().selected = "Talos-v1.14.1~9.efi".into();
+    let said = h.e().power(Power::Reboot).await.unwrap();
+    assert!(
+        said.starts_with("rebooting: the OS on trial, Talos-v1.14.1~9.efi, is backed out"),
+        "{said}"
+    );
+    assert!(h.e().record.before.is_none());
 }

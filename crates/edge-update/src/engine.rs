@@ -78,6 +78,9 @@ pub struct Before {
     pub default_entry: String,
     pub started: i64,
     pub snapshot: Option<String>,
+    /// An operator powered the unit down on the OS trial.
+    #[serde(default)]
+    pub backed_out: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +112,20 @@ pub struct Record {
     pub since: i64,
 }
 
+impl Record {
+    /// Why the unit must not be powered down now: an update is under way. Its
+    /// OS trial is the exception, since a reboot then backs the update out.
+    pub fn power_refusal(&self) -> Option<String> {
+        match self.phase {
+            Phase::Idle | Phase::Verifying { .. } | Phase::Trial => None,
+            _ => Some(format!(
+                "the update to {} is under way: wait until it commits or fails",
+                self.release.as_ref().map_or("", |r| r.tag())
+            )),
+        }
+    }
+}
+
 impl Default for Record {
     fn default() -> Self {
         Self {
@@ -127,6 +144,24 @@ pub enum Tick {
     Moved,
     Wait(Duration),
     Idle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Power {
+    Reboot,
+    Shutdown,
+}
+
+/// The unit as it runs, whatever the engine is doing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Unit {
+    pub talos_version: String,
+    pub stack_tag: String,
+    pub good: String,
+    pub previous: String,
+    pub trial: String,
+    pub rolled_back: String,
+    pub os_trial: bool,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -157,6 +192,7 @@ pub struct Engine {
     pub record: Record,
     /// What the current phase is waiting for, for a person.
     pub detail: String,
+    pub unit: Unit,
 }
 
 enum Next {
@@ -207,6 +243,7 @@ impl Engine {
             now,
             record,
             detail: String::new(),
+            unit: Unit::default(),
         })
     }
 
@@ -255,6 +292,67 @@ impl Engine {
             rel.tag()
         );
         self.go(Phase::Starting)
+    }
+
+    /// Rereads the unit, a part that cannot be read keeping its last reading;
+    /// true if anything changed.
+    pub async fn refresh_unit(&mut self) -> bool {
+        let was = self.unit.clone();
+        match async { anyhow::Ok((self.talos.version().await?, self.boot().await?)) }.await {
+            Ok((v, b)) => (self.unit.talos_version, self.unit.os_trial) = (v, b.trial()),
+            Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's OS"),
+        }
+        let st = &self.settings.stack;
+        match async {
+            let (_, tag) = self.cluster.sync(&st.flux_instance).await?;
+            anyhow::Ok((tag, self.cluster.config_map(&st.judge).await?))
+        }
+        .await
+        {
+            Ok((tag, judge)) => {
+                let judge = judge.unwrap_or_default();
+                let get = |k: &str| judge.get(k).cloned().unwrap_or_default();
+                let u = &mut self.unit;
+                u.stack_tag = tag;
+                (u.good, u.previous, u.trial, u.rolled_back) = (
+                    get("good"),
+                    get("previous"),
+                    get("trial"),
+                    get("rolled_back"),
+                );
+            }
+            Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's stack"),
+        }
+        self.unit != was
+    }
+
+    /// Reboots or shuts the unit down; says what it boots next.
+    pub async fn power(&mut self, p: Power) -> anyhow::Result<String> {
+        if let Some(why) = self.record.power_refusal() {
+            anyhow::bail!(why);
+        }
+        let b = self.boot().await?;
+        match p {
+            Power::Reboot => self.talos.reboot().await?,
+            Power::Shutdown => self.talos.shutdown().await?,
+        }
+        let action = match p {
+            Power::Reboot => "rebooting",
+            Power::Shutdown => "shutting down",
+        };
+        if !b.trial() {
+            return Ok(action.into());
+        }
+        if self.record.phase == Phase::Trial
+            && let Some(before) = self.record.before.as_mut()
+        {
+            before.backed_out = true;
+            self.save()?;
+        }
+        Ok(format!(
+            "{action}: the OS on trial, {}, is backed out and the unit boots {} again",
+            b.selected, b.default
+        ))
     }
 
     fn go(&mut self, p: Phase) -> anyhow::Result<()> {
@@ -571,6 +669,7 @@ impl Engine {
             default_entry: self.boot().await?.default,
             started: (self.now)(),
             snapshot: None,
+            backed_out: false,
         });
         Ok(Go(Phase::Importing))
     }
@@ -705,14 +804,16 @@ impl Engine {
                 ),
             );
         }
-        if b.default
-            .eq_ignore_ascii_case(&self.before()?.default_entry)
-        {
-            return Ok(Fail(
-                "the new OS did not stay up, and the unit went back to its previous OS by itself. \
-                 The stack did not move; applying again repeats the upgrade"
-                    .into(),
-            ));
+        let before = self.before()?;
+        if b.default.eq_ignore_ascii_case(&before.default_entry) {
+            let why = if before.backed_out {
+                "an operator backed the new OS out by powering the unit down on its trial"
+            } else {
+                "the new OS did not stay up, and the unit went back to its previous OS by itself"
+            };
+            return Ok(Fail(format!(
+                "{why}. The stack did not move; applying again repeats the upgrade"
+            )));
         }
         let want = self.release()?.get("TALOS_VERSION").to_string();
         let running = self.talos.version().await?;
@@ -894,4 +995,4 @@ pub fn version_ge(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

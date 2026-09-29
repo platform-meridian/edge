@@ -285,6 +285,18 @@ impl crate::unit::Talos for Node {
         }
         Ok(())
     }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        let r = self
+            .machine()?
+            .shutdown(req(pb::ShutdownRequest { force: false }))
+            .await?
+            .into_inner();
+        for m in &r.messages {
+            upstream(m.metadata.as_ref())?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -298,7 +310,9 @@ mod tests {
 
     type Stream<T> = std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
 
-    struct Apid;
+    /// Answers as apid does, and says which power calls it took.
+    #[derive(Clone, Default)]
+    struct Apid(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     #[tonic::async_trait]
     impl MachineService for Apid {
@@ -338,9 +352,29 @@ mod tests {
         }
         async fn reboot(
             &self,
-            _: Request<pb::RebootRequest>,
+            r: Request<pb::RebootRequest>,
         ) -> Result<Response<pb::RebootResponse>, Status> {
-            Err(Status::unimplemented(""))
+            let mode = r.into_inner().mode();
+            self.0.lock().unwrap().push(format!("reboot {mode:?}"));
+            Ok(Response::new(pb::RebootResponse { messages: vec![] }))
+        }
+        async fn shutdown(
+            &self,
+            r: Request<pb::ShutdownRequest>,
+        ) -> Result<Response<pb::ShutdownResponse>, Status> {
+            let force = r.into_inner().force;
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("shutdown force={force}"));
+            Ok(Response::new(pb::ShutdownResponse {
+                messages: vec![pb::Shutdown {
+                    metadata: Some(pb::Metadata {
+                        hostname: String::new(),
+                        error: "already shutting down".into(),
+                    }),
+                }],
+            }))
         }
         async fn version(
             &self,
@@ -388,6 +422,10 @@ mod tests {
     }
 
     async fn apid(server: &Pki, clients: &Pki) -> std::net::SocketAddr {
+        serve(server, clients, Apid::default()).await
+    }
+
+    async fn serve(server: &Pki, clients: &Pki, apid: Apid) -> std::net::SocketAddr {
         let (cert, key) = server.leaf(&["talos.default"]);
         let key = key.replace("ED25519 PRIVATE KEY", "PRIVATE KEY");
         let tls = ServerTlsConfig::new()
@@ -400,7 +438,7 @@ mod tests {
             Server::builder()
                 .tls_config(tls)
                 .unwrap()
-                .add_service(MachineServiceServer::new(Apid))
+                .add_service(MachineServiceServer::new(apid))
                 .serve_with_incoming(incoming),
         );
         addr
@@ -463,5 +501,25 @@ mod tests {
             &addr.to_string(),
         );
         assert!(node.version().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn power_calls_power_cycle_and_shut_down_gracefully() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = Pki::new();
+        let apid = Apid::default();
+        let addr = serve(&pki, &pki, apid.clone()).await;
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::new(
+            &talosconfig(d.path(), &pki.ca, pki.leaf(&[])),
+            &addr.to_string(),
+        );
+        node.reboot().await.unwrap();
+        let e = node.shutdown().await.unwrap_err();
+        assert_eq!(e.to_string(), "already shutting down");
+        assert_eq!(
+            *apid.0.lock().unwrap(),
+            ["reboot Powercycle", "shutdown force=false"]
+        );
     }
 }

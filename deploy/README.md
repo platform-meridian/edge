@@ -30,7 +30,7 @@ Then provide:
     kustomization: flux-system/my-stack
     source: flux-system/my-stack        # the OCIRepository
     lock: flux-system/my-stack-lock     # built_epoch, and what LOCK_* lines check
-    judge: flux-system/my-stack-commit  # good and rolled_back
+    judge: flux-system/my-stack-commit  # good, previous, trial, rolled_back
   ```
 - any static routes, as ConfigMaps projected into edge-gateway's
   `routes.d/`, merged in name order:

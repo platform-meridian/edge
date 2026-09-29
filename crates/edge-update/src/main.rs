@@ -152,21 +152,30 @@ async fn serve() -> anyhow::Result<()> {
         }
     });
 
-    run(&mut engine, rx, publish).await;
+    let mut term = edge_common::Terminator::new();
+    run(&mut engine, rx, publish, term.wait()).await;
     Ok(())
 }
+
+/// How often the unit is reread while nothing else happens.
+const UNIT_EVERY: Duration = Duration::from_secs(30);
 
 async fn run(
     engine: &mut Engine,
     mut rx: mpsc::Receiver<Command>,
     publish: watch::Sender<Snapshot>,
+    stop: impl std::future::Future<Output = ()>,
 ) {
-    let mut term = edge_common::Terminator::new();
     let snap = |e: &Engine| Snapshot {
         record: e.record.clone(),
         detail: e.detail.clone(),
+        unit: e.unit.clone(),
     };
+    let mut unit = tokio::time::interval(UNIT_EVERY);
+    unit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut phase = engine.record.phase.clone();
     let mut backoff = Duration::from_secs(5);
+    tokio::pin!(stop);
     loop {
         publish.send_replace(snap(engine));
         let wait = match engine.step().await {
@@ -184,22 +193,98 @@ async fn run(
             }
         };
         publish.send_replace(snap(engine));
-        tokio::select! {
-            cmd = rx.recv() => match cmd {
-                Some(Command::Verify(sha, reply)) => {
-                    let r = engine.request_verify(&sha);
-                    publish.send_replace(snap(engine));
-                    let _ = reply.send(r);
-                }
-                Some(Command::Apply(tag, reply)) => {
-                    let r = engine.request_apply(&tag);
-                    publish.send_replace(snap(engine));
-                    let _ = reply.send(r);
-                }
-                None => return,
-            },
-            _ = tokio::time::sleep(wait) => {}
-            _ = term.wait() => return,
+        // A new phase has moved something on the unit.
+        if engine.record.phase != phase {
+            phase = engine.record.phase.clone();
+            unit.reset_immediately();
         }
+        let next = tokio::time::Instant::now() + wait;
+        loop {
+            tokio::select! {
+                cmd = rx.recv() => {
+                    match cmd {
+                        Some(Command::Verify(sha, reply)) => {
+                            let r = engine.request_verify(&sha);
+                            publish.send_replace(snap(engine));
+                            let _ = reply.send(r);
+                        }
+                        Some(Command::Apply(tag, reply)) => {
+                            let r = engine.request_apply(&tag);
+                            publish.send_replace(snap(engine));
+                            let _ = reply.send(r);
+                        }
+                        Some(Command::Power(p, reply)) => {
+                            let _ = reply.send(engine.power(p).await);
+                        }
+                        None => return,
+                    }
+                    break;
+                }
+                _ = unit.tick() => {
+                    if engine.refresh_unit().await {
+                        publish.send_replace(snap(engine));
+                    }
+                }
+                _ = tokio::time::sleep_until(next) => break,
+                _ = &mut stop => return,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::{Harness, OLD_TAG, Spec};
+
+    #[tokio::test(start_paused = true)]
+    async fn the_unit_is_reread_while_idle_and_sent_on_change() {
+        let mut h = Harness::new();
+        let mut engine = h.engine.take().unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let (publish, mut status) = watch::channel(Snapshot::default());
+        tokio::spawn(async move { run(&mut engine, rx, publish, std::future::pending()).await });
+
+        status.wait_for(|s| s.unit.good == OLD_TAG).await.unwrap();
+        tokio::time::sleep(UNIT_EVERY + Duration::from_secs(1)).await;
+        assert!(!status.has_changed().unwrap(), "sent with nothing changed");
+
+        h.world
+            .lock()
+            .unwrap()
+            .judge
+            .insert("good".into(), "update-new".into());
+        let asked = tokio::time::Instant::now();
+        status
+            .wait_for(|s| s.unit.good == "update-new")
+            .await
+            .unwrap();
+        assert!(
+            asked.elapsed() < UNIT_EVERY,
+            "reread after {:?}",
+            asked.elapsed()
+        );
+    }
+
+    // Real time: the import runs on a blocking thread, which paused time skips past.
+    #[tokio::test]
+    async fn a_new_phase_rereads_the_unit_at_once() {
+        let mut h = Harness::new();
+        assert!(h.verify(&Spec::new("update-new")).await.is_none());
+        let mut engine = h.engine.take().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let (publish, mut status) = watch::channel(Snapshot::default());
+        tokio::spawn(async move { run(&mut engine, rx, publish, std::future::pending()).await });
+        status.wait_for(|s| s.unit.good == OLD_TAG).await.unwrap();
+
+        let (reply, applied) = tokio::sync::oneshot::channel();
+        tx.send(Command::Apply("update-new".into(), reply))
+            .await
+            .unwrap();
+        applied.await.unwrap().unwrap();
+        tokio::time::timeout(UNIT_EVERY / 6, status.wait_for(|s| s.unit.os_trial))
+            .await
+            .expect("the unit was not reread when the phase moved")
+            .unwrap();
     }
 }

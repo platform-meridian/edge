@@ -8,19 +8,21 @@ use connectrpc::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::engine::{Entry, Outcome, Phase, Record, Release};
+use crate::engine::{Entry, Outcome, Phase, Power, Record, Release, Unit};
 use crate::pb::edge::update::v1 as pb;
 use crate::upload::{Upload, Uploads};
 
 pub enum Command {
     Verify(String, oneshot::Sender<anyhow::Result<()>>),
     Apply(String, oneshot::Sender<anyhow::Result<()>>),
+    Power(Power, oneshot::Sender<anyhow::Result<String>>),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub record: Record,
     pub detail: String,
+    pub unit: Unit,
 }
 
 pub struct Service {
@@ -83,6 +85,22 @@ impl Service {
         Ok(self.convert(&s))
     }
 
+    /// Refused at once from the status while an update runs, rather than
+    /// after the engine's current step, which may take minutes.
+    async fn power(&self, p: Power) -> Result<String, ConnectError> {
+        if let Some(why) = self.status.borrow().record.power_refusal() {
+            return Err(ConnectError::failed_precondition(why));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Power(p, tx))
+            .await
+            .map_err(|_| ConnectError::unavailable("the engine has stopped"))?;
+        rx.await
+            .map_err(|_| ConnectError::unavailable("the engine has stopped"))?
+            .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))
+    }
+
     fn convert(&self, s: &Snapshot) -> pb::Status {
         let upload = self.uploads.lock().ok().and_then(|u| u.current());
         status(s, upload.as_ref())
@@ -141,6 +159,19 @@ fn phase(r: &Record) -> pb::Phase {
     }
 }
 
+fn unit(u: &Unit) -> pb::Unit {
+    pb::Unit {
+        talos_version: u.talos_version.clone(),
+        stack_tag: u.stack_tag.clone(),
+        good: u.good.clone(),
+        previous: u.previous.clone(),
+        trial: u.trial.clone(),
+        rolled_back: u.rolled_back.clone(),
+        os_trial: u.os_trial,
+        ..Default::default()
+    }
+}
+
 fn status(s: &Snapshot, up: Option<&Upload>) -> pb::Status {
     let r = &s.record;
     pb::Status {
@@ -150,6 +181,7 @@ fn status(s: &Snapshot, up: Option<&Upload>) -> pb::Status {
         error: r.error.clone(),
         upload: up.map(upload).into(),
         updated_unix: r.since,
+        unit: Some(unit(&s.unit)).into(),
         ..Default::default()
     }
 }
@@ -290,6 +322,28 @@ impl pb::UpdateService for Service {
             ..Default::default()
         })
     }
+
+    async fn reboot(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, pb::RebootRequest>,
+    ) -> ServiceResult<pb::RebootResponse> {
+        Response::ok(pb::RebootResponse {
+            detail: self.power(Power::Reboot).await?,
+            ..Default::default()
+        })
+    }
+
+    async fn shutdown(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, pb::ShutdownRequest>,
+    ) -> ServiceResult<pb::ShutdownResponse> {
+        Response::ok(pb::ShutdownResponse {
+            detail: self.power(Power::Shutdown).await?,
+            ..Default::default()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +444,7 @@ mod tests {
                         ..Record::default()
                     },
                     detail: "unpacking".into(),
+                    ..Snapshot::default()
                 });
                 let _ = reply.send(Ok(()));
             }
@@ -422,5 +477,88 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn the_status_carries_the_unit() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, publish, _rx) = serve(d.path()).await;
+        publish.send_replace(Snapshot {
+            unit: Unit {
+                talos_version: "v1.14.1".into(),
+                stack_tag: "s2".into(),
+                good: "s2".into(),
+                previous: "s1".into(),
+                trial: "s3".into(),
+                rolled_back: "s0 2026-09-01T00:00:00Z".into(),
+                os_trial: true,
+            },
+            ..Snapshot::default()
+        });
+        let u = c
+            .get_status(pb::GetStatusRequest::default())
+            .await
+            .unwrap()
+            .into_owned()
+            .status
+            .unit
+            .clone();
+        assert_eq!(
+            (
+                u.talos_version.as_str(),
+                u.stack_tag.as_str(),
+                u.good.as_str(),
+                u.previous.as_str(),
+                u.trial.as_str(),
+                u.rolled_back.as_str(),
+                u.os_trial
+            ),
+            (
+                "v1.14.1",
+                "s2",
+                "s2",
+                "s1",
+                "s3",
+                "s0 2026-09-01T00:00:00Z",
+                true
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn power_is_refused_at_once_mid_update_and_asked_of_the_engine_otherwise() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, publish, mut rx) = serve(d.path()).await;
+        publish.send_replace(Snapshot {
+            record: Record {
+                phase: Phase::Installing,
+                ..Record::default()
+            },
+            ..Snapshot::default()
+        });
+        let e = c.reboot(pb::RebootRequest::default()).await.unwrap_err();
+        assert_eq!(e.code, connectrpc::ErrorCode::FailedPrecondition);
+        assert!(e.message.unwrap().contains("under way"));
+        assert!(rx.try_recv().is_err(), "the engine was asked");
+
+        publish.send_replace(Snapshot::default());
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let Command::Power(p, reply) = cmd else {
+                    unreachable!()
+                };
+                let _ = reply.send(match p {
+                    Power::Reboot => Ok("rebooting".into()),
+                    Power::Shutdown => Err(anyhow::anyhow!("apid said no")),
+                });
+            }
+        });
+        let r = c.reboot(pb::RebootRequest::default()).await.unwrap();
+        assert_eq!(r.into_owned().detail, "rebooting");
+        let e = c
+            .shutdown(pb::ShutdownRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(e.message.as_deref(), Some("apid said no"));
     }
 }

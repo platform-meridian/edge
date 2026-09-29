@@ -25,6 +25,7 @@ pub trait Talos: Send + Sync {
     async fn install(&self, image: &str) -> anyhow::Result<()>;
     /// A power cycle: a kexec would boot the default and lose the trial.
     async fn reboot(&self) -> anyhow::Result<()>;
+    async fn shutdown(&self) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -117,6 +118,6 @@ pub struct Stack {
     pub source: Ref,
     /// The stack's own record: `built_epoch`, and what `LOCK_*` lines check.
     pub lock: Ref,
-    /// The judge's record: `good` and `rolled_back`.
+    /// The judge's record: `good`, `previous`, `trial` and `rolled_back`.
     pub judge: Ref,
 }

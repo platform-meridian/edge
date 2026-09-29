@@ -22,6 +22,11 @@ service UpdateService {
   rpc WatchStatus(WatchStatusRequest) returns (stream WatchStatusResponse);
   // Updates applied or refused, newest first.
   rpc ListHistory(ListHistoryRequest) returns (ListHistoryResponse);
+  // Power-cycles the unit. Refused while an update is under way, except on
+  // its OS trial: the reboot then boots the previous OS, backing the update out.
+  rpc Reboot(RebootRequest) returns (RebootResponse);
+  // Powers the unit off, on the same terms as Reboot.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
 
 message BeginUploadRequest {
@@ -91,6 +96,20 @@ message ListHistoryResponse {
   repeated HistoryEntry entries = 1;
 }
 
+message RebootRequest {}
+
+message RebootResponse {
+  // What the unit boots next, for a person.
+  string detail = 1;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {
+  // What the unit boots when it is powered on again, for a person.
+  string detail = 1;
+}
+
 enum Phase {
   PHASE_UNSPECIFIED = 0;
   PHASE_IDLE = 1;
@@ -119,6 +138,24 @@ message Status {
   string error = 4;
   Upload upload = 5;
   int64 updated_unix = 6;
+  Unit unit = 7;
+}
+
+// The unit as it runs, read every half-minute whatever the engine is doing.
+// A part that cannot be read keeps what was last read.
+message Unit {
+  string talos_version = 1;
+  // The stack tag the unit follows.
+  string stack_tag = 2;
+  // The stack judge's record.
+  string good = 3;
+  string previous = 4;
+  // The stack being judged, when it is not the good one.
+  string trial = 5;
+  // "<tag> <time>" of the last rollback.
+  string rolled_back = 6;
+  // The running OS is on trial: a reset boots the previous one.
+  bool os_trial = 7;
 }
 
 message Release {
