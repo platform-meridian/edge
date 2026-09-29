@@ -117,7 +117,7 @@ jobs:
       attestations: write
     strategy:
       matrix:
-        name: [edge-cni, edge-dhcp, edge-dns, edge-gateway, edge-idle, edge-layers, edge-registry, edge-scope, edge-signer, edge-state, edge-watch]
+        name: [edge-cni, edge-dhcp, edge-dns, edge-gateway, edge-idle, edge-layers, edge-registry, edge-scope, edge-signer, edge-state, edge-update, edge-watch]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8

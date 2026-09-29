@@ -19,6 +19,7 @@ recover without anyone on site.
 | [`edge-dhcp`](crates/edge-dhcp/) | Replaces dnsmasq: DHCP and a local DNS name for the device on its operator port. |
 | [`edge-gateway`](crates/edge-gateway/) | A Gateway API ingress on the host's own ports that authorises every request unless its route opts out. |
 | [`edge-signer`](crates/edge-signer/) | Replaces cert-manager: signs Kubernetes pod certificates from the operator's CA. |
+| [`edge-update`](crates/edge-update/) | Verifies signed update bundles and applies them on the device: the OS on trial, then the stack, each committed or rolled back. |
 | [`edge-watch`](crates/edge-watch/) | Keeps the hardware watchdog armed and resets the device when its health checks fail. |
 | [`edge-scope`](crates/edge-scope/) | Records logs and hardware health so they survive resets and power loss. |
 | [`edge-registry`](crates/edge-registry/) | An image registry on the device that containerd and Flux pull through: a store that survives power loss, served read-only, falling back to Talos's image cache. |
