@@ -6,7 +6,6 @@ substitute:
 | Placeholder | Value |
 |---|---|
 | `@OPERATOR_DOMAIN@`, `@OPERATOR_ADDR@` | the domain and address operators reach the device on |
-| `@NODE_HOSTNAME@` | the node's hostname |
 | `@APISERVER_HOST@`, `@APISERVER_PORT@` | the node's kube-apiserver |
 | `@CLUSTER_DNS@` | the kubelet's `clusterDNS` address |
 | `@BUILD_EPOCH@` | the build time, the earliest the clock may read (edge-scope) |
