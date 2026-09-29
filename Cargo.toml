@@ -15,6 +15,7 @@ members = [
     "crates/edge-layers",
     "crates/edge-dhcp",
     "crates/edge-common",
+    "crates/edge-registry",
 ]
 
 [workspace.package]

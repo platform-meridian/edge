@@ -722,6 +722,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "edge-common",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nix 0.31.3",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "edge-scope"
 version = "0.1.0"
 dependencies = [
