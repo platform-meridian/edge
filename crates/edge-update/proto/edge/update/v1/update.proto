@@ -1,0 +1,148 @@
+// Updates the unit from bundles signed by the pinned update key.
+//
+// A bundle is uploaded in chunks, verified, then applied. Every call is safe to
+// repeat: an upload resumes, and an update in progress survives a reboot or a
+// power cut and carries on by itself.
+syntax = "proto3";
+
+package edge.update.v1;
+
+service UpdateService {
+  // Starts the upload of a bundle, or resumes the one with the same hash.
+  rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
+  // Stores one chunk. A chunk already held is accepted again.
+  rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
+  // Checks a complete upload against the pinned key and this unit, changing
+  // nothing on the unit. The result is in the status.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // Applies the verified bundle.
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // The status now, then every change to it.
+  rpc WatchStatus(WatchStatusRequest) returns (stream WatchStatusResponse);
+  // Updates applied or refused, newest first.
+  rpc ListHistory(ListHistoryRequest) returns (ListHistoryResponse);
+}
+
+message BeginUploadRequest {
+  uint64 size = 1;
+  // SHA-256 of the whole bundle.
+  bytes sha256 = 2;
+}
+
+message BeginUploadResponse {
+  Upload upload = 1;
+}
+
+message Upload {
+  bytes sha256 = 1;
+  uint64 size = 2;
+  uint32 chunk_size = 3;
+  // Bit i (least significant first within each byte) is set once chunk i is held.
+  bytes received = 4;
+  // Every chunk is held and the whole matches sha256.
+  bool complete = 5;
+}
+
+message PutChunkRequest {
+  bytes sha256 = 1;
+  uint32 index = 2;
+  bytes data = 3;
+  // SHA-256 of data.
+  bytes data_sha256 = 4;
+}
+
+message PutChunkResponse {
+  Upload upload = 1;
+}
+
+message VerifyRequest {
+  bytes sha256 = 1;
+}
+
+message VerifyResponse {
+  Status status = 1;
+}
+
+message ApplyRequest {
+  // The stack tag of the verified release, so a client applies what it saw.
+  string stack_tag = 1;
+}
+
+message ApplyResponse {
+  Status status = 1;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  Status status = 1;
+}
+
+message WatchStatusRequest {}
+
+message WatchStatusResponse {
+  Status status = 1;
+}
+
+message ListHistoryRequest {}
+
+message ListHistoryResponse {
+  repeated HistoryEntry entries = 1;
+}
+
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  PHASE_IDLE = 1;
+  PHASE_VERIFYING = 2;
+  PHASE_VERIFIED = 3;
+  PHASE_IMPORTING = 4;
+  PHASE_SNAPSHOTTING = 5;
+  PHASE_STAGING = 6;
+  PHASE_INSTALLING = 7;
+  PHASE_REBOOTING = 8;
+  PHASE_TRIAL = 9;
+  PHASE_SEEDING = 10;
+  PHASE_AWAITING_GOOD = 11;
+  PHASE_REPOINTING = 12;
+  PHASE_JUDGING = 13;
+  PHASE_COLLECTING = 14;
+}
+
+message Status {
+  Phase phase = 1;
+  // What is happening now, for a person.
+  string detail = 2;
+  // The release verified or being applied.
+  Release release = 3;
+  // Why the last verification or update stopped, empty once one succeeds.
+  string error = 4;
+  Upload upload = 5;
+  int64 updated_unix = 6;
+}
+
+message Release {
+  string stack_tag = 1;
+  string talos_version = 2;
+  int64 built_epoch = 3;
+  // Every MANIFEST line, as signed.
+  map<string, string> manifest = 4;
+  bytes sha256 = 5;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_COMMITTED = 1;
+  OUTCOME_FAILED = 2;
+  OUTCOME_REFUSED = 3;
+}
+
+message HistoryEntry {
+  Release release = 1;
+  Outcome outcome = 2;
+  string detail = 3;
+  int64 started_unix = 4;
+  int64 finished_unix = 5;
+  // SHA-256 of the store copy taken before the update, if it got that far.
+  string snapshot_sha256 = 6;
+}

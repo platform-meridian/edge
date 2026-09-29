@@ -1,0 +1,32 @@
+// cosi-project/runtime api/v1alpha1: reading one resource, and the machine
+// config's spec (talos api/resource/config).
+syntax = "proto3";
+
+package cosi.resource;
+
+service State {
+    rpc Get(GetRequest) returns (GetResponse);
+}
+
+message GetRequest {
+    string namespace = 1;
+    string type = 2;
+    string id = 3;
+}
+
+message Spec {
+    bytes proto_spec = 1;
+    string yaml_spec = 2;
+}
+
+message Resource {
+    Spec spec = 2;
+}
+
+message GetResponse {
+    Resource resource = 1;
+}
+
+message MachineConfigSpec {
+    bytes yaml_marshalled = 1;
+}

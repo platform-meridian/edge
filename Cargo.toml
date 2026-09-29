@@ -16,6 +16,7 @@ members = [
     "crates/edge-dhcp",
     "crates/edge-common",
     "crates/edge-registry",
+    "crates/edge-update",
 ]
 
 [workspace.package]

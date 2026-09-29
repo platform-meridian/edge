@@ -1,0 +1,149 @@
+// The corner of Talos's API (siderolabs/talos api/, cosi-project/runtime) that
+// edge-update uses. Names and field numbers are upstream's; fields left out are
+// skipped by the decoder.
+syntax = "proto3";
+
+package machine;
+
+message Metadata {
+    string hostname = 1;
+    string error = 2;
+}
+
+message Data {
+    Metadata metadata = 1;
+    bytes bytes = 2;
+}
+
+message Empty {}
+
+enum ContainerDriver {
+    CONTAINERD = 0;
+    CRI = 1;
+}
+
+enum ContainerdNamespace {
+    NS_UNKNOWN = 0;
+    NS_SYSTEM = 1;
+    NS_CRI = 2;
+}
+
+message ContainerdInstance {
+    ContainerDriver driver = 1;
+    ContainerdNamespace namespace = 2;
+}
+
+service MachineService {
+    rpc ApplyConfiguration(ApplyConfigurationRequest) returns (ApplyConfigurationResponse);
+    rpc List(ListRequest) returns (stream FileInfo);
+    rpc Read(ReadRequest) returns (stream Data);
+    rpc Reboot(RebootRequest) returns (RebootResponse);
+    rpc Version(Empty) returns (VersionResponse);
+}
+
+message ApplyConfigurationRequest {
+    enum Mode {
+        REBOOT = 0;
+        AUTO = 1;
+        NO_REBOOT = 2;
+        STAGED = 3;
+        TRY = 4;
+    }
+    bytes data = 1;
+    Mode mode = 4;
+    bool dry_run = 5;
+}
+
+message ApplyConfiguration {
+    Metadata metadata = 1;
+    repeated string warnings = 2;
+    string mode_details = 4;
+}
+
+message ApplyConfigurationResponse {
+    repeated ApplyConfiguration messages = 1;
+}
+
+message ListRequest {
+    string root = 1;
+}
+
+message FileInfo {
+    Metadata metadata = 1;
+    string name = 2;
+    int64 size = 3;
+    bool is_dir = 6;
+    string error = 7;
+}
+
+message ReadRequest {
+    string path = 1;
+}
+
+message RebootRequest {
+    enum Mode {
+        DEFAULT = 0;
+        POWERCYCLE = 1;
+    }
+    Mode mode = 1;
+}
+
+message Reboot {
+    Metadata metadata = 1;
+}
+
+message RebootResponse {
+    repeated Reboot messages = 1;
+}
+
+message VersionInfo {
+    string tag = 1;
+}
+
+message Version {
+    Metadata metadata = 1;
+    VersionInfo version = 2;
+}
+
+message VersionResponse {
+    repeated Version messages = 1;
+}
+
+service LifecycleService {
+    rpc Upgrade(LifecycleServiceUpgradeRequest) returns (stream LifecycleServiceUpgradeResponse);
+}
+
+message InstallArtifactsSource {
+    string image_name = 1;
+}
+
+message LifecycleServiceUpgradeRequest {
+    ContainerdInstance containerd = 1;
+    InstallArtifactsSource source = 2;
+}
+
+message LifecycleServiceInstallProgress {
+    oneof response {
+        string message = 1;
+        int32 exit_code = 2;
+    }
+}
+
+message LifecycleServiceUpgradeResponse {
+    LifecycleServiceInstallProgress progress = 1;
+}
+
+service ImageService {
+    rpc Pull(ImageServicePullRequest) returns (stream ImageServicePullResponse);
+}
+
+message ImageServicePullRequest {
+    ContainerdInstance containerd = 1;
+    string image_ref = 3;
+}
+
+message ImageServicePullResponse {
+    oneof response {
+        string name = 1;
+    }
+}

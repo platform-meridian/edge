@@ -1,0 +1,228 @@
+//! The cluster, through the apiserver: Flux's objects, the stack's records and
+//! the bundle's seed.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use anyhow::Context;
+use async_trait::async_trait;
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
+use k8s_openapi::api::core::v1::ConfigMap;
+use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams};
+use kube::{Api, Client};
+use serde::Deserialize;
+
+use crate::unit::Ref;
+
+const MANAGER: &str = "edge-update";
+const CALL: Duration = Duration::from_secs(30);
+
+pub struct Kube {
+    client: Client,
+}
+
+impl Kube {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    fn dynamic(&self, gvk: (&str, &str, &str), at: &Ref) -> Api<DynamicObject> {
+        let ar = ApiResource::from_gvk(&GroupVersionKind::gvk(gvk.0, gvk.1, gvk.2));
+        Api::namespaced_with(self.client.clone(), &at.namespace, &ar)
+    }
+}
+
+const FLUX_INSTANCE: (&str, &str, &str) = ("fluxcd.controlplane.io", "v1", "FluxInstance");
+const OCI_REPOSITORY: (&str, &str, &str) = ("source.toolkit.fluxcd.io", "v1", "OCIRepository");
+const KUSTOMIZATION: (&str, &str, &str) = ("kustomize.toolkit.fluxcd.io", "v1", "Kustomization");
+
+async fn timed<T>(f: impl std::future::Future<Output = kube::Result<T>>) -> anyhow::Result<T> {
+    Ok(tokio::time::timeout(CALL, f)
+        .await
+        .context("the apiserver did not answer")??)
+}
+
+/// Objects in a manifest stream, empty documents skipped.
+fn objects(manifests: &str) -> anyhow::Result<Vec<DynamicObject>> {
+    let mut out = Vec::new();
+    for de in serde_yaml::Deserializer::from_str(manifests) {
+        let v = serde_yaml::Value::deserialize(de)?;
+        if v.is_null() {
+            continue;
+        }
+        out.push(serde_yaml::from_value(v).context("a seed document is not a Kubernetes object")?);
+    }
+    Ok(out)
+}
+
+#[async_trait]
+impl crate::unit::Cluster for Kube {
+    async fn config_map(&self, at: &Ref) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &at.namespace);
+        Ok(timed(api.get_opt(&at.name))
+            .await?
+            .map(|c| c.data.unwrap_or_default()))
+    }
+
+    async fn sync(&self, instance: &Ref) -> anyhow::Result<(String, String)> {
+        let fi = timed(self.dynamic(FLUX_INSTANCE, instance).get(&instance.name)).await?;
+        let sync = &fi.data["spec"]["sync"];
+        let s = |k: &str| sync[k].as_str().unwrap_or_default().to_string();
+        Ok((s("url"), s("ref")))
+    }
+
+    async fn repoint(
+        &self,
+        instance: &Ref,
+        url: &str,
+        tag: &str,
+        path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut sync = serde_json::json!({ "url": url, "ref": tag });
+        if let Some(p) = path {
+            sync["path"] = p.into();
+        }
+        let patch = serde_json::json!({ "spec": { "sync": sync } });
+        timed(self.dynamic(FLUX_INSTANCE, instance).patch(
+            &instance.name,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn reconcile(&self, source: &Ref) -> anyhow::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .to_string();
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { "reconcile.fluxcd.io/requestedAt": now } }
+        });
+        timed(self.dynamic(OCI_REPOSITORY, source).patch(
+            &source.name,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn applied(&self, kustomization: &Ref) -> anyhow::Result<Option<String>> {
+        let k = timed(
+            self.dynamic(KUSTOMIZATION, kustomization)
+                .get_opt(&kustomization.name),
+        )
+        .await?;
+        Ok(k.and_then(|k| {
+            k.data["status"]["lastAppliedRevision"]
+                .as_str()
+                .map(String::from)
+        }))
+    }
+
+    async fn apply(&self, manifests: &str) -> anyhow::Result<()> {
+        for obj in objects(manifests)? {
+            let types = obj
+                .types
+                .clone()
+                .context("a seed object has no apiVersion or kind")?;
+            let gvk = GroupVersionKind::try_from(&types)?;
+            let name = obj
+                .metadata
+                .name
+                .clone()
+                .context("a seed object has no name")?;
+            let (ar, caps) = timed(kube::discovery::pinned_kind(&self.client, &gvk)).await?;
+            let api: Api<DynamicObject> = match (&caps.scope, &obj.metadata.namespace) {
+                (kube::discovery::Scope::Namespaced, Some(ns)) => {
+                    Api::namespaced_with(self.client.clone(), ns, &ar)
+                }
+                (kube::discovery::Scope::Namespaced, None) => {
+                    anyhow::bail!("the seed's {} {name} names no namespace", gvk.kind)
+                }
+                (kube::discovery::Scope::Cluster, _) => Api::all_with(self.client.clone(), &ar),
+            };
+            timed(api.patch(
+                &name,
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(&obj),
+            ))
+            .await
+            .with_context(|| format!("apply {} {name}", gvk.kind))?;
+        }
+        Ok(())
+    }
+
+    async fn not_rolled_out(&self, manifests: &str) -> anyhow::Result<Vec<String>> {
+        let mut waiting = Vec::new();
+        for obj in objects(manifests)? {
+            let is_deploy = obj.types.as_ref().is_some_and(|t| t.kind == "Deployment");
+            let (Some(name), Some(ns)) = (obj.metadata.name, obj.metadata.namespace) else {
+                continue;
+            };
+            if !is_deploy {
+                continue;
+            }
+            let api: Api<Deployment> = Api::namespaced(self.client.clone(), &ns);
+            let d = timed(api.get(&name)).await?;
+            let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+            let st = d.status.unwrap_or_default();
+            let current = st.observed_generation >= d.metadata.generation
+                && st.updated_replicas.unwrap_or(0) >= want
+                && st.available_replicas.unwrap_or(0) >= want
+                && st.replicas.unwrap_or(0) == want;
+            if !current {
+                waiting.push(format!("{ns}/{name}"));
+            }
+        }
+        Ok(waiting)
+    }
+
+    async fn not_ready(&self) -> anyhow::Result<Vec<String>> {
+        let mut waiting = Vec::new();
+        let lp = ListParams::default();
+        let deploys: Api<Deployment> = Api::all(self.client.clone());
+        for d in timed(deploys.list(&lp)).await? {
+            let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+            let ready = d.status.and_then(|s| s.ready_replicas).unwrap_or(0);
+            if ready < want {
+                waiting.push(format!("deployment {}", name(&d.metadata)));
+            }
+        }
+        let sets: Api<DaemonSet> = Api::all(self.client.clone());
+        for d in timed(sets.list(&lp)).await? {
+            let st = d.status.unwrap_or_default();
+            if st.number_ready < st.desired_number_scheduled {
+                waiting.push(format!("daemonset {}", name(&d.metadata)));
+            }
+        }
+        Ok(waiting)
+    }
+}
+
+fn name(m: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> String {
+    format!(
+        "{}/{}",
+        m.namespace.as_deref().unwrap_or_default(),
+        m.name.as_deref().unwrap_or_default()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_objects_parse_and_empty_documents_are_skipped() {
+        let objs = objects(
+            "---\napiVersion: v1\nkind: ServiceAccount\nmetadata: {name: judge, namespace: flux}\n---\n\n---\n\
+             apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: judge, namespace: flux}\nspec: {replicas: 1}\n",
+        )
+        .unwrap();
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[1].types.as_ref().unwrap().kind, "Deployment");
+        assert!(objects("- not an object\n").is_err());
+    }
+}
