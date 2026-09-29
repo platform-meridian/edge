@@ -165,8 +165,7 @@ fn held_fields(k: &Key) -> impl Iterator<Item = &'static str> + '_ {
 fn describe(k: &Key) -> String {
     match k {
         Key::V1alpha1 => "v1alpha1".into(),
-        Key::Typed(kind, name) if name.is_empty() => kind.clone(),
-        Key::Typed(kind, name) => format!("{kind} {name}"),
+        Key::Typed(kind, name) => format!("{kind} {name}").trim_end().into(),
     }
 }
 
@@ -642,5 +641,46 @@ image: kubelet:new
     #[test]
     fn a_patch_without_v1alpha1_is_refused() {
         assert!(merge(UNIT, "apiVersion: v1alpha1\nkind: KubeletConfig\n").is_err());
+    }
+
+    #[test]
+    fn held_names_the_units_secrets() {
+        let keys: Vec<String> = held(&parse(UNIT).unwrap())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for k in [
+            "machine.token",
+            "cluster.etcd.ca",
+            "KubeAPIServerCAConfig",
+            "UserVolumeConfig data.encryption",
+        ] {
+            assert!(keys.iter().any(|h| h == k), "{k} not held: {keys:?}");
+        }
+    }
+
+    #[test]
+    fn fields_are_held_only_in_the_kinds_that_hold_them() {
+        let p = "version: v1alpha1\n---\napiVersion: v1alpha1\nkind: KubeletConfig\nencryption: kept\ncertExtraSANs: [kept]\n";
+        let out = parse(&merge(UNIT, p).unwrap()).unwrap();
+        let k = doc(&out, "KubeletConfig", "").unwrap();
+        assert_eq!(s(get(k, &["encryption"])), "kept\n");
+        assert_eq!(s(get(k, &["certExtraSANs"])), "- kept\n");
+    }
+
+    #[test]
+    fn a_volume_the_unit_has_keeps_its_own_keying() {
+        let unit = format!(
+            "{UNIT}---\napiVersion: v1alpha1\nkind: UserVolumeConfig\nname: plain\nprovisioning: {{minSize: 1GB}}\n"
+        );
+        let p = "version: v1alpha1\n---\napiVersion: v1alpha1\nkind: UserVolumeConfig\nname: plain\nprovisioning: {minSize: 2GB}\n";
+        let out = parse(&merge(&unit, p).unwrap()).unwrap();
+        assert!(
+            get(
+                doc(&out, "UserVolumeConfig", "plain").unwrap(),
+                &["encryption"]
+            )
+            .is_none()
+        );
     }
 }

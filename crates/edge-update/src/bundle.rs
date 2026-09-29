@@ -105,7 +105,6 @@ fn safe(path: &Path) -> anyhow::Result<PathBuf> {
     for c in path.components() {
         match c {
             Component::Normal(p) => out.push(p),
-            Component::CurDir => {}
             _ => bail!("{} is not a plain relative path", path.display()),
         }
     }
@@ -116,7 +115,7 @@ fn safe(path: &Path) -> anyhow::Result<PathBuf> {
 fn read_small(entry: &mut impl Read, size: u64, max: u64, what: &str) -> anyhow::Result<Vec<u8>> {
     ensure!(size <= max, "{what} is {size} bytes, more than {max}");
     let mut buf = Vec::with_capacity(size as usize);
-    entry.take(max + 1).read_to_end(&mut buf)?;
+    entry.read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -487,6 +486,7 @@ mod tests {
     fn traversal_and_links_are_refused() {
         assert!(safe(Path::new("../x")).is_err());
         assert!(safe(Path::new("/etc/x")).is_err());
+        assert!(safe(Path::new("./x")).is_err());
         assert!(parse_sums(&format!("{}  ../../etc/passwd\n", "0".repeat(64))).is_err());
 
         let c = Case::new();

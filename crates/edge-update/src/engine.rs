@@ -859,12 +859,13 @@ pub fn installer_pin(r: &str) -> String {
     let Some((name, digest)) = r.split_once('@') else {
         return r.into();
     };
-    let slash = name.rfind('/').map(|i| i + 1).unwrap_or(0);
-    let repo = match name[slash..].find(':') {
-        Some(c) => &name[..slash + c],
-        None => name,
-    };
-    format!("{repo}@{digest}")
+    let (dir, last) = name.rsplit_once('/').unwrap_or(("", name));
+    let last = last.split(':').next().unwrap_or(last);
+    if dir.is_empty() {
+        format!("{last}@{digest}")
+    } else {
+        format!("{dir}/{last}@{digest}")
+    }
 }
 
 fn decode_efivar(b: &[u8]) -> String {

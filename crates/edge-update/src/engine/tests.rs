@@ -77,6 +77,11 @@ struct World {
     calls: usize,
     changes: usize,
     crash_at: Option<usize>,
+    /// The crash is a power cut too.
+    cut_on_crash: bool,
+    never_ready: bool,
+    seed_stuck: bool,
+    judge_idle: bool,
 }
 
 impl World {
@@ -116,6 +121,10 @@ impl World {
             calls: 0,
             changes: 0,
             crash_at: None,
+            cut_on_crash: false,
+            never_ready: false,
+            seed_stuck: false,
+            judge_idle: false,
         }
     }
 
@@ -123,6 +132,9 @@ impl World {
         self.log.push(what);
         self.changes += 1;
         if self.crash_at == Some(self.changes) {
+            if self.cut_on_crash {
+                self.power_cycle();
+            }
             anyhow::bail!("crash after change {}", self.changes);
         }
         Ok(())
@@ -172,7 +184,7 @@ impl World {
     /// The stack judge: a new ref is committed or rolled back after a few looks.
     fn tick_judge(&mut self) {
         let good = self.judge.get("good").cloned().unwrap_or_default();
-        if self.tag == good {
+        if self.tag == good || self.judge_idle {
             return;
         }
         self.judge_ticks += 1;
@@ -348,7 +360,7 @@ impl Cluster for FakeCluster {
     async fn not_rolled_out(&self, _: &str) -> anyhow::Result<Vec<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        Ok(if w.seeded {
+        Ok(if w.seeded && !w.seed_stuck {
             vec![]
         } else {
             vec!["judge".into()]
@@ -357,7 +369,11 @@ impl Cluster for FakeCluster {
     async fn not_ready(&self) -> anyhow::Result<Vec<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        Ok(vec![])
+        Ok(if w.never_ready {
+            vec!["deployment app/web".into()]
+        } else {
+            vec![]
+        })
     }
 }
 
@@ -842,6 +858,10 @@ fn installer_is_pinned_by_digest_alone() {
         installer_pin("reg/installer@sha256:ab"),
         "reg/installer@sha256:ab"
     );
+    assert_eq!(
+        installer_pin("installer:t1@sha256:ab"),
+        "installer@sha256:ab"
+    );
 }
 
 #[test]
@@ -864,4 +884,135 @@ fn trial_is_read_as_boot_commit_reads_it() {
     assert!(!b("Talos-b.efi", "Talos-a.efi", "kexec reboot").trial());
     assert!(!b("", "Talos-a.efi", "").trial());
     assert_eq!(decode_efivar(&utf16("Talos-v1.efi")), "Talos-v1.efi");
+}
+
+/// Fails in `phase`, strictly after `limit` and within a poll or so of it.
+async fn times_out(set: impl FnOnce(&mut World), phase: Phase, limit: i64, why: &str) {
+    let mut h = Harness::new();
+    set(&mut h.w());
+    let mut began = None;
+    let e = h
+        .update(&Spec::new("update-new"), |h, _| {
+            if h.e().record.phase == phase {
+                began = Some(h.e().record.since);
+            }
+        })
+        .await;
+    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert!(e.detail.contains(why), "{}", e.detail);
+    let waited = e.finished - began.expect("never reached the phase");
+    assert!(
+        waited > limit && waited <= limit + 60,
+        "failed after {waited}s"
+    );
+    assert_eq!(h.w().tag, OLD_TAG, "the stack moved");
+    assert!(h.e().record.error.contains(why), "{}", h.e().record.error);
+}
+
+#[tokio::test]
+async fn workloads_that_never_settle_stop_it_before_the_stack() {
+    times_out(
+        |w| w.never_ready = true,
+        Phase::Settling,
+        SETTLE,
+        "not ready",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_judge_that_never_rolls_out_stops_it() {
+    times_out(
+        |w| w.seed_stuck = true,
+        Phase::Seeding,
+        ROLLOUT,
+        "did not roll out",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_judge_with_nothing_to_roll_back_to_stops_it() {
+    times_out(
+        |w| {
+            w.judge_idle = true;
+            w.judge.insert("good".into(), "update-older".into());
+        },
+        Phase::AwaitingGood,
+        GOOD,
+        "never recorded",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn nothing_else_is_taken_while_an_update_runs() {
+    let mut h = Harness::new();
+    let mut refused = false;
+    let e = h
+        .update(&Spec::new("update-new"), |h, n| {
+            if n == 1 {
+                let sha = h.e().record.release.clone().unwrap().sha256;
+                refused = h.e().request_apply("update-new").is_err()
+                    && h.e().request_verify(&sha).is_err();
+            }
+        })
+        .await;
+    assert!(refused, "a second request was taken mid-update");
+    assert_eq!(e.outcome, Outcome::Committed);
+    assert!(h.e().record.error.is_empty());
+    let left = std::fs::read_dir(h.state().join("releases")).map_or(0, |d| d.count());
+    assert_eq!(left, 0, "the unpacked release outlived its commit");
+}
+
+#[tokio::test]
+async fn a_cut_between_install_and_its_record_does_not_install_twice() {
+    let mut h = Harness::new();
+    {
+        let mut w = h.w();
+        // import, stage, install: the cut lands straight after the install.
+        w.crash_at = Some(3);
+        w.cut_on_crash = true;
+    }
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert_eq!(h.w().log.iter().filter(|l| *l == "install").count(), 1);
+}
+
+#[tokio::test]
+async fn a_unit_that_committed_while_the_engine_was_away_carries_on() {
+    let mut h = Harness::new();
+    let e = h
+        .update(&Spec::new("update-new"), |h, _| {
+            if matches!(h.e().record.phase, Phase::Rebooting { .. }) {
+                let mut w = h.w();
+                w.power_cycle();
+                w.default = w.selected.clone();
+                drop(w);
+                h.reopen();
+            }
+        })
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+}
+
+#[tokio::test]
+async fn a_stack_rolled_back_once_can_be_applied_again() {
+    let mut h = Harness::new();
+    h.w().verdict = Verdict::Bad;
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Failed);
+    h.w().verdict = Verdict::Good;
+    h.e().request_apply("update-new").unwrap();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert_eq!(
+        h.w().log.iter().filter(|l| *l == "install").count(),
+        1,
+        "the committed OS was installed again"
+    );
 }

@@ -256,4 +256,42 @@ mod tests {
         assert_eq!(u.size, 20);
         assert!(up.put(&hex::encode(sha(&a)), 0, &a, &sha(&a)).is_err());
     }
+
+    #[test]
+    fn a_record_that_disagrees_with_its_file_starts_over() {
+        let d = tempfile::tempdir().unwrap();
+        let up = Uploads::new(d.path());
+        let data = body(CHUNK as usize + 1);
+        up.begin(data.len() as u64, &hex::encode(sha(&data)))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(up.bundle())
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+        assert!(up.current().is_none());
+    }
+
+    #[test]
+    fn a_bundle_must_fit_the_volume() {
+        let d = tempfile::tempdir().unwrap();
+        let up = Uploads::new(d.path());
+        up.begin(256 << 20, &"a".repeat(64)).unwrap();
+        let e = up.begin(1 << 62, &"b".repeat(64)).unwrap_err();
+        assert!(e.to_string().contains("free"), "{e}");
+    }
+
+    #[test]
+    fn a_chunk_already_held_is_not_written_again() {
+        let d = tempfile::tempdir().unwrap();
+        let up = Uploads::new(d.path());
+        let data = body(CHUNK as usize + 5);
+        let h = hex::encode(sha(&data));
+        up.begin(data.len() as u64, &h).unwrap();
+        put_all(&up, &data, [0].into_iter());
+        let other = vec![9u8; CHUNK as usize];
+        up.put(&h, 0, &other, &sha(&other)).unwrap();
+        assert!(put_all(&up, &data, [1].into_iter()).complete);
+    }
 }
