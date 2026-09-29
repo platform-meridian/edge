@@ -95,12 +95,15 @@ pub fn set_aside(path: &Path) -> Option<PathBuf> {
     None
 }
 
-// EINVAL/ENOTSUP: the filesystem cannot sync directories.
 fn sync_parent(path: &Path) -> io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
+    match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => sync_dir(d),
+        _ => sync_dir(Path::new(".")),
+    }
+}
+
+// EINVAL/ENOTSUP: the filesystem cannot sync directories.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
     match File::open(dir).and_then(|d| d.sync_all()) {
         Ok(()) => Ok(()),
         Err(e)

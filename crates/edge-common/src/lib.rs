@@ -14,7 +14,7 @@ pub mod sandbox;
 mod supervise;
 pub mod watch_state;
 
-pub use durable::{TMP_SUFFIX, durable_write, durable_write_with, set_aside};
+pub use durable::{TMP_SUFFIX, durable_write, durable_write_with, set_aside, sync_dir};
 pub use logging::init_tracing;
 pub use outage::Outage;
 pub use supervise::forever;
