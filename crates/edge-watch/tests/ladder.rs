@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
@@ -64,8 +65,15 @@ impl Unit {
     }
 
     fn start(&self) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_edge-watch"))
-            .env("EDGE_WATCH_CONFIG", self.dir.join("cfg"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_edge-watch"));
+        // SAFETY: prctl is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL);
+                Ok(())
+            });
+        }
+        cmd.env("EDGE_WATCH_CONFIG", self.dir.join("cfg"))
             .env("EDGE_WATCH_DEVICE", self.dir.join("watchdog"))
             .env("EDGE_WATCH_STATE", self.dir.join("state"))
             .env(
