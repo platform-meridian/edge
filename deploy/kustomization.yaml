@@ -14,3 +14,4 @@ resources:
   - edge-idle.yaml
   - edge-signer.yaml
   - edge-gateway.yaml
+  - edge-update.yaml

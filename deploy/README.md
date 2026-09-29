@@ -15,6 +15,23 @@ Then provide:
 - the images, named `edge-<name>:appliance`, through an `images:` transformer;
 - the Gateway API CRDs;
 - the CA edge-signer signs with, at `/etc/edge-signer/ca.pem` on the host;
+- for edge-update: Talos API access with `os:admin` for namespace `edge`
+  (`KubeTalosAPIAccessConfig`), the `edge-update` and `edge-registry` user
+  volumes, and ConfigMap `edge-update` in `edge` whose `config.yaml` names the
+  key, the node's store and the stack:
+
+  ```yaml
+  signingKey: ssh-ed25519 AAAA...     # signs every bundle
+  signatureNamespace: my-update       # ssh-keygen -Y sign -n
+  store: /var/lib/etcd/state.log      # copied off before each update
+  stack:
+    url: oci://127.0.0.1:5000/my-stack  # the stack artifact's repository on the unit
+    fluxInstance: flux-system/flux
+    kustomization: flux-system/my-stack
+    source: flux-system/my-stack        # the OCIRepository
+    lock: flux-system/my-stack-lock     # built_epoch, and what LOCK_* lines check
+    judge: flux-system/my-stack-commit  # good and rolled_back
+  ```
 - any static routes, as ConfigMaps projected into edge-gateway's
   `routes.d/`, merged in name order:
 

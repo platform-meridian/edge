@@ -1,0 +1,113 @@
+# Verifies signed update bundles and applies them to this node through its own
+# Talos API. The consumer supplies ConfigMap edge-update (config.yaml, see
+# crates/edge-update), Talos API access with os:admin for namespace edge, and
+# the edge-update and edge-registry user volumes.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-update
+  namespace: edge
+---
+# Talos answers this with Secret edge-update: a talosconfig holding the role.
+apiVersion: talos.dev/v1alpha1
+kind: ServiceAccount
+metadata:
+  name: edge-update
+  namespace: edge
+spec:
+  roles: ["os:admin"]
+---
+# The stack's pointer and records, and what a bundle's seed applies. Holding
+# the seed's own grants is what lets it create a Role carrying them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-update
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "serviceaccounts"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "create", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["list"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: ["fluxcd.controlplane.io"]
+    resources: ["fluxinstances"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["ocirepositories"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-update
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edge-update }
+subjects:
+  - { kind: ServiceAccount, name: edge-update, namespace: edge }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-update
+  namespace: edge
+  labels: { app: edge-update }
+spec:
+  replicas: 1
+  # One engine per record: the old pod must be gone before the new one starts.
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: edge-update } }
+  template:
+    metadata:
+      labels: { app: edge-update }
+    spec:
+      serviceAccountName: edge-update
+      # Talos's API and the apiserver on loopback, so an update or rollback
+      # never waits on the pod network or cluster DNS it may be replacing.
+      hostNetwork: true
+      dnsPolicy: Default
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: edge-update
+          image: "edge-update:appliance"
+          env:
+            - { name: KUBERNETES_SERVICE_HOST, value: "@APISERVER_HOST@" }
+            - { name: KUBERNETES_SERVICE_PORT, value: "@APISERVER_PORT@" }
+            # Loopback only: whatever runs on the host reaches it, the network does not.
+            - { name: EDGE_UPDATE_LISTEN, value: "127.0.0.1:7443" }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          # Root owns the volumes; no capability is needed to write them.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            - { name: config, mountPath: /etc/edge-update, readOnly: true }
+            - { name: talos, mountPath: /var/run/secrets/talos.dev, readOnly: true }
+            - { name: state, mountPath: /var/mnt/edge-update }
+            - { name: registry, mountPath: /var/mnt/edge-registry }
+      volumes:
+        - name: config
+          configMap: { name: edge-update }
+        - name: talos
+          secret: { secretName: edge-update }
+        # Directory, not DirectoryOrCreate: until the volume mounts, a created
+        # directory would put the record on EPHEMERAL, which a repair wipes.
+        - name: state
+          hostPath: { path: /var/mnt/edge-update, type: Directory }
+        - name: registry
+          hostPath: { path: /var/mnt/edge-registry, type: Directory }
