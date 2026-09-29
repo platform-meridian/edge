@@ -105,6 +105,19 @@ impl Store {
         self.manifest_path(&digest).is_file().then_some(digest)
     }
 
+    /// The repositories held, under any registry, whose path is `path`: how a
+    /// request that names no registry finds one, as Talos's registryd does.
+    pub fn repos_at_path(&self, path: &str) -> Vec<String> {
+        let mut repos: Vec<String> = entries(&self.tag_dir())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(dir, _)| repo_from_dir(&dir))
+            .filter(|r| r.split_once('/').is_some_and(|(_, p)| p == path))
+            .collect();
+        repos.sort();
+        repos
+    }
+
     pub fn list(&self) -> io::Result<Listing> {
         let mut listing = Listing {
             images: self.tags()?,
@@ -226,30 +239,26 @@ impl Store {
             .open(self.root.join(LOCK))
     }
 
-    /// Removes whatever a power cut or a bad disk left that cannot be served
-    /// whole: temp files, blobs and manifests whose content does not match their
-    /// digest, manifests missing a blob, and tags naming a missing manifest.
-    /// Skipped while a writer holds the store; it leaves nothing torn behind.
+    /// Removes what a power cut can leave: temp files, then manifests missing a
+    /// blob, then tags naming a missing manifest. A named file is whole, as it
+    /// was fsynced before its rename; [`Store::verify`] catches a rotted one.
+    /// Skipped while a writer holds the store: it leaves nothing torn behind.
     pub fn repair(&self) -> io::Result<usize> {
         let Some(_lock) = self.try_lock()? else {
             tracing::info!("store busy with a writer; not repairing");
             return Ok(0);
         };
+        self.drop_incomplete()
+    }
+
+    fn drop_incomplete(&self) -> io::Result<usize> {
         let blobs = self.remove_where(&self.blob_dir(), |name, path| {
-            let digest = Digest::from_hex(name).ok_or("not a digest")?;
-            let (got, _) = File::open(path)
-                .and_then(|f| copy_hashing(f, &mut io::sink()))
-                .map_err(|_| "unreadable")?;
-            (got == digest)
-                .then_some(())
-                .ok_or("content does not match")
+            Digest::from_hex(name).ok_or("not a digest")?;
+            path.is_file().then_some(()).ok_or("not a file")
         })?;
         let manifests = self.remove_where(&self.manifest_dir(), |name, path| {
-            let digest = Digest::from_hex(name).ok_or("not a digest")?;
+            Digest::from_hex(name).ok_or("not a digest")?;
             let bytes = std::fs::read(path).map_err(|_| "unreadable")?;
-            if Digest::of(&bytes) != digest {
-                return Err("content does not match");
-            }
             let m = Manifest::parse(&bytes).map_err(|_| "not a manifest")?;
             match m.blobs.iter().all(|b| self.has_blob(&b.digest)) {
                 true => Ok(()),
@@ -279,6 +288,32 @@ impl Store {
         Ok(blobs + manifests + tags)
     }
 
+    /// Hashes every blob and manifest, and removes any whose content does not
+    /// match its name, with what then lacks it. Slow: hashing runs unlocked, and
+    /// only a removal waits for writers.
+    pub fn verify(&self) -> io::Result<usize> {
+        let mut removed = 0;
+        for dir in [self.blob_dir(), self.manifest_dir()] {
+            for (name, path) in entries(&dir)? {
+                let Some(digest) = Digest::from_hex(&name) else {
+                    continue;
+                };
+                if hashes_to(&path, &digest) != Some(false) {
+                    continue;
+                }
+                let _lock = self.lock()?;
+                // A writer may have replaced it with good content meanwhile.
+                if hashes_to(&path, &digest) == Some(false) {
+                    tracing::warn!(path = %path.display(), "removing: content does not match");
+                    remove(&path)?;
+                    sync_dir(&dir)?;
+                    removed += 1 + self.drop_incomplete()?;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     fn remove_where(
         &self,
         dir: &Path,
@@ -295,6 +330,12 @@ impl Store {
         sync_dir(dir)?;
         Ok(removed)
     }
+}
+
+/// None when the file is gone.
+fn hashes_to(path: &Path, digest: &Digest) -> Option<bool> {
+    let file = File::open(path).ok()?;
+    Some(copy_hashing(file, &mut io::sink()).is_ok_and(|(got, _)| got == *digest))
 }
 
 // A name that is not UTF-8 comes back lossy, and so never valid.

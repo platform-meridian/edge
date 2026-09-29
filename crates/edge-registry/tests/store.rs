@@ -186,6 +186,7 @@ fn not_a_layout() {
 struct Three {
     store: Store,
     old: common::Image,
+    prev: common::Image,
     cur: common::Image,
     shared: Digest,
     _d: tempfile::TempDir,
@@ -222,6 +223,7 @@ fn three_releases() -> Three {
         store,
         shared: shared.digest.clone(),
         old,
+        prev,
         cur,
         _d: d,
     }
@@ -300,7 +302,7 @@ fn retain_nothing_empties() {
 }
 
 #[test]
-fn repair_removes_torn_and_corrupt() {
+fn repair_removes_torn() {
     let t = three_releases();
     let root = t.store.root();
     let blobs = root.join("blobs/sha256");
@@ -315,25 +317,20 @@ fn repair_removes_torn_and_corrupt() {
     .unwrap();
     std::fs::write(root.join("tags/ghcr.io%o%app/torn"), b"sha256:12").unwrap();
     std::fs::write(root.join("tags/NotARepo"), b"").unwrap();
-    // A flipped byte in the old release's second layer takes its manifest and tag with it.
-    let old_layer = blobs.join(t.old.layers[1].digest.hex());
-    let mut bytes = std::fs::read(&old_layer).unwrap();
-    bytes[0] ^= 1;
-    std::fs::write(&old_layer, bytes).unwrap();
+    // A missing layer takes the previous release's manifest and tag with it.
+    std::fs::remove_file(blobs.join(t.prev.layers[0].digest.hex())).unwrap();
+    let flipped = flip_a_byte(&blobs.join(t.old.layers[1].digest.hex()));
     let before = tags(&t.store);
 
-    assert_eq!(t.store.repair().unwrap(), 9);
+    assert_eq!(t.store.repair().unwrap(), 8);
 
-    assert!(!old_layer.exists());
-    assert_eq!(t.store.manifest(&t.old.manifest.digest).unwrap(), None);
-    assert_eq!(t.store.resolve("ghcr.io/o/app", "1"), None);
+    assert_eq!(t.store.manifest(&t.prev.manifest.digest).unwrap(), None);
     let after: Vec<_> = before
         .into_iter()
-        .filter(|t| t != "ghcr.io/o/app:1")
+        .filter(|t| t != "ghcr.io/o/app:2")
         .collect();
     assert_eq!(tags(&t.store), after);
-    assert!(t.store.blob_path(&t.shared).exists());
-    assert_eq!(t.store.list().unwrap().blobs, 8);
+    assert!(flipped.exists(), "repair hashes nothing");
     for dir in [&blobs, &manifests] {
         for e in std::fs::read_dir(dir).unwrap() {
             let name = e.unwrap().file_name().into_string().unwrap();
@@ -344,6 +341,40 @@ fn repair_removes_torn_and_corrupt() {
             );
         }
     }
+    assert_eq!(t.store.repair().unwrap(), 0);
+}
+
+fn flip_a_byte(path: &std::path::Path) -> std::path::PathBuf {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    path.to_path_buf()
+}
+
+#[test]
+fn verify_removes_rot() {
+    let t = three_releases();
+    let root = t.store.root();
+    let old_layer = flip_a_byte(&root.join("blobs/sha256").join(t.old.layers[1].digest.hex()));
+    let helper = t.store.resolve("ghcr.io/o/helper", "1").unwrap();
+    let manifest = root.join("manifests/sha256").join(helper.hex());
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&manifest, bytes).unwrap();
+    let before = tags(&t.store);
+
+    assert_eq!(t.store.verify().unwrap(), 5);
+
+    assert!(!old_layer.exists() && !manifest.exists());
+    assert_eq!(t.store.manifest(&t.old.manifest.digest).unwrap(), None);
+    let gone = ["ghcr.io/o/app:1", "ghcr.io/o/helper:1"];
+    let after: Vec<_> = before
+        .into_iter()
+        .filter(|t| !gone.contains(&t.as_str()))
+        .collect();
+    assert_eq!(tags(&t.store), after);
+    assert!(t.store.blob_path(&t.shared).exists());
+    assert_eq!(t.store.verify().unwrap(), 0);
     assert_eq!(t.store.repair().unwrap(), 0);
 }
 
