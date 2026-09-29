@@ -9,8 +9,8 @@ mod api;
 mod bundle;
 mod cluster;
 mod engine;
-mod fetch;
 mod machineconfig;
+mod registry;
 mod talos;
 mod unit;
 mod upload;
@@ -73,18 +73,6 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
     r
 }
 
-/// Until the registry library is wired in, an import fails the update cleanly.
-struct Unwired;
-
-impl unit::Registry for Unwired {
-    fn import(&self, _: &std::path::Path) -> anyhow::Result<()> {
-        anyhow::bail!("no image registry is wired into this build")
-    }
-    fn retain(&self, _: &std::collections::BTreeSet<String>) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn serve() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -120,8 +108,10 @@ async fn serve() -> anyhow::Result<()> {
         settings,
         talos,
         kube,
-        Arc::new(Unwired),
-        Arc::new(fetch::Http::new()),
+        Arc::new(registry::Registry::open(&PathBuf::from(env(
+            "EDGE_UPDATE_REGISTRY",
+            "/var/mnt/edge-registry",
+        )))?),
         now,
     )?;
 

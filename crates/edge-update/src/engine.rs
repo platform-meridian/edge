@@ -17,7 +17,6 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::{self, Manifest, Signer};
-use crate::fetch::Fetch;
 use crate::machineconfig;
 use crate::unit::{Cluster, Registry, Settings, Talos};
 use crate::upload::Uploads;
@@ -47,7 +46,6 @@ pub enum Phase {
     Trial,
     Settling,
     Seeding,
-    Carrying,
     AwaitingGood,
     Repointing { rolled_back: String },
     Judging { rolled_back: String },
@@ -80,9 +78,6 @@ pub struct Before {
     pub default_entry: String,
     pub started: i64,
     pub snapshot: Option<String>,
-    /// The running stack's artifact, copied to the unit's registry.
-    #[serde(default)]
-    pub carried: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,7 +153,6 @@ pub struct Engine {
     talos: Arc<dyn Talos>,
     cluster: Arc<dyn Cluster>,
     registry: Arc<dyn Registry>,
-    fetch: Arc<dyn Fetch>,
     now: Clock,
     pub record: Record,
     /// What the current phase is waiting for, for a person.
@@ -186,7 +180,6 @@ impl Engine {
         talos: Arc<dyn Talos>,
         cluster: Arc<dyn Cluster>,
         registry: Arc<dyn Registry>,
-        fetch: Arc<dyn Fetch>,
         now: Clock,
     ) -> anyhow::Result<Self> {
         let signer = Signer::new(&settings.signing_key, &settings.signature_namespace)?;
@@ -211,7 +204,6 @@ impl Engine {
             talos,
             cluster,
             registry,
-            fetch,
             now,
             record,
             detail: String::new(),
@@ -289,7 +281,6 @@ impl Engine {
             Phase::Trial => self.trial().await?,
             Phase::Settling => self.settling().await?,
             Phase::Seeding => self.seeding().await?,
-            Phase::Carrying => self.carrying().await?,
             Phase::AwaitingGood => self.awaiting_good().await?,
             Phase::Repointing { rolled_back } => self.repointing(rolled_back).await?,
             Phase::Judging { rolled_back } => self.judging(&rolled_back).await?,
@@ -580,7 +571,6 @@ impl Engine {
             default_entry: self.boot().await?.default,
             started: (self.now)(),
             snapshot: None,
-            carried: None,
         });
         Ok(Go(Phase::Importing))
     }
@@ -761,7 +751,7 @@ impl Engine {
             .context("apply the bundle's seed")?;
         let waiting = self.cluster.not_rolled_out(&seed).await?;
         if waiting.is_empty() {
-            return Ok(Go(Phase::Carrying));
+            return Ok(Go(Phase::AwaitingGood));
         }
         if (self.now)() - self.record.since > ROLLOUT {
             return Ok(Fail(format!(
@@ -770,26 +760,6 @@ impl Engine {
             )));
         }
         poll(10, format!("rolling out {}", waiting.join(", ")))
-    }
-
-    async fn carrying(&mut self) -> anyhow::Result<Next> {
-        let b = self.before()?.clone();
-        let url = self.settings.stack.url.clone();
-        if b.url == url || b.tag.is_empty() {
-            return Ok(Go(Phase::AwaitingGood));
-        }
-        let (_, repo) = crate::fetch::split(&url)?;
-        let name = format!("{repo}:{}", b.tag);
-        let layout = self.dir.join("carried");
-        self.fetch.artifact(&b.url, &b.tag, &name, &layout).await?;
-        let registry = self.registry.clone();
-        let l = layout.clone();
-        tokio::task::spawn_blocking(move || registry.import(&l)).await??;
-        let _ = std::fs::remove_dir_all(&layout);
-        if let Some(b) = self.record.before.as_mut() {
-            b.carried = Some(name);
-        }
-        Ok(Go(Phase::AwaitingGood))
     }
 
     async fn judge(&self) -> anyhow::Result<(String, String)> {
@@ -879,7 +849,6 @@ impl Engine {
     fn collecting(&mut self) -> anyhow::Result<Next> {
         let mut keep = self.release()?.refs.clone();
         keep.extend(self.committed_refs(1));
-        keep.extend(self.before()?.carried.clone());
         self.registry.retain(&keep)?;
         Ok(Done)
     }

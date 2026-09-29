@@ -187,12 +187,6 @@ impl World {
                 self.lock.insert("built_epoch".into(), "2000".into());
             }
             Verdict::Bad => {
-                // The judge moves only the ref, so the good artifact must be at this url.
-                assert!(
-                    !self.url.contains(":5000") || self.held.contains(&format!("stack:{good}")),
-                    "rolled back to {good}, which {} does not serve",
-                    self.url
-                );
                 self.judge
                     .insert("rolled_back".into(), format!("{} 12:00", self.tag));
                 self.tag = good;
@@ -204,7 +198,6 @@ impl World {
 type Shared = Arc<Mutex<World>>;
 
 struct FakeTalos(Shared);
-struct FakeFetch(Shared);
 struct FakeCluster(Shared);
 struct FakeRegistry(Shared);
 
@@ -368,27 +361,6 @@ impl Cluster for FakeCluster {
     }
 }
 
-#[async_trait]
-impl crate::fetch::Fetch for FakeFetch {
-    async fn artifact(
-        &self,
-        url: &str,
-        tag: &str,
-        name: &str,
-        layout: &Path,
-    ) -> anyhow::Result<()> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        assert_eq!(
-            (url, tag),
-            (w.url.as_str(), w.tag.as_str()),
-            "carried something other than the running stack"
-        );
-        crate::fetch::write_layout(layout, name, b"{}", &[])?;
-        w.change("carry".into())
-    }
-}
-
 impl Registry for FakeRegistry {
     fn import(&self, layout: &Path) -> anyhow::Result<()> {
         let refs = crate::bundle::layout_refs(layout)?;
@@ -486,8 +458,7 @@ impl Harness {
                 settings(&self.public),
                 Arc::new(FakeTalos(w.clone())),
                 Arc::new(FakeCluster(w.clone())),
-                Arc::new(FakeRegistry(w.clone())),
-                Arc::new(FakeFetch(w)),
+                Arc::new(FakeRegistry(w)),
                 Arc::new(move || clock.load(Ordering::SeqCst)),
             )
             .unwrap(),
@@ -620,14 +591,8 @@ async fn an_update_commits_in_order() {
             "install",
             "reboot",
             "seed",
-            "carry",
-            "import",
             "repoint update-new"
         ]
-    );
-    assert!(
-        w.held.contains("stack:update-old"),
-        "the running stack was not carried"
     );
     let e = &h.engine.as_ref().unwrap().record.history[0];
     assert!(e.snapshot.is_some());

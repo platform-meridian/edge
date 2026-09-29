@@ -133,7 +133,7 @@ fn phase(r: &Record) -> pb::Phase {
         Phase::Installing => pb::Phase::PHASE_INSTALLING,
         Phase::Rebooting { .. } => pb::Phase::PHASE_REBOOTING,
         Phase::Trial | Phase::Settling => pb::Phase::PHASE_TRIAL,
-        Phase::Seeding | Phase::Carrying => pb::Phase::PHASE_SEEDING,
+        Phase::Seeding => pb::Phase::PHASE_SEEDING,
         Phase::AwaitingGood => pb::Phase::PHASE_AWAITING_GOOD,
         Phase::Repointing { .. } => pb::Phase::PHASE_REPOINTING,
         Phase::Judging { .. } => pb::Phase::PHASE_JUDGING,
