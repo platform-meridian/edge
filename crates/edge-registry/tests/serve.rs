@@ -78,6 +78,8 @@ fn pulls_by_tag() {
         );
     }
 
+    let unqualified = f.registry.get("/v2/o/app/manifests/v1");
+    assert_eq!(unqualified.body, f.app.manifest.bytes);
     let direct = f.registry.get("/v2/ghcr.io/o/app/manifests/v1");
     assert_eq!(direct.body, f.app.manifest.bytes);
     let docker = f
@@ -179,7 +181,6 @@ fn unknown_is_404() {
     for path in [
         "/v2/o/app/manifests/v2?ns=ghcr.io".to_string(),
         "/v2/o/app/manifests/v1?ns=docker.io".to_string(),
-        "/v2/o/app/manifests/v1".to_string(),
         format!("/v2/o/app/manifests/{absent}"),
         format!("/v2/o/app/blobs/{absent}"),
         "/v2/o/app/blobs/sha256:00".to_string(),
@@ -250,24 +251,54 @@ fn serves_what_is_imported_later() {
 }
 
 #[test]
-fn repairs_at_start() {
+fn repairs_at_start_and_verifies_after() {
     let d = tempdir();
     let mut layout = Layout::new(&d.path().join("layout"));
     let app = layout.image("app", 1);
+    let gone = layout.image("gone", 1);
     layout.tag(&app, "ghcr.io/o/app:v1");
+    layout.tag(&gone, "ghcr.io/o/gone:v1");
     let root = d.path().join("store");
     let store = Store::open(&root).unwrap();
     store.import_layout(layout.write()).unwrap();
-    let layer = store.blob_path(&app.layers[0].digest);
-    std::fs::write(&layer, b"torn").unwrap();
-    let temp = layer.with_extension("edge-tmp");
+    let rotted = store.blob_path(&app.layers[0].digest);
+    std::fs::write(&rotted, b"rot").unwrap();
+    let temp = rotted.with_extension("edge-tmp");
     std::fs::write(&temp, b"half").unwrap();
+    std::fs::remove_file(store.blob_path(&gone.layers[0].digest)).unwrap();
 
     let registry = Registry::start(&root);
 
+    assert!(!temp.exists());
     assert_eq!(
-        registry.get("/v2/o/app/manifests/v1?ns=ghcr.io").status,
+        registry.get("/v2/o/gone/manifests/v1?ns=ghcr.io").status,
         404
     );
-    assert!(!layer.exists() && !temp.exists());
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while registry.get("/v2/o/app/manifests/v1?ns=ghcr.io").status != 404 {
+        assert!(
+            std::time::Instant::now() < until,
+            "the verify pass never removed the rotted blob's image"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!rotted.exists());
+}
+
+#[test]
+fn finds_a_repository_without_its_registry() {
+    let d = tempdir();
+    let mut layout = Layout::new(&d.path().join("layout"));
+    let stack = layout.image("stack", 1);
+    layout.tag(&stack, "127.0.0.1:5999/meridian-stack:t1");
+    let root = d.path().join("store");
+    Store::open(&root)
+        .unwrap()
+        .import_layout(layout.write())
+        .unwrap();
+    let registry = Registry::start(&root);
+    let resp = registry.get("/v2/meridian-stack/manifests/t1");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, stack.manifest.bytes);
+    assert_eq!(registry.get("/v2/other-stack/manifests/t1").status, 404);
 }

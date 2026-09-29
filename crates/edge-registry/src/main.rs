@@ -1,5 +1,6 @@
-//! Serves the image store read-only on loopback. Images arrive through the
-//! library, from the process that imports them, never over the network.
+//! Serves the image store read-only on loopback, and passes what it does not
+//! hold through to an upstream registry. Images arrive through the library, from
+//! the process that imports them, never over the network.
 
 mod server;
 
@@ -10,53 +11,70 @@ use edge_registry::Store;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:5000";
 const DEFAULT_ROOT: &str = "/var/lib/edge-registry";
+/// Talos's registryd, which serves the image cache baked into the media.
+const DEFAULT_UPSTREAM: &str = "127.0.0.1:3172";
 
 #[derive(Debug, PartialEq)]
 struct Config {
     listen: SocketAddr,
     root: PathBuf,
+    upstream: SocketAddr,
 }
 
 fn config(args: impl IntoIterator<Item = String>, env: impl Fn(&str) -> Option<String>) -> Config {
-    let (mut listen, mut root) = (env("EDGE_REGISTRY_LISTEN"), env("EDGE_REGISTRY_ROOT"));
+    let mut listen = env("EDGE_REGISTRY_LISTEN");
+    let mut root = env("EDGE_REGISTRY_ROOT");
+    let mut upstream = env("EDGE_REGISTRY_UPSTREAM");
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next(),
             "--root" => root = args.next(),
+            "--upstream" => upstream = args.next(),
             _ => tracing::warn!(arg, "ignoring an unknown argument"),
         }
     }
-    let default: SocketAddr = DEFAULT_LISTEN.parse().expect("the default parses");
-    let listen = match listen.map(|l| l.parse::<SocketAddr>()) {
+    Config {
+        listen: loopback("listen", listen, DEFAULT_LISTEN),
+        root: root.map_or_else(|| DEFAULT_ROOT.into(), PathBuf::from),
+        upstream: loopback("upstream", upstream, DEFAULT_UPSTREAM),
+    }
+}
+
+fn loopback(what: &str, addr: Option<String>, default: &str) -> SocketAddr {
+    let default: SocketAddr = default.parse().expect("the default parses");
+    match addr.map(|a| a.parse::<SocketAddr>()) {
         None => default,
         Some(Ok(a)) if a.ip().is_loopback() => a,
         Some(got) => {
-            tracing::error!(?got, %default, "not a loopback address; using the default");
+            tracing::error!(what, ?got, %default, "not a loopback address; using the default");
             default
         }
-    };
-    Config {
-        listen,
-        root: root.map_or_else(|| DEFAULT_ROOT.into(), PathBuf::from),
     }
 }
 
 fn main() -> anyhow::Result<()> {
     edge_common::init_tracing();
-    let Config { listen, root } = config(std::env::args().skip(1), |k| std::env::var(k).ok());
+    let Config {
+        listen,
+        root,
+        upstream,
+    } = config(std::env::args().skip(1), |k| std::env::var(k).ok());
     let store = Store::open(&root)?;
     match store.repair() {
         Ok(0) => {}
         Ok(n) => tracing::warn!(removed = n, "repaired the store"),
         Err(e) => tracing::error!(error = %e, "could not finish repairing the store"),
     }
-    // After repair, the only writing this process does.
-    edge_common::sandbox::restrict(&edge_common::sandbox::registry(&root, listen.port()));
+    edge_common::sandbox::restrict(&edge_common::sandbox::registry(
+        &root,
+        listen.port(),
+        upstream.port(),
+    ));
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(server::serve(store, listen))
+        .block_on(server::serve(store, listen, upstream))
 }
 
 #[cfg(test)]
@@ -79,7 +97,8 @@ mod tests {
             cfg(&[], &[]),
             Config {
                 listen: DEFAULT_LISTEN.parse().unwrap(),
-                root: DEFAULT_ROOT.into()
+                root: DEFAULT_ROOT.into(),
+                upstream: DEFAULT_UPSTREAM.parse().unwrap(),
             }
         );
     }
@@ -89,22 +108,33 @@ mod tests {
         let env = [
             ("EDGE_REGISTRY_LISTEN", "127.0.0.1:6000"),
             ("EDGE_REGISTRY_ROOT", "/env"),
+            ("EDGE_REGISTRY_UPSTREAM", "127.0.0.1:6001"),
         ];
         assert_eq!(cfg(&[], &env).listen.port(), 6000);
         assert_eq!(cfg(&[], &env).root, PathBuf::from("/env"));
-        let c = cfg(&["--root", "/arg", "--listen", "[::1]:7000"], &env);
+        assert_eq!(cfg(&[], &env).upstream.port(), 6001);
+        let c = cfg(
+            &[
+                "--root",
+                "/arg",
+                "--listen",
+                "[::1]:7000",
+                "--upstream",
+                "127.0.0.2:7001",
+            ],
+            &env,
+        );
         assert_eq!(c.listen, "[::1]:7000".parse().unwrap());
         assert_eq!(c.root, PathBuf::from("/arg"));
+        assert_eq!(c.upstream, "127.0.0.2:7001".parse().unwrap());
     }
 
     #[test]
     fn loopback_only() {
         for bad in ["0.0.0.0:5000", "192.168.1.2:5000", "localhost:5000", "5000"] {
-            assert_eq!(
-                cfg(&["--listen", bad], &[]).listen,
-                DEFAULT_LISTEN.parse().unwrap(),
-                "{bad}"
-            );
+            let c = cfg(&["--listen", bad, "--upstream", bad], &[]);
+            assert_eq!(c.listen, DEFAULT_LISTEN.parse().unwrap(), "{bad}");
+            assert_eq!(c.upstream, DEFAULT_UPSTREAM.parse().unwrap(), "{bad}");
         }
     }
 }

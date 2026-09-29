@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use edge_registry::Digest;
@@ -159,16 +161,26 @@ pub struct Registry {
     pub port: u16,
 }
 
+pub fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 impl Registry {
+    /// Its upstream is a port nothing listens on.
     pub fn start(root: &Path) -> Registry {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        Registry::with_upstream(root, free_port())
+    }
+
+    pub fn with_upstream(root: &Path, upstream: u16) -> Registry {
+        let port = free_port();
         let child = Command::new(env!("CARGO_BIN_EXE_edge-registry"))
             .args(["--root".as_ref(), root.as_os_str()])
             .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--upstream", &format!("127.0.0.1:{upstream}")])
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
@@ -246,5 +258,60 @@ impl Response {
             .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A registry that answers each path with a canned response and records what
+/// it was asked.
+pub struct Stub {
+    pub port: u16,
+    pub seen: Arc<Mutex<Vec<String>>>,
+}
+
+pub struct Canned {
+    pub status: &'static str,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Stub {
+    pub fn start(answers: HashMap<String, Canned>) -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let mut head = Vec::new();
+                let mut b = [0u8];
+                while !head.ends_with(b"\r\n\r\n") && conn.read(&mut b).is_ok_and(|n| n == 1) {
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let target = head.split(' ').nth(1).unwrap_or_default().to_string();
+                log.lock().unwrap().push(head);
+                let resp = match answers.get(&target) {
+                    Some(c) => {
+                        let mut r = format!("HTTP/1.1 {}\r\nConnection: close\r\n", c.status);
+                        for (k, v) in &c.headers {
+                            r.push_str(&format!("{k}: {v}\r\n"));
+                        }
+                        r.push_str(&format!("Content-Length: {}\r\n\r\n", c.body.len()));
+                        [r.into_bytes(), c.body.clone()].concat()
+                    }
+                    None => {
+                        b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                            .to_vec()
+                    }
+                };
+                let _ = conn.write_all(&resp);
+            }
+        });
+        Stub { port, seen }
+    }
+
+    pub fn requests(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
     }
 }

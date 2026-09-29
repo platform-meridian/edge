@@ -284,11 +284,12 @@ pub fn layers(root: &Path, state: &Path, image_caches: &Path) -> Rules {
     }
 }
 
-pub fn registry(root: &Path, port: u16) -> Rules {
+/// Writes the store only to remove what fails its digest.
+pub fn registry(root: &Path, port: u16, upstream_port: u16) -> Rules {
     Rules {
         bind_tcp: Some(vec![port]),
-        connect_tcp: Some(vec![]),
-        ..Rules::default().with(Access::Read, [root])
+        connect_tcp: Some(vec![upstream_port]),
+        ..Rules::default().with(Access::Write, [root])
     }
 }
 
@@ -757,23 +758,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_read_only() {
+    fn registry_confined() {
         let d = scratch("registry");
         let secret = outside(&d);
         let root = d.join("store");
         std::fs::create_dir_all(root.join("blobs")).unwrap();
-        std::fs::write(root.join("blobs/b"), b"b").unwrap();
         let (listen, other) = (free_port(), free_port());
+        let (_upstream, upstream) = listening();
         let (_tcp, tcp) = listening();
         sandboxed(
-            || registry(&root, listen),
+            || registry(&root, listen, upstream),
             || {
-                allowed("read a blob", read(root.join("blobs/b")))?;
-                denied("write the store", write_in(root.join("blobs")))?;
+                allowed("durable write in the store", write_in(root.join("blobs")))?;
                 denied("read outside", read(&secret))?;
+                denied("write outside", write_in(d.join("outside")))?;
                 allowed("bind the listen port", bind(listen))?;
                 denied("bind another port", bind(other))?;
-                denied("dial", dial(tcp))
+                allowed("dial the upstream", dial(upstream))?;
+                denied("dial another port", dial(tcp))
             },
         );
         std::fs::remove_dir_all(&d).ok();
