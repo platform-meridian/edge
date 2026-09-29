@@ -3,7 +3,8 @@
 //!   edge-update                 serve the update API and run the engine
 //!   edge-update strip-config    a full machine config on stdin, its patch on stdout
 //!   edge-update check-bundle <bundle.tar> <key.pub> <namespace> <scratch dir>
-//!                               what the unit checks before touching anything
+//!                               what the unit checks before touching anything, and
+//!                               an import into a scratch registry store
 
 mod api;
 mod bundle;
@@ -61,6 +62,22 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
         machineconfig::check_patch(&std::fs::read_to_string(dest.join(bundle::PATCH))?)?;
         let refs = bundle::layout_refs(&dest.join(bundle::IMAGES))?;
         anyhow::ensure!(!refs.is_empty(), "the image layout names no image");
+        // Into a scratch store, as the unit imports it.
+        let store = edge_registry::Store::open(dest.join("store"))?;
+        let tagged = store.import_layout(&dest.join(bundle::IMAGES))?;
+        // Images named by digest alone are held untagged, found by their digest.
+        let named = refs
+            .iter()
+            .filter(|r| {
+                r.parse::<edge_registry::ImageRef>()
+                    .is_ok_and(|i| i.tag.is_some())
+            })
+            .count();
+        anyhow::ensure!(
+            tagged.len() == named,
+            "the registry tagged {} of the layout's {named} tagged images",
+            tagged.len()
+        );
         for (k, v) in &manifest {
             println!("{k}={v}");
         }
