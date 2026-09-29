@@ -1,16 +1,10 @@
 //! Flight recorder into a power-cut-safe ring on flash. `edge-scope dump` prints
 //! the ring, then each log ring, oldest first, one JSON object per line.
 
-mod cause;
-mod clock;
 mod cri;
-mod logline;
-mod logs;
 mod ntp;
-mod nvme;
-mod record;
-mod ring;
-mod sample;
+
+use edge_scope::{cause, clock, logs, nvme, record, ring, sample};
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
