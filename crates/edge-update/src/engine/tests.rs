@@ -914,7 +914,7 @@ async fn workloads_that_never_settle_stop_it_before_the_stack() {
     times_out(
         |w| w.never_ready = true,
         Phase::Settling,
-        SETTLE,
+        20 * 60,
         "not ready",
     )
     .await;
@@ -925,7 +925,7 @@ async fn a_judge_that_never_rolls_out_stops_it() {
     times_out(
         |w| w.seed_stuck = true,
         Phase::Seeding,
-        ROLLOUT,
+        10 * 60,
         "did not roll out",
     )
     .await;
@@ -939,7 +939,7 @@ async fn a_judge_with_nothing_to_roll_back_to_stops_it() {
             w.judge.insert("good".into(), "update-older".into());
         },
         Phase::AwaitingGood,
-        GOOD,
+        20 * 60,
         "never recorded",
     )
     .await;

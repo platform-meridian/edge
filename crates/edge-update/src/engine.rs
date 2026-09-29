@@ -26,9 +26,9 @@ const SECURE_BOOT: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
-pub const SETTLE: i64 = 20 * 60;
-pub const ROLLOUT: i64 = 10 * 60;
-pub const GOOD: i64 = 20 * 60;
+const SETTLE: i64 = 20 * 60;
+const ROLLOUT: i64 = 10 * 60;
+const GOOD: i64 = 20 * 60;
 const HISTORY: usize = 50;
 const SNAPSHOTS: usize = 2;
 
