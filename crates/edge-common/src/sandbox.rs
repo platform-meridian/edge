@@ -284,6 +284,14 @@ pub fn layers(root: &Path, state: &Path, image_caches: &Path) -> Rules {
     }
 }
 
+pub fn registry(root: &Path, port: u16) -> Rules {
+    Rules {
+        bind_tcp: Some(vec![port]),
+        connect_tcp: Some(vec![]),
+        ..Rules::default().with(Access::Read, [root])
+    }
+}
+
 /// DHCP and DNS are UDP, which Landlock cannot restrict.
 pub fn dhcp() -> Rules {
     Rules {
@@ -743,6 +751,29 @@ mod tests {
                 allowed("dial the apiserver", dial(api))?;
                 denied("dial another port", dial(unlisted))?;
                 denied("bind", bind(port))
+            },
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn registry_read_only() {
+        let d = scratch("registry");
+        let secret = outside(&d);
+        let root = d.join("store");
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::write(root.join("blobs/b"), b"b").unwrap();
+        let (listen, other) = (free_port(), free_port());
+        let (_tcp, tcp) = listening();
+        sandboxed(
+            || registry(&root, listen),
+            || {
+                allowed("read a blob", read(root.join("blobs/b")))?;
+                denied("write the store", write_in(root.join("blobs")))?;
+                denied("read outside", read(&secret))?;
+                allowed("bind the listen port", bind(listen))?;
+                denied("bind another port", bind(other))?;
+                denied("dial", dial(tcp))
             },
         );
         std::fs::remove_dir_all(&d).ok();
