@@ -21,6 +21,7 @@ recover without anyone on site.
 | [`edge-signer`](crates/edge-signer/) | Replaces cert-manager: signs Kubernetes pod certificates from the operator's CA. |
 | [`edge-watch`](crates/edge-watch/) | Keeps the hardware watchdog armed and resets the device when its health checks fail. |
 | [`edge-scope`](crates/edge-scope/) | Records logs and hardware health so they survive resets and power loss. |
+| [`edge-registry`](crates/edge-registry/) | An image registry on the device that containerd pulls through: a store that survives power loss, served read-only. |
 | [`edge-layers`](crates/edge-layers/) | Repairs container image layers damaged by power loss before the kubelet starts. |
 | [`edge-idle`](crates/edge-idle/) | Throttles the scheduler and controller-manager while the cluster is idle. |
 | [`edge-kube`](crates/edge-kube/) | Library: the Service, EndpointSlice and NetworkPolicy view shared by edge-cni and edge-dns. |

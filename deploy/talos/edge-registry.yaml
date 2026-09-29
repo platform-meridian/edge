@@ -1,0 +1,20 @@
+# The image registry containerd pulls through, up before the kubelet. It only
+# reads the store; the updater imports into it and sweeps it on the host path.
+name: edge-registry
+depends:
+  - path: /var/mnt/edge-registry
+restart: always
+container:
+  entrypoint: /edge-registry
+  environment:
+    - EDGE_REGISTRY_ROOT=/var/mnt/edge-registry
+    - EDGE_REGISTRY_LISTEN=127.0.0.1:5000
+  mounts:
+    # rslave: the edge-registry volume may be mounted after this starts.
+    - source: /var/mnt
+      destination: /var/mnt
+      type: bind
+      options: [rbind, rslave, rw]
+  security:
+    writeableRootfs: false
+    writeableSysfs: false

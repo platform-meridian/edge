@@ -32,6 +32,7 @@ patches:
 ```
 
 `talos/` holds the Talos extension services: edge-scope, edge-layers,
-edge-watch, edge-dhcp (`operator-lan`) and a minimal edge-cni config that lets
-the node become Ready. CI tags each image with its commit, so one commit pins
-both manifests and images.
+edge-watch, edge-registry, edge-dhcp (`operator-lan`) and a minimal edge-cni
+config that lets the node become Ready. edge-registry wants a user volume named
+`edge-registry` and the machine's registry mirrors pointed at it. CI tags each
+image with its commit, so one commit pins both manifests and images.
