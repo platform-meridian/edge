@@ -302,3 +302,26 @@ fn finds_a_repository_without_its_registry() {
     assert_eq!(resp.body, stack.manifest.bytes);
     assert_eq!(registry.get("/v2/other-stack/manifests/t1").status, 404);
 }
+
+#[test]
+fn decodes_percent_encoding() {
+    let d = tempdir();
+    let mut layout = Layout::new(&d.path().join("layout"));
+    let installer = layout.image("installer", 1);
+    layout.tag(&installer, "127.0.0.1:5999/installer:v1");
+    let root = d.path().join("store");
+    Store::open(&root)
+        .unwrap()
+        .import_layout(layout.write())
+        .unwrap();
+    let registry = Registry::start(&root);
+    let encoded = installer.manifest.digest.to_string().replace(':', "%3A");
+    for path in [
+        "/v2/installer/manifests/v1?ns=127.0.0.1%3A5999".to_string(),
+        "/v2/install%65r/manifests/v1?ns=127.0.0.1%3A5999".to_string(),
+        format!("/v2/installer/manifests/{encoded}?ns=127.0.0.1%3A5999"),
+        format!("/v2/installer/blobs/{}", installer.layers[0].digest).replace(':', "%3A"),
+    ] {
+        assert_eq!(registry.get(&path).status, 200, "{path}");
+    }
+}

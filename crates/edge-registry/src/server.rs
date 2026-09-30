@@ -82,12 +82,7 @@ fn lower_priority() {
     let priority: libc::c_int = 0;
     // SAFETY: both act on the calling thread (0) and take no pointers but `priority`.
     unsafe {
-        libc::syscall(
-            libc::SYS_sched_setscheduler,
-            0,
-            libc::SCHED_IDLE,
-            &priority,
-        );
+        libc::syscall(libc::SYS_sched_setscheduler, 0, libc::SCHED_IDLE, &priority);
         libc::syscall(
             libc::SYS_ioprio_set,
             IOPRIO_WHO_PROCESS,
@@ -115,16 +110,26 @@ fn route(path: &str, query: Option<&str>) -> Option<Route> {
     }
     let mut parts = rest.strip_prefix('/')?.rsplitn(3, '/');
     let (reference, kind, name) = (parts.next()?, parts.next()?, parts.next()?);
-    let ns = query.and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("ns=")));
+    let reference = decode(reference)?;
+    let ns = query.and_then(|q| {
+        form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| (k == "ns").then(|| v.into_owned()))
+    });
     match kind {
         "manifests" => Some(Route::Manifest {
-            name: name.to_owned(),
-            ns: ns.map(str::to_owned),
-            reference: reference.to_owned(),
+            name: decode(name)?,
+            ns,
+            reference,
         }),
         "blobs" => reference.parse().ok().map(Route::Blob),
         _ => None,
     }
+}
+
+fn decode(segment: &str) -> Option<String> {
+    percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
 }
 
 async fn respond<B>(store: &Store, upstream: &Upstream, req: &Request<B>) -> Response<Body> {
