@@ -403,7 +403,7 @@ impl Engine {
             Phase::AwaitingGood => self.awaiting_good().await?,
             Phase::Repointing { rolled_back } => self.repointing(rolled_back).await?,
             Phase::Judging { rolled_back } => self.judging(&rolled_back).await?,
-            Phase::Collecting => self.collecting()?,
+            Phase::Collecting => self.collecting().await?,
         };
         match next {
             Go(p) => {
@@ -714,9 +714,20 @@ impl Engine {
             .collect()
     }
 
+    /// Also what the cluster runs: a failed update leaves its judge seeded.
+    async fn keep(&self, mut refs: BTreeSet<String>) -> anyhow::Result<BTreeSet<String>> {
+        refs.extend(
+            self.cluster
+                .images_in_use()
+                .await
+                .context("read the images the cluster runs")?,
+        );
+        Ok(refs)
+    }
+
     async fn importing(&mut self) -> anyhow::Result<Next> {
         self.detail = "importing the images".into();
-        let keep = self.committed_refs(2);
+        let keep = self.keep(self.committed_refs(2)).await?;
         let layout = self
             .release_dir(&self.release()?.sha256)
             .join(bundle::IMAGES);
@@ -1012,10 +1023,10 @@ impl Engine {
         )
     }
 
-    fn collecting(&mut self) -> anyhow::Result<Next> {
+    async fn collecting(&mut self) -> anyhow::Result<Next> {
         let mut keep = self.release()?.refs.clone();
         keep.extend(self.committed_refs(1));
-        self.registry.retain(&keep)?;
+        self.registry.retain(&self.keep(keep).await?)?;
         Ok(Done)
     }
 }

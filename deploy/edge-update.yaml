@@ -17,8 +17,9 @@ metadata:
 spec:
   roles: ["os:admin"]
 ---
-# The stack's pointer and records, and what a bundle's seed applies. Holding
-# the seed's own grants is what lets it create a Role carrying them.
+# The stack's pointer and records, what a bundle's seed applies, and the
+# workloads whose images the store keeps. Holding the seed's own grants is what
+# lets it create a Role carrying them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

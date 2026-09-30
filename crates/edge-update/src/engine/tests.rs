@@ -66,6 +66,10 @@ pub(crate) struct World {
     judge_ticks: u32,
     verdict: Verdict,
     seeded: bool,
+    /// What the seeded judge runs; it pulls only what the registry holds.
+    judge_image: String,
+    /// Images other workloads run.
+    running: BTreeSet<String>,
 
     held: BTreeSet<String>,
     last_installed: String,
@@ -117,6 +121,8 @@ impl World {
             judge_ticks: 0,
             verdict: Verdict::Good,
             seeded: false,
+            judge_image: String::new(),
+            running: BTreeSet::new(),
             held: BTreeSet::new(),
             last_installed: String::new(),
             no_store: false,
@@ -148,6 +154,10 @@ impl World {
 
     fn on_trial(&self) -> bool {
         !self.selected.eq_ignore_ascii_case(&self.default)
+    }
+
+    fn judge_pulls(&self) -> bool {
+        self.judge_image.is_empty() || self.held.contains(&self.judge_image)
     }
 
     fn committed_new(&self) -> bool {
@@ -381,14 +391,18 @@ impl Cluster for FakeCluster {
             w.committed_new(),
             "the judge was updated before the OS was committed"
         );
-        assert_eq!(manifests, "kind: Judge\n");
+        w.judge_image = manifests
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("image: "))
+            .expect("the seed names the judge's image")
+            .into();
         w.seeded = true;
         w.change("seed".into())
     }
     async fn not_rolled_out(&self, _: &str) -> anyhow::Result<Vec<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        Ok(if w.seeded && !w.seed_stuck {
+        Ok(if w.seeded && !w.seed_stuck && w.judge_pulls() {
             vec![]
         } else {
             vec!["judge".into()]
@@ -397,11 +411,26 @@ impl Cluster for FakeCluster {
     async fn not_ready(&self) -> anyhow::Result<Vec<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        Ok(if w.never_ready {
-            vec!["deployment app/web".into()]
-        } else {
-            vec![]
-        })
+        let mut waiting = Vec::new();
+        if w.never_ready {
+            waiting.push("deployment app/web".into());
+        }
+        if !w.judge_pulls() {
+            waiting.push("deployment flux-system/stack-commit".into());
+        }
+        Ok(waiting)
+    }
+    async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>> {
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        anyhow::ensure!(!w.apiserver_down, "the apiserver is not answering");
+        let mut images = w.running.clone();
+        images.extend(
+            [w.judge_image.clone()]
+                .into_iter()
+                .filter(|i| !i.is_empty()),
+        );
+        Ok(images)
     }
 }
 
@@ -454,6 +483,21 @@ impl Spec {
             patch: patch(tag),
         }
     }
+}
+
+fn seed(tag: &str) -> String {
+    format!(
+        "apiVersion: apps/v1
+kind: Deployment
+metadata: {{name: stack-commit, namespace: flux-system}}
+spec:
+  template:
+    spec:
+      containers:
+        - name: judge
+          image: reg/judge:{tag}
+"
+    )
 }
 
 fn settings(public: &str) -> Settings {
@@ -537,10 +581,11 @@ impl Harness {
         );
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
         std::fs::write(src.join("config-patch.yaml"), &s.patch).unwrap();
-        std::fs::write(src.join("seed.yaml"), "kind: Judge\n").unwrap();
+        std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
         let index = serde_json::json!({"manifests": [
             {"annotations": {"io.containerd.image.name": format!("reg/app:{}", s.tag)}},
+            {"annotations": {"io.containerd.image.name": format!("reg/judge:{}", s.tag)}},
             {"annotations": {"io.containerd.image.name": "reg/base@sha256:shared"}},
         ]});
         std::fs::write(src.join("images/index.json"), index.to_string()).unwrap();
@@ -854,7 +899,7 @@ async fn a_stack_with_another_digest_is_rolled_back() {
 }
 
 #[tokio::test]
-async fn the_registry_keeps_the_current_and_previous_releases() {
+async fn registry_keeps_two_releases_and_what_runs() {
     let mut h = Harness::new();
     for (i, tag) in ["update-a", "update-b", "update-c"].into_iter().enumerate() {
         let mut s = Spec::new(tag);
@@ -864,19 +909,49 @@ async fn the_registry_keeps_the_current_and_previous_releases() {
             .insert("built_epoch".into(), (s.epoch - 1).to_string());
         let e = h.update(&s, |_, _| {}).await;
         assert_eq!(e.outcome, Outcome::Committed, "{tag}: {}", e.detail);
+        if i == 0 {
+            h.w().running.insert("reg/app:update-a".into());
+        }
     }
     let held = h.w().held.clone();
     assert_eq!(
         held,
         [
+            "reg/app:update-a",
             "reg/app:update-b",
             "reg/app:update-c",
-            "reg/base@sha256:shared"
+            "reg/base@sha256:shared",
+            "reg/judge:update-b",
+            "reg/judge:update-c",
         ]
         .into_iter()
         .map(String::from)
         .collect()
     );
+}
+
+#[tokio::test]
+async fn failed_update_keeps_its_judge_image() {
+    let mut h = Harness::new();
+    h.w().verdict = Verdict::Bad;
+    let e = h.update(&Spec::new("update-a"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert_eq!(h.w().judge_image, "reg/judge:update-a");
+
+    h.w().verdict = Verdict::Good;
+    let mut next = Spec::new("update-b");
+    next.epoch = 2010;
+    let mut kept = None;
+    let e = h
+        .update(&next, |h, _| {
+            if h.e().record.phase == Phase::Snapshotting {
+                kept = Some(h.w().held.contains("reg/judge:update-a"));
+            }
+        })
+        .await;
+    assert_eq!(kept, Some(true), "the import collected the running judge");
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-b");
 }
 
 async fn refused(h: &mut Harness, s: &Spec, why: &str) {

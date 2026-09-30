@@ -1,13 +1,13 @@
 //! The cluster, through the apiserver: Flux's objects, the stack's records and
 //! the bundle's seed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, PodSpec};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams};
 use kube::{Api, Client};
 use serde::Deserialize;
@@ -53,6 +53,13 @@ fn objects(manifests: &str) -> anyhow::Result<Vec<DynamicObject>> {
         out.push(serde_yaml::from_value(v).context("a seed document is not a Kubernetes object")?);
     }
     Ok(out)
+}
+
+fn images(spec: &PodSpec) -> impl Iterator<Item = String> + '_ {
+    spec.containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten())
+        .filter_map(|c| c.image.clone())
 }
 
 #[async_trait]
@@ -200,6 +207,24 @@ impl crate::unit::Cluster for Kube {
         }
         Ok(waiting)
     }
+
+    async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>> {
+        let lp = ListParams::default();
+        let mut specs = Vec::new();
+        let deploys: Api<Deployment> = Api::all(self.client.clone());
+        for d in timed(deploys.list(&lp)).await? {
+            specs.extend(d.spec.and_then(|s| s.template.spec));
+        }
+        let sets: Api<DaemonSet> = Api::all(self.client.clone());
+        for d in timed(sets.list(&lp)).await? {
+            specs.extend(d.spec.and_then(|s| s.template.spec));
+        }
+        let pods: Api<Pod> = Api::all(self.client.clone());
+        for p in timed(pods.list(&lp)).await? {
+            specs.extend(p.spec);
+        }
+        Ok(specs.iter().flat_map(images).collect())
+    }
 }
 
 fn name(m: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> String {
@@ -224,5 +249,18 @@ mod tests {
         assert_eq!(objs.len(), 2);
         assert_eq!(objs[1].types.as_ref().unwrap().kind, "Deployment");
         assert!(objects("- not an object\n").is_err());
+    }
+
+    #[test]
+    fn images_include_init_containers() {
+        let spec: PodSpec = serde_json::from_value(serde_json::json!({
+            "initContainers": [{"name": "i", "image": "reg/init:1"}],
+            "containers": [{"name": "c", "image": "reg/app:1"}, {"name": "n"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            images(&spec).collect::<Vec<_>>(),
+            ["reg/app:1", "reg/init:1"]
+        );
     }
 }

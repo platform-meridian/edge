@@ -54,6 +54,8 @@ pub trait Cluster: Send + Sync {
     async fn not_rolled_out(&self, manifests: &str) -> anyhow::Result<Vec<String>>;
     /// Deployments and DaemonSets anywhere with fewer ready than wanted.
     async fn not_ready(&self) -> anyhow::Result<Vec<String>>;
+    /// Every image a pod, Deployment or DaemonSet names.
+    async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>>;
 }
 
 /// The unit's image store: content-addressed, collected by what is kept.
