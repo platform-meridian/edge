@@ -173,9 +173,15 @@ pub struct Boot {
 
 impl Boot {
     /// As boot-commit judges it: sd-boot chose an entry other than the default.
-    pub fn trial(&self) -> bool {
+    fn uncommitted(&self) -> bool {
         !(self.one_shot == "kexec reboot" || self.selected.is_empty())
             && !self.selected.eq_ignore_ascii_case(&self.default)
+    }
+
+    /// Uncommitted with a default to go back to. Fresh media has none until
+    /// boot-commit's first commit, and nothing to revert to.
+    pub fn trial(&self) -> bool {
+        self.uncommitted() && !self.default.is_empty()
     }
 }
 
@@ -279,7 +285,7 @@ impl Engine {
         })
     }
 
-    pub fn request_apply(&mut self, tag: &str) -> anyhow::Result<()> {
+    pub async fn request_apply(&mut self, tag: &str) -> anyhow::Result<()> {
         anyhow::ensure!(self.idle(), "an update is in progress");
         let rel = self
             .record
@@ -290,6 +296,18 @@ impl Engine {
             rel.tag() == tag,
             "the verified bundle is {}, not {tag}",
             rel.tag()
+        );
+        // An update's own trial needs the unit's boot committed to fall back to.
+        let boot = self.boot().await?;
+        anyhow::ensure!(
+            !boot.trial(),
+            "the unit is on trial of {}: wait for it to commit or revert",
+            boot.selected
+        );
+        anyhow::ensure!(
+            !boot.uncommitted(),
+            "the unit has not committed its first boot, {}, yet: wait for it to",
+            boot.selected
         );
         self.go(Phase::Starting)
     }
@@ -562,13 +580,6 @@ impl Engine {
                 "the unit enforces Secure Boot and the bundle was built without it"
             );
         }
-        let boot = self.boot().await?;
-        ensure!(
-            !boot.trial(),
-            "the unit is on trial of {}: wait for it to commit or revert",
-            boot.selected
-        );
-
         let st = &self.settings.stack;
         let lock = self
             .cluster

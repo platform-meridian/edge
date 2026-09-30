@@ -575,7 +575,7 @@ impl Harness {
             "refused: {:?}",
             self.e().record.history.first()
         );
-        self.e().request_apply(&s.tag).unwrap();
+        self.e().request_apply(&s.tag).await.unwrap();
         self.run(interrupt).await;
         self.e().record.history[0].clone()
     }
@@ -698,7 +698,7 @@ async fn a_power_cut_after_any_phase_converges() {
             );
             assert_eq!(h.w().tag, OLD_TAG, "cut after phase {k}");
             assert!(!h.w().committed_new());
-            h.e().request_apply("update-new").unwrap();
+            h.e().request_apply("update-new").await.unwrap();
             h.run(|_, _| {}).await;
             let e = h.e().record.history[0].clone();
             assert_eq!(
@@ -819,10 +819,29 @@ async fn refusals_change_nothing() {
 }
 
 #[tokio::test]
-async fn a_unit_on_trial_is_refused() {
-    let mut h = Harness::new();
-    h.w().selected = "Talos-v1.14.1~9.efi".into();
-    refused(&mut h, &Spec::new("update-new"), "on trial").await;
+async fn a_unit_on_trial_verifies_but_waits_to_apply() {
+    for (default, why) in [("Talos-v1.14.1.efi", "on trial"), ("", "first boot")] {
+        let mut h = Harness::new();
+        const TRIAL: &str = "Talos-v1.14.1~9.efi";
+        {
+            let mut w = h.w();
+            w.selected = TRIAL.into();
+            w.entries.insert(TRIAL.to_lowercase(), "v1.14.1".into());
+            w.default = default.into();
+        }
+        let s = Spec::new("update-new");
+        assert_eq!(h.verify(&s).await, None, "verify was refused");
+        let e = h.e().request_apply(&s.tag).await.unwrap_err();
+        assert!(e.to_string().contains(why), "{e}");
+        assert_eq!(h.e().record.phase, Phase::Idle);
+        assert!(h.e().record.history.is_empty());
+        assert!(h.w().log.is_empty());
+
+        h.w().default = TRIAL.into();
+        h.e().request_apply(&s.tag).await.unwrap();
+        h.run(|_, _| {}).await;
+        assert_eq!(h.e().record.history[0].outcome, Outcome::Committed);
+    }
 }
 
 #[tokio::test]
@@ -896,6 +915,11 @@ fn trial_is_read_as_boot_commit_reads_it() {
     assert!(!b("Talos-A.efi", "talos-a.efi", "").trial());
     assert!(!b("Talos-b.efi", "Talos-a.efi", "kexec reboot").trial());
     assert!(!b("", "Talos-a.efi", "").trial());
+    assert!(
+        !b("Talos-a.efi", "", "").trial(),
+        "fresh media has nothing to revert to"
+    );
+    assert!(b("Talos-a.efi", "", "").uncommitted());
     assert_eq!(decode_efivar(&utf16("Talos-v1.efi")), "Talos-v1.efi");
 }
 
@@ -966,7 +990,7 @@ async fn nothing_else_is_taken_while_an_update_runs() {
         .update(&Spec::new("update-new"), |h, n| {
             if n == 1 {
                 let sha = h.e().record.release.clone().unwrap().sha256;
-                refused = h.e().request_apply("update-new").is_err()
+                refused = futures::executor::block_on(h.e().request_apply("update-new")).is_err()
                     && h.e().request_verify(&sha).is_err();
             }
         })
@@ -1018,7 +1042,7 @@ async fn a_stack_rolled_back_once_can_be_applied_again() {
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Failed);
     h.w().verdict = Verdict::Good;
-    h.e().request_apply("update-new").unwrap();
+    h.e().request_apply("update-new").await.unwrap();
     h.run(|_, _| {}).await;
     let e = h.e().record.history[0].clone();
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
@@ -1049,7 +1073,7 @@ async fn step_until(h: &mut Harness, at: impl Fn(&Phase) -> bool) {
 
 async fn applied(h: &mut Harness, s: &Spec) {
     assert!(h.verify(s).await.is_none());
-    h.e().request_apply(&s.tag).unwrap();
+    h.e().request_apply(&s.tag).await.unwrap();
 }
 
 #[tokio::test]

@@ -15,7 +15,8 @@ service UpdateService {
   // Checks a complete upload against the pinned key and this unit, changing
   // nothing on the unit. The result is in the status.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
-  // Applies the verified bundle.
+  // Applies the verified bundle. Refused until the unit has committed the OS
+  // it booted, since the update's own trial falls back to it.
   rpc Apply(ApplyRequest) returns (ApplyResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   // The status now, then every change to it.

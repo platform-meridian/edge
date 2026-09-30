@@ -209,7 +209,7 @@ async fn run(
                             let _ = reply.send(r);
                         }
                         Some(Command::Apply(tag, reply)) => {
-                            let r = engine.request_apply(&tag);
+                            let r = engine.request_apply(&tag).await;
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
                         }
