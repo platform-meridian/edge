@@ -115,17 +115,15 @@ fn cache_path(r: &str) -> anyhow::Result<PathBuf> {
         Some((n, d)) => (n, Some(d.strip_prefix("sha256:").unwrap_or(d))),
         None => (r, None),
     };
-    let slash = name.rfind('/').map_or(0, |i| i + 1);
-    let (last, tag) = match name[slash..].split_once(':') {
-        Some((l, t)) => (l, Some(t)),
-        None => (&name[slash..], None),
+    let (name, tag) = match name.rsplit_once(':') {
+        Some((n, t)) if !t.contains('/') => (n, Some(t)),
+        _ => (name, None),
     };
-    let name = format!("{}{last}", &name[..slash]);
     let (reg, repo) = match name.split_once('/') {
         Some((first, rest)) if first.contains(['.', ':']) || first == "localhost" => {
             (first.to_string(), rest.to_string())
         }
-        _ => ("docker.io".to_string(), name.clone()),
+        _ => ("docker.io".to_string(), name.to_string()),
     };
     let reg = match reg.as_str() {
         "index.docker.io" => "docker.io".to_string(),
@@ -181,6 +179,10 @@ mod tests {
                 "reg.example_5000_/a/b/reference/t",
             ),
             ("10.0.0.1:5000/app:t", "10.0.0.1_5000_/app/reference/t"),
+            (
+                "reg.example:5000/a/b@sha256:abc",
+                "reg.example_5000_/a/b/digest/sha256-abc",
+            ),
             (
                 "ghcr.io/org/app:v2@sha256:abc",
                 "ghcr.io/org/app/digest/sha256-abc",

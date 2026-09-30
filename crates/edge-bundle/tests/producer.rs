@@ -304,9 +304,38 @@ fn a_flat_cache_missing_an_image_is_refused() {
 
     let flat = dir.path().join("flat3");
     let refs = flat_cache(&flat, &[("registry.example/app", "v2")]);
-    std::fs::write(flat.join("blob/not-a-blob"), "x").unwrap();
-    let e = err(oci::from_flat_cache(&flat, &dir.path().join("l3"), &refs));
-    assert!(e.contains("not a sha256 blob"), "{e}");
+    for (i, bad) in [
+        "not-a-blob".into(),
+        format!("sha256-{}", "z".repeat(64)),
+        "sha256-ab".into(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let _ = std::fs::remove_dir_all(dir.path().join("l3"));
+        std::fs::write(flat.join("blob").join(bad), "x").unwrap();
+        let e = err(oci::from_flat_cache(&flat, &dir.path().join("l3"), &refs));
+        assert!(e.contains("not a sha256 blob"), "{i} {e}");
+        std::fs::remove_file(flat.join("blob").join(bad)).unwrap();
+    }
+}
+
+#[test]
+fn manifests_the_refs_do_not_name_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let flat = dir.path().join("flat");
+    let refs = flat_cache(&flat, &[("registry.example/app", "v2")]);
+    let base = flat.join("manifests/registry.example/app");
+    std::fs::create_dir_all(base.join("digest")).unwrap();
+    std::fs::create_dir_all(base.join("other")).unwrap();
+    std::fs::write(base.join("digest/sha256-platform"), "platform").unwrap();
+    std::fs::write(base.join("reference/v1"), "older").unwrap();
+    std::fs::write(base.join("other/x"), "stray").unwrap();
+    let layout = dir.path().join("layout");
+    oci::from_flat_cache(&flat, &layout, &refs).unwrap();
+    let blob = |b: &str| layout.join("blobs/sha256").join(sha(b.as_bytes())).exists();
+    assert!(blob("platform") && blob("older"));
+    assert!(!blob("stray"));
 }
 
 /// The same documents, in any order, their keys in any order.
