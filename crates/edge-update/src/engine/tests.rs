@@ -70,6 +70,7 @@ pub(crate) struct World {
     held: BTreeSet<String>,
     last_installed: String,
     no_store: bool,
+    install_fails: bool,
 
     /// Every change to the unit, in order.
     log: Vec<String>,
@@ -119,6 +120,7 @@ impl World {
             held: BTreeSet::new(),
             last_installed: String::new(),
             no_store: false,
+            install_fails: false,
             log: Vec::new(),
             calls: 0,
             changes: 0,
@@ -267,6 +269,11 @@ impl Talos for FakeTalos {
         w.calls += 1;
         Ok(w.staged.clone().unwrap_or_else(|| w.active.clone()))
     }
+    async fn running_config(&self) -> anyhow::Result<String> {
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        Ok(w.active.clone())
+    }
     async fn stage_config(&self, config: &str, dry_run: bool) -> anyhow::Result<()> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
@@ -285,6 +292,7 @@ impl Talos for FakeTalos {
             "installed before staging"
         );
         assert!(image.ends_with(&format!("@{DIGEST}")) && !image.contains(":update-new@"));
+        anyhow::ensure!(!w.install_fails, "pulling {image}: not found");
         let entry = format!("Talos-v1.14.1~{}.efi", w.entries.len());
         w.entries.insert(entry.to_lowercase(), "v1.14.1".into());
         w.one_shot = entry.clone();
@@ -555,7 +563,10 @@ impl Harness {
                     self.clock.fetch_add(d.as_secs() as i64, Ordering::SeqCst);
                 }
                 // A crash: the process is gone, and a new one reads the record.
-                Err(_) => self.reopen(),
+                Err(_) => {
+                    self.clock.fetch_add(60, Ordering::SeqCst);
+                    self.reopen();
+                }
             }
         }
         panic!("the engine did not settle: {:?}", self.e().record.phase);
@@ -924,7 +935,7 @@ fn trial_is_read_as_boot_commit_reads_it() {
 }
 
 /// Fails in `phase`, strictly after `limit` and within a poll or so of it.
-async fn times_out(set: impl FnOnce(&mut World), phase: Phase, limit: i64, why: &str) {
+async fn times_out(set: impl FnOnce(&mut World), phase: Phase, limit: i64, why: &str) -> Harness {
     let mut h = Harness::new();
     set(&mut h.w());
     let mut began = None;
@@ -944,6 +955,38 @@ async fn times_out(set: impl FnOnce(&mut World), phase: Phase, limit: i64, why: 
     );
     assert_eq!(h.w().tag, OLD_TAG, "the stack moved");
     assert!(h.e().record.error.contains(why), "{}", h.e().record.error);
+    h
+}
+
+#[tokio::test]
+async fn an_install_that_never_succeeds_stops_it() {
+    let mut h = times_out(
+        |w| w.install_fails = true,
+        Phase::Installing,
+        30 * 60,
+        "did not install",
+    )
+    .await;
+    {
+        let w = h.w();
+        assert_eq!(w.staged.as_deref().unwrap_or(&w.active), w.active);
+        assert!(!w.active.contains("store:update-new"));
+        assert_eq!(
+            (w.selected.as_str(), w.one_shot.as_str()),
+            ("Talos-v1.14.1.efi", "")
+        );
+    }
+    assert!(h.e().record.history[0].snapshot.is_some());
+
+    h.w().install_fails = false;
+    h.e().request_apply("update-new").await.unwrap();
+    assert!(
+        h.e().record.error.is_empty(),
+        "a new apply kept the old error"
+    );
+    h.run(|_, _| {}).await;
+    assert_eq!(h.e().record.history[0].outcome, Outcome::Committed);
+    h.committed("update-new");
 }
 
 #[tokio::test]

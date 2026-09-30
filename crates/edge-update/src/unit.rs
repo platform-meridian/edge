@@ -19,6 +19,8 @@ pub trait Talos: Send + Sync {
     async fn copy(&self, path: &str, dest: &Path) -> anyhow::Result<u64>;
     /// The config the node boots next.
     async fn machine_config(&self) -> anyhow::Result<String>;
+    /// The config the node runs.
+    async fn running_config(&self) -> anyhow::Result<String>;
     /// Stages a config for the next boot, or only validates it.
     async fn stage_config(&self, config: &str, dry_run: bool) -> anyhow::Result<()>;
     /// Pulls the installer and writes the new OS beside the running one.

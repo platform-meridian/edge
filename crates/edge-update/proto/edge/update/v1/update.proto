@@ -135,7 +135,8 @@ message Status {
   string detail = 2;
   // The release verified or being applied.
   Release release = 3;
-  // Why the last verification or update stopped, empty once one succeeds.
+  // Why the last verification or update stopped, empty once one succeeds or
+  // an update starts.
   string error = 4;
   Upload upload = 5;
   int64 updated_unix = 6;

@@ -116,6 +116,35 @@ fn system() -> pb::ContainerdInstance {
     }
 }
 
+impl Node {
+    /// The first of `ids` among the node's machine configs.
+    async fn config(&self, ids: &[&str]) -> anyhow::Result<String> {
+        let mut client = StateClient::new(self.channel()?);
+        for &id in ids {
+            let get = pb::cosi::GetRequest {
+                namespace: "config".into(),
+                r#type: "MachineConfigs.config.talos.dev".into(),
+                id: id.into(),
+            };
+            let r = match client.get(req(get)).await {
+                Ok(r) => r.into_inner(),
+                Err(e) if e.code() == tonic::Code::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let spec = r
+                .resource
+                .and_then(|r| r.spec)
+                .context("the machine config has no spec")?;
+            if !spec.proto_spec.is_empty() {
+                let s = pb::cosi::MachineConfigSpec::decode(spec.proto_spec.as_slice())?;
+                return Ok(String::from_utf8(s.yaml_marshalled)?);
+            }
+            return Ok(serde_yaml::from_str::<String>(&spec.yaml_spec)?);
+        }
+        bail!("the node has no machine config")
+    }
+}
+
 #[async_trait]
 impl crate::unit::Talos for Node {
     async fn version(&self) -> anyhow::Result<String> {
@@ -189,30 +218,12 @@ impl crate::unit::Talos for Node {
     }
 
     async fn machine_config(&self) -> anyhow::Result<String> {
-        let mut client = StateClient::new(self.channel()?);
         // `persistent` is what the next boot uses, a staged config included.
-        for id in ["persistent", "v1alpha1"] {
-            let get = pb::cosi::GetRequest {
-                namespace: "config".into(),
-                r#type: "MachineConfigs.config.talos.dev".into(),
-                id: id.into(),
-            };
-            let r = match client.get(req(get)).await {
-                Ok(r) => r.into_inner(),
-                Err(e) if e.code() == tonic::Code::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let spec = r
-                .resource
-                .and_then(|r| r.spec)
-                .context("the machine config has no spec")?;
-            if !spec.proto_spec.is_empty() {
-                let s = pb::cosi::MachineConfigSpec::decode(spec.proto_spec.as_slice())?;
-                return Ok(String::from_utf8(s.yaml_marshalled)?);
-            }
-            return Ok(serde_yaml::from_str::<String>(&spec.yaml_spec)?);
-        }
-        bail!("the node has no machine config")
+        self.config(&["persistent", "v1alpha1"]).await
+    }
+
+    async fn running_config(&self) -> anyhow::Result<String> {
+        self.config(&["v1alpha1"]).await
     }
 
     async fn stage_config(&self, config: &str, dry_run: bool) -> anyhow::Result<()> {

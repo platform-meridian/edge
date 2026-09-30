@@ -26,6 +26,7 @@ const SECURE_BOOT: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
+const INSTALL: i64 = 30 * 60;
 const SETTLE: i64 = 20 * 60;
 const ROLLOUT: i64 = 10 * 60;
 const GOOD: i64 = 20 * 60;
@@ -309,6 +310,7 @@ impl Engine {
             "the unit has not committed its first boot, {}, yet: wait for it to",
             boot.selected
         );
+        self.record.error.clear();
         self.go(Phase::Starting)
     }
 
@@ -776,9 +778,23 @@ impl Engine {
             return Ok(Go(Phase::Trial));
         }
         self.detail = "installing the new OS beside the running one".into();
-        self.talos
-            .install(&installer_pin(self.release()?.get("INSTALLER_REF")))
-            .await?;
+        let installer = installer_pin(self.release()?.get("INSTALLER_REF"));
+        if let Err(e) = self.talos.install(&installer).await {
+            if (self.now)() - self.record.since <= INSTALL {
+                return Err(e);
+            }
+            // The next boot must not take the new config onto the old OS.
+            let running = self.talos.running_config().await?;
+            self.talos
+                .stage_config(&running, false)
+                .await
+                .context("drop the staged machine config")?;
+            return Ok(Fail(format!(
+                "{installer} did not install in {} minutes: {e:#}. The unit runs as it did, \
+                 its staged config dropped and the stack unmoved; applying again retries",
+                INSTALL / 60
+            )));
+        }
         Ok(Go(Phase::Rebooting {
             boot_id: self.boot_id().await?,
         }))
