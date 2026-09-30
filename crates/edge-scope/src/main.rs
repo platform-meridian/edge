@@ -3,6 +3,7 @@
 
 mod cri;
 mod ntp;
+mod shutdown;
 
 use edge_scope::{cause, clock, logs, nvme, record, ring, sample};
 
@@ -290,6 +291,11 @@ impl Scope {
         let head = self.head(t, up, synced);
         self.event(now, head, Kind::Stop, Body::Stop {});
     }
+
+    fn release(&mut self, now: Instant, t: u64, synced: bool) {
+        self.stop(now, t, synced);
+        self.rec.ring = None;
+    }
 }
 
 fn worth_a_warning(prev: cause::Cause) -> bool {
@@ -425,6 +431,7 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| path.with_file_name("time.json")),
     };
     let cri_sock = var("EDGE_SCOPE_CRI", "/run/containerd/containerd.sock");
+    let machined = var("EDGE_SCOPE_MACHINED", "/system/run/machined/machine.sock");
     edge_common::sandbox::restrict(&edge_common::sandbox::scope(edge_common::sandbox::Scope {
         ring: &path,
         time_file: &src.time_file,
@@ -433,6 +440,7 @@ fn main() -> anyhow::Result<()> {
         dev_dir: &src.dev_dir,
         watch_state: &src.watch_state,
         cri_socket: &cri_sock,
+        machined_socket: &machined,
     }));
 
     if let Err(e) = edge_common::install() {
@@ -486,6 +494,11 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    let (tx, going_down) = std::sync::mpsc::channel();
+    if let Err(e) = shutdown::spawn(machined, tx) {
+        tracing::error!(error = %e, "cannot watch for shutdown; the ring stays open to the end");
+    }
+
     let start = Instant::now();
     let mut scope = Scope {
         rec: Recorder::new(
@@ -510,6 +523,15 @@ fn main() -> anyhow::Result<()> {
     };
 
     loop {
+        if let Ok(sequence) = going_down.try_recv() {
+            scope.release(Instant::now(), wall(), clock::synced());
+            if let Some(l) = &logs {
+                l.close();
+            }
+            tracing::info!(sequence, "the unit is going down; recording stopped");
+            while !edge_common::sleep(Duration::from_secs(3600)) {}
+            return Ok(());
+        }
         scope.tick(Instant::now(), wall(), clock::synced());
         if edge_common::sleep(interval) {
             scope.stop(Instant::now(), wall(), clock::synced());
@@ -837,6 +859,7 @@ mod tests {
         }
         match end {
             "stop" => s.stop(Instant::now(), 1_003, false),
+            "release" => s.release(Instant::now(), 1_003, false),
             "watchdog" => {
                 watch(d, true, &["meridian"]);
                 s.tick(Instant::now(), 1_004, false);
@@ -849,6 +872,7 @@ mod tests {
     fn boot_end_recorded_next_boot() {
         for (end, pending_at_boot, want) in [
             ("stop", false, "clean"),
+            ("release", false, "clean"),
             ("cut", false, "power-cut"),
             ("watchdog", true, "watchdog-reset"),
             // edge-watch already folded its record; the ring still says it.
@@ -867,6 +891,25 @@ mod tests {
             assert_eq!(first["boot"], "bbbbbbbb");
             std::fs::remove_dir_all(&d).ok();
         }
+    }
+
+    #[test]
+    fn release_closes_ring() {
+        let d = scratch("release");
+        let open_in = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .flatten()
+                .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&d)))
+                .count()
+        };
+        let mut s = scope_in(&d, "aaaaaaaa", 20, 1_000, 0);
+        s.tick(Instant::now(), 1_000, false);
+        assert!(open_in() > 0);
+        s.release(Instant::now(), 1_001, false);
+        assert_eq!(open_in(), 0);
+        assert_eq!(records(&d).last().unwrap()["k"], "stop");
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

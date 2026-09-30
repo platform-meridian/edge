@@ -234,6 +234,7 @@ pub struct Scope<'a> {
     pub dev_dir: &'a Path,
     pub watch_state: &'a Path,
     pub cri_socket: &'a Path,
+    pub machined_socket: &'a Path,
 }
 
 /// NTP and the log sink are UDP, which Landlock cannot restrict.
@@ -245,7 +246,10 @@ pub fn scope(s: Scope) -> Rules {
             .with(Access::Write, [dir_of(s.ring), dir_of(s.time_file)])
             .with(Access::Read, [s.proc_dir, s.sys_dir, s.watch_state])
             .with(Access::Device, [s.dev_dir])
-            .with(Access::Socket, [dir_of(s.cri_socket)])
+            .with(
+                Access::Socket,
+                [dir_of(s.cri_socket), dir_of(s.machined_socket)],
+            )
     }
 }
 
@@ -654,13 +658,14 @@ mod tests {
     fn scope_confined() {
         let d = scratch("scope");
         let secret = outside(&d);
-        for s in ["dev", "watch", "run", "elsewhere"] {
+        for s in ["dev", "watch", "run", "machined", "elsewhere"] {
             std::fs::create_dir_all(d.join(s)).unwrap();
         }
         std::fs::write(d.join("dev/nvme0"), b"").unwrap();
         std::fs::write(d.join("watch/state.json"), b"{}").unwrap();
         let ring = d.join("scope/ring.bin");
         let _cri = UnixListener::bind(d.join("run/containerd.sock")).unwrap();
+        let _machined = UnixListener::bind(d.join("machined/machine.sock")).unwrap();
         let _other = UnixListener::bind(d.join("elsewhere/x.sock")).unwrap();
         let (_tcp, tcp) = listening();
         let port = free_port();
@@ -674,6 +679,7 @@ mod tests {
                     dev_dir: &d.join("dev"),
                     watch_state: &d.join("watch"),
                     cri_socket: &d.join("run/containerd.sock"),
+                    machined_socket: &d.join("machined/machine.sock"),
                 })
             },
             || {
@@ -687,6 +693,10 @@ mod tests {
                 allowed(
                     "reach containerd",
                     UnixStream::connect(d.join("run/containerd.sock")),
+                )?;
+                allowed(
+                    "reach machined",
+                    UnixStream::connect(d.join("machined/machine.sock")),
                 )?;
                 if kernel_abi() >= 9 {
                     denied(

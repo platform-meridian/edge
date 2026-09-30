@@ -142,6 +142,7 @@ pub struct Store {
     unparsed: u64,
     reported: (u64, u64),
     next_warning: Instant,
+    closed: bool,
 }
 
 fn ring_path(dir: &Path, source: &str) -> PathBuf {
@@ -170,6 +171,7 @@ impl Store {
             unparsed: 0,
             reported: (0, 0),
             next_warning: Instant::now(),
+            closed: false,
         }
     }
 
@@ -224,6 +226,9 @@ impl Store {
     }
 
     pub fn write(&mut self, pending: Pending) {
+        if self.closed {
+            return;
+        }
         self.lost += pending.refused;
         self.unparsed += pending.unparsed;
         for (source, q) in pending.queues {
@@ -262,6 +267,13 @@ pub struct Logs {
 impl Logs {
     pub fn flush_all(&self) {
         flush(&self.pending, &self.store, Instant::now() + REPEAT_PERIOD);
+    }
+
+    pub fn close(&self) {
+        self.flush_all();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        store.rings.clear();
+        store.closed = true;
     }
 }
 
@@ -702,6 +714,40 @@ mod tests {
         assert_eq!(all.len(), 4);
         assert!(String::from_utf8_lossy(&all[3].payload).contains("\"repeated\":1"));
         assert!(String::from_utf8_lossy(&all[0].payload).contains("\"boot\":\"abcd1234\""));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    fn open_in(dir: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(dir)))
+            .count()
+    }
+
+    #[test]
+    fn close_releases_rings() {
+        let d = scratch("close");
+        let logs = spawn("127.0.0.1:0", d.clone(), "b".into()).unwrap();
+        logs.pending
+            .lock()
+            .unwrap()
+            .push(line("machined", "before"), Instant::now());
+        logs.flush_all();
+        assert!(open_in(&d) > 0);
+        logs.pending
+            .lock()
+            .unwrap()
+            .push(line("machined", "pending"), Instant::now());
+        logs.close();
+        assert_eq!(open_in(&d), 0);
+        logs.pending
+            .lock()
+            .unwrap()
+            .push(line("machined", "after"), Instant::now());
+        logs.flush_all();
+        assert_eq!(open_in(&d), 0);
+        assert_eq!(msgs(&d, "machined"), ["before", "pending"]);
         std::fs::remove_dir_all(&d).ok();
     }
 
