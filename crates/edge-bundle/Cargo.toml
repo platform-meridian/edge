@@ -23,4 +23,5 @@ hex = "0.4"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+edge-registry = { path = "../edge-registry" }
 tempfile = "3"

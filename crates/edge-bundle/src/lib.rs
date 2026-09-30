@@ -12,6 +12,9 @@
 //! - `images/`: an OCI image layout holding every image, the installer and the
 //!   stack artifact, each named in its index by `io.containerd.image.name`
 //!   (`oci`).
+//!
+//! A build writes one with [`write`]; a unit reads one with [`unpack`] and
+//! [`check`].
 
 pub mod machineconfig;
 pub mod oci;
@@ -25,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
-use ssh_key::{PublicKey, SshSig};
+use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 
 pub use oci::layout_refs;
 
@@ -64,6 +67,41 @@ impl Verifier {
     }
 }
 
+/// The build's private key: signs as `ssh-keygen -Y sign` does.
+pub struct SigningKey {
+    key: PrivateKey,
+    namespace: String,
+}
+
+impl SigningKey {
+    /// An unencrypted OpenSSH private key.
+    pub fn from_openssh(pem: &str, namespace: &str) -> anyhow::Result<Self> {
+        let key = PrivateKey::from_openssh(pem.trim()).context("the update signing key")?;
+        ensure!(
+            !key.is_encrypted(),
+            "the update signing key is encrypted; sign with an unencrypted copy"
+        );
+        ensure!(!namespace.is_empty(), "no signature namespace");
+        Ok(Self {
+            key,
+            namespace: namespace.into(),
+        })
+    }
+
+    /// The public half, as a unit pins it.
+    pub fn public_key(&self) -> anyhow::Result<String> {
+        Ok(self.key.public_key().to_openssh()?)
+    }
+
+    pub fn sign(&self, msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let sig = self
+            .key
+            .sign(&self.namespace, HashAlg::Sha512, msg)
+            .map_err(|e| anyhow::anyhow!("signing: {e}"))?;
+        Ok(sig.to_pem(LineEnding::LF)?.into_bytes())
+    }
+}
+
 pub type Manifest = BTreeMap<String, String>;
 
 fn manifest_key(k: &str) -> bool {
@@ -85,6 +123,19 @@ pub fn parse_manifest(text: &str) -> anyhow::Result<Manifest> {
         );
     }
     Ok(m)
+}
+
+pub fn render_manifest(m: &Manifest) -> anyhow::Result<String> {
+    let mut out = String::new();
+    for (k, v) in m {
+        ensure!(manifest_key(k), "MANIFEST key {k:?} is not KEY");
+        ensure!(
+            !v.contains(['\n', '\r']),
+            "MANIFEST value of {k} is not one line"
+        );
+        out.push_str(&format!("{k}={v}\n"));
+    }
+    Ok(out)
 }
 
 fn parse_sums(text: &str) -> anyhow::Result<BTreeMap<PathBuf, [u8; 32]>> {
@@ -232,6 +283,121 @@ pub fn check(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
     let refs = layout_refs(&dir.join(IMAGES))?;
     ensure!(!refs.is_empty(), "the image layout names no image");
     Ok(refs)
+}
+
+/// What a build puts in a bundle.
+pub struct Contents<'a> {
+    pub manifest: &'a Manifest,
+    /// From [`machineconfig::strip`].
+    pub patch: &'a str,
+    pub seed: &'a str,
+    /// An OCI image layout ([`oci::from_flat_cache`]).
+    pub images: &'a Path,
+}
+
+enum Source {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+impl Source {
+    fn open(&self) -> std::io::Result<Box<dyn Read + '_>> {
+        Ok(match self {
+            Source::Bytes(b) => Box::new(b.as_slice()),
+            Source::File(p) => Box::new(File::open(p)?),
+        })
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(match self {
+            Source::Bytes(b) => b.len() as u64,
+            Source::File(p) => std::fs::metadata(p)?.len(),
+        })
+    }
+}
+
+/// Writes `contents` as a bundle to `out`, signed with `key`, every entry
+/// root's and dated `mtime` so the same inputs make the same tar. Refuses
+/// what a unit would refuse.
+pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> anyhow::Result<()> {
+    check_contents(contents)?;
+    let mut files = BTreeMap::new();
+    files.insert(
+        MANIFEST.to_string(),
+        Source::Bytes(render_manifest(contents.manifest)?.into_bytes()),
+    );
+    files.insert(
+        PATCH.into(),
+        Source::Bytes(contents.patch.as_bytes().into()),
+    );
+    files.insert(SEED.into(), Source::Bytes(contents.seed.as_bytes().into()));
+    for p in walk(contents.images)? {
+        let name = Path::new(IMAGES).join(p.strip_prefix(contents.images)?);
+        let name = name.to_str().context("an image layout path is not UTF-8")?;
+        files.insert(name.into(), Source::File(p));
+    }
+
+    let mut sums = String::new();
+    for (name, src) in &files {
+        let mut hash = Sha256::new();
+        std::io::copy(&mut src.open()?, &mut hash)?;
+        sums.push_str(&format!("{}  {name}\n", hex::encode(hash.finalize())));
+    }
+    let sig = key.sign(sums.as_bytes())?;
+
+    let r = (|| {
+        let mut tar = tar::Builder::new(std::io::BufWriter::new(File::create(out)?));
+        let mut append = |name: &str, size: u64, data: &mut dyn Read| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(size);
+            h.set_mode(0o644);
+            h.set_uid(0);
+            h.set_gid(0);
+            h.set_mtime(mtime);
+            tar.append_data(&mut h, name, data)
+        };
+        append(SUMS, sums.len() as u64, &mut sums.as_bytes())?;
+        append(SIG, sig.len() as u64, &mut sig.as_slice())?;
+        for (name, src) in &files {
+            append(name, src.len()?, &mut src.open()?)?;
+        }
+        tar.into_inner()?.into_inner()?.sync_all()?;
+        anyhow::Ok(())
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(out);
+    }
+    r.with_context(|| format!("writing {}", out.display()))
+}
+
+fn check_contents(c: &Contents) -> anyhow::Result<()> {
+    machineconfig::check_patch(c.patch)?;
+    ensure!(
+        !layout_refs(c.images)?.is_empty(),
+        "the image layout names no image"
+    );
+    Ok(())
+}
+
+/// Every regular file under `dir`, refusing anything a unit would.
+fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let e = e?;
+        let kind = e.file_type()?;
+        if kind.is_dir() {
+            out.extend(walk(&e.path())?);
+        } else {
+            ensure!(
+                kind.is_file(),
+                "{} is not a regular file",
+                e.path().display()
+            );
+            out.push(e.path());
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -403,5 +569,23 @@ mod tests {
         assert!(parse_manifest("lower=1\n").is_err());
         assert!(parse_manifest("NOEQUALS\n").is_err());
         assert_eq!(parse_manifest("A_1=x=y\n").unwrap()["A_1"], "x=y");
+    }
+
+    #[test]
+    fn a_manifest_renders_back_to_itself() {
+        let m =
+            parse_manifest("FORMAT=2\nLOCK_A=x=y\nCOMPONENT_B=img:1 sha256:aa dirty=0\nEMPTY=\n")
+                .unwrap();
+        assert_eq!(parse_manifest(&render_manifest(&m).unwrap()).unwrap(), m);
+        for (k, v) in [
+            ("lower", "x"),
+            ("", "x"),
+            ("A-B", "x"),
+            ("A", "x\nB=y"),
+            ("A", "x\r"),
+        ] {
+            let m = Manifest::from([(k.into(), v.into())]);
+            assert!(render_manifest(&m).is_err(), "{k:?}={v:?}");
+        }
     }
 }

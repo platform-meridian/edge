@@ -836,6 +836,7 @@ name = "edge-bundle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "edge-registry",
  "hex",
  "nix 0.31.3",
  "serde",
