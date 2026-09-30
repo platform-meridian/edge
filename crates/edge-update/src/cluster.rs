@@ -55,6 +55,22 @@ fn objects(manifests: &str) -> anyhow::Result<Vec<DynamicObject>> {
     Ok(out)
 }
 
+pub fn workload(kind: &str, namespace: &str, name: &str) -> String {
+    format!("{} {namespace}/{name}", kind.to_ascii_lowercase())
+}
+
+/// A manifest stream's namespaced objects, named as [`workload`] names them.
+pub fn declared(manifests: &str) -> anyhow::Result<BTreeSet<String>> {
+    Ok(objects(manifests)?
+        .into_iter()
+        .filter_map(|o| {
+            let kind = &o.types.as_ref()?.kind;
+            let m = &o.metadata;
+            Some(workload(kind, m.namespace.as_deref()?, m.name.as_deref()?))
+        })
+        .collect())
+}
+
 fn images(spec: &PodSpec) -> impl Iterator<Item = String> + '_ {
     spec.containers
         .iter()
@@ -195,14 +211,14 @@ impl crate::unit::Cluster for Kube {
             let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
             let ready = d.status.and_then(|s| s.ready_replicas).unwrap_or(0);
             if ready < want {
-                waiting.push(format!("deployment {}", name(&d.metadata)));
+                waiting.push(workload("Deployment", ns(&d.metadata), name(&d.metadata)));
             }
         }
         let sets: Api<DaemonSet> = Api::all(self.client.clone());
         for d in timed(sets.list(&lp)).await? {
             let st = d.status.unwrap_or_default();
             if st.number_ready < st.desired_number_scheduled {
-                waiting.push(format!("daemonset {}", name(&d.metadata)));
+                waiting.push(workload("DaemonSet", ns(&d.metadata), name(&d.metadata)));
             }
         }
         Ok(waiting)
@@ -227,12 +243,14 @@ impl crate::unit::Cluster for Kube {
     }
 }
 
-fn name(m: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> String {
-    format!(
-        "{}/{}",
-        m.namespace.as_deref().unwrap_or_default(),
-        m.name.as_deref().unwrap_or_default()
-    )
+type Meta = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+fn ns(m: &Meta) -> &str {
+    m.namespace.as_deref().unwrap_or_default()
+}
+
+fn name(m: &Meta) -> &str {
+    m.name.as_deref().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -249,6 +267,22 @@ mod tests {
         assert_eq!(objs.len(), 2);
         assert_eq!(objs[1].types.as_ref().unwrap().kind, "Deployment");
         assert!(objects("- not an object\n").is_err());
+    }
+
+    #[test]
+    fn declared_named_like_not_ready() {
+        let w = declared(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: judge, namespace: flux}\n---\n\
+             apiVersion: v1\nkind: ServiceAccount\nmetadata: {name: judge, namespace: flux}\n---\n\
+             apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata: {name: judge}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            w,
+            ["deployment flux/judge", "serviceaccount flux/judge"]
+                .map(String::from)
+                .into()
+        );
     }
 
     #[test]

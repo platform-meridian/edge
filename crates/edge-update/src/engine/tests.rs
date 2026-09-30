@@ -954,6 +954,16 @@ async fn failed_update_keeps_its_judge_image() {
     h.committed("update-b");
 }
 
+#[tokio::test]
+async fn broken_judge_is_replaced_not_awaited() {
+    let mut h = Harness::new();
+    h.w().judge_image = "reg/judge:gone".into();
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert_eq!(h.w().judge_image, "reg/judge:update-new");
+}
+
 async fn refused(h: &mut Harness, s: &Spec, why: &str) {
     let e = h.verify(s).await.expect("the bundle was accepted");
     assert_eq!(e.outcome, Outcome::Refused);
@@ -1177,13 +1187,23 @@ async fn an_operator_moving_the_stack_ends_the_judging() {
 
 #[tokio::test]
 async fn workloads_that_never_settle_stop_it_before_the_stack() {
-    times_out(
+    let h = times_out(
         |w| w.never_ready = true,
         Phase::Settling,
         20 * 60,
-        "not ready",
+        "not ready: deployment app/web. NOT moving the stack",
     )
     .await;
+    assert!(
+        h.engine
+            .as_ref()
+            .unwrap()
+            .record
+            .error
+            .contains("applying again carries on"),
+        "no way on: {}",
+        h.engine.as_ref().unwrap().record.error
+    );
 }
 
 #[tokio::test]

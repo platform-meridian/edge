@@ -52,7 +52,8 @@ pub trait Cluster: Send + Sync {
     async fn apply(&self, manifests: &str) -> anyhow::Result<()>;
     /// Names of the stream's Deployments not yet rolled out.
     async fn not_rolled_out(&self, manifests: &str) -> anyhow::Result<Vec<String>>;
-    /// Deployments and DaemonSets anywhere with fewer ready than wanted.
+    /// Deployments and DaemonSets anywhere with fewer ready than wanted, as
+    /// [`crate::cluster::workload`] names them.
     async fn not_ready(&self) -> anyhow::Result<Vec<String>>;
     /// Every image a pod, Deployment or DaemonSet names.
     async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>>;

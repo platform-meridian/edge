@@ -896,14 +896,24 @@ impl Engine {
         Ok(Go(Phase::Settling))
     }
 
+    fn seed(&self) -> anyhow::Result<String> {
+        let dir = self.release_dir(&self.release()?.sha256);
+        Ok(std::fs::read_to_string(dir.join(bundle::SEED))?)
+    }
+
+    /// The seed's own workloads are not waited for: seeding replaces them, and
+    /// a broken judge must not block the update that brings its fix.
     async fn settling(&mut self) -> anyhow::Result<Next> {
-        let waiting = self.cluster.not_ready().await?;
+        let replaced = crate::cluster::declared(&self.seed()?)?;
+        let mut waiting = self.cluster.not_ready().await?;
+        waiting.retain(|w| !replaced.contains(w));
         if waiting.is_empty() {
             return Ok(Go(Phase::Seeding));
         }
         if (self.now)() - self.record.since > SETTLE {
             return Ok(Fail(format!(
-                "the new OS is committed but these are not ready: {}. NOT moving the stack",
+                "the new OS is committed but these are not ready: {}. NOT moving the stack; \
+                 once they are ready, applying again carries on without reinstalling the OS",
                 waiting.join(", ")
             )));
         }
@@ -911,8 +921,7 @@ impl Engine {
     }
 
     async fn seeding(&mut self) -> anyhow::Result<Next> {
-        let seed =
-            std::fs::read_to_string(self.release_dir(&self.release()?.sha256).join(bundle::SEED))?;
+        let seed = self.seed()?;
         self.cluster
             .apply(&seed)
             .await
