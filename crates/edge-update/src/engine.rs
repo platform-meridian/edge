@@ -968,6 +968,15 @@ impl Engine {
         if good == tag {
             return Ok(Go(Phase::Collecting));
         }
+        let (_, now) = self
+            .cluster
+            .sync(&self.settings.stack.flux_instance)
+            .await?;
+        if now != tag {
+            return Ok(Fail(format!(
+                "an operator moved the stack to {now} while {tag} was on trial; the update ends here"
+            )));
+        }
         poll(
             30,
             format!("{tag} is on trial; the unit's judge commits it after ten healthy minutes"),

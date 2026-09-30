@@ -990,6 +990,24 @@ async fn an_install_that_never_succeeds_stops_it() {
 }
 
 #[tokio::test]
+async fn an_operator_moving_the_stack_ends_the_judging() {
+    let mut h = Harness::new();
+    h.w().judge_idle = true;
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
+    h.w().tag = OLD_TAG.into();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Failed);
+    assert!(
+        e.detail
+            .contains("an operator moved the stack to update-old"),
+        "{}",
+        e.detail
+    );
+}
+
+#[tokio::test]
 async fn workloads_that_never_settle_stop_it_before_the_stack() {
     times_out(
         |w| w.never_ready = true,
