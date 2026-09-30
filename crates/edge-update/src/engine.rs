@@ -25,6 +25,7 @@ const LOADER: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 const SECURE_BOOT: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
+const SAVED_CONFIG: &str = "config-before.yaml";
 
 const INSTALL: i64 = 30 * 60;
 const SETTLE: i64 = 20 * 60;
@@ -424,7 +425,6 @@ impl Engine {
             Done => {
                 let tag = self.release()?.tag().to_string();
                 self.finish(Outcome::Committed, format!("{tag} committed"))?;
-                self.tidy();
                 Ok(Tick::Moved)
             }
         }
@@ -470,11 +470,14 @@ impl Engine {
         if outcome != Outcome::Failed {
             self.record.release = None;
         }
-        self.go(Phase::Idle)
+        self.go(Phase::Idle)?;
+        self.tidy();
+        Ok(())
     }
 
-    /// Unpacked releases and uploads nothing refers to any more.
+    /// Unpacked releases, uploads and a saved config nothing refers to any more.
     fn tidy(&self) {
+        let _ = std::fs::remove_file(self.dir.join(SAVED_CONFIG));
         let keep = self.record.release.as_ref().map(|r| r.sha256.clone());
         if let Ok(dirs) = std::fs::read_dir(self.dir.join("releases")) {
             for d in dirs.flatten() {
@@ -675,6 +678,19 @@ impl Engine {
             .cluster
             .sync(&self.settings.stack.flux_instance)
             .await?;
+        // Saved before anything stages: a cut after staging boots the old OS on the new config.
+        let running = self
+            .talos
+            .running_config()
+            .await
+            .context("read the unit's machine config")?;
+        edge_common::durable_write_with(&self.dir.join(SAVED_CONFIG), |f| {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.write_all(running.as_bytes())
+        })
+        .context("save the unit's machine config")?;
         self.record.before = Some(Before {
             talos: self.talos.version().await?,
             url,
@@ -783,16 +799,11 @@ impl Engine {
             if (self.now)() - self.record.since <= INSTALL {
                 return Err(e);
             }
-            // The next boot must not take the new config onto the old OS.
-            let running = self.talos.running_config().await?;
-            self.talos
-                .stage_config(&running, false)
-                .await
-                .context("drop the staged machine config")?;
             return Ok(Fail(format!(
-                "{installer} did not install in {} minutes: {e:#}. The unit runs as it did, \
-                 its staged config dropped and the stack unmoved; applying again retries",
-                INSTALL / 60
+                "{installer} did not install in {} minutes: {e:#}. The OS is unchanged; {}. \
+                 The stack did not move; applying again retries",
+                INSTALL / 60,
+                self.restore().await?
             )));
         }
         Ok(Go(Phase::Rebooting {
@@ -813,11 +824,28 @@ impl Engine {
         {
             return Ok(Go(Phase::Trial));
         }
-        Ok(Fail(
-            "the unit rebooted on its previous OS: the install did not take or the new OS did not stay up. \
-             Nothing else moved; applying again repeats the upgrade"
-                .into(),
-        ))
+        Ok(Fail(format!(
+            "the unit rebooted on its previous OS, as the install did not take or the new OS did not stay up; \
+             {}. The stack did not move; applying again repeats the upgrade",
+            self.restore().await?
+        )))
+    }
+
+    /// Puts the saved config back, now and for every boot after. Without a
+    /// reboot, which the old OS does not need; try mode would undo it.
+    async fn restore(&self) -> anyhow::Result<&'static str> {
+        let saved = match std::fs::read_to_string(self.dir.join(SAVED_CONFIG)) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok("the update's machine config stays: none was saved before it");
+            }
+            Err(e) => return Err(e).context("read the saved machine config"),
+        };
+        self.talos
+            .apply_config(&saved)
+            .await
+            .context("restore the machine config")?;
+        Ok("its machine config from before the update is back")
     }
 
     async fn trial(&mut self) -> anyhow::Result<Next> {
@@ -839,7 +867,8 @@ impl Engine {
                 "the new OS did not stay up, and the unit went back to its previous OS by itself"
             };
             return Ok(Fail(format!(
-                "{why}. The stack did not move; applying again repeats the upgrade"
+                "{why}; {}. The stack did not move; applying again repeats the upgrade",
+                self.restore().await?
             )));
         }
         let want = self.release()?.get("TALOS_VERSION").to_string();

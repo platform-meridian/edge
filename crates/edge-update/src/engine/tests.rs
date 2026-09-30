@@ -493,6 +493,10 @@ impl Harness {
         self.dir.path().join("state")
     }
 
+    fn saved(&self) -> PathBuf {
+        self.state().join(SAVED_CONFIG)
+    }
+
     fn reopen(&mut self) {
         let w = self.world.clone();
         let clock = self.clock.clone();
@@ -715,6 +719,7 @@ async fn a_power_cut_after_any_phase_converges() {
                 e.detail
             );
             assert_eq!(h.w().tag, OLD_TAG, "cut after phase {k}");
+            assert_eq!(h.w().active, UNIT_CONFIG, "cut after phase {k}");
             assert!(!h.w().committed_new());
             h.e().request_apply("update-new").await.unwrap();
             h.run(|_, _| {}).await;
@@ -737,10 +742,91 @@ async fn a_new_os_that_does_not_stay_up_stops_the_update() {
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Failed);
     assert!(e.detail.contains("did not stay up"), "{}", e.detail);
+    assert!(
+        e.detail
+            .contains("its machine config from before the update is back"),
+        "{}",
+        e.detail
+    );
+    assert!(!h.saved().exists(), "the saved config outlived the update");
     let w = h.w();
+    assert_eq!(
+        (w.active.as_str(), w.staged.as_deref()),
+        (UNIT_CONFIG, None)
+    );
     assert_eq!(w.tag, OLD_TAG);
     assert!(!w.seeded);
     assert!(!w.log.iter().any(|l| l.starts_with("repoint")));
+}
+
+#[tokio::test]
+async fn cut_after_saving_keeps_unit_config() {
+    // The import, then the staging: the old OS boots on the update's config.
+    for n in [1, 2] {
+        let mut h = Harness::new();
+        {
+            let mut w = h.w();
+            w.trial_fails = true;
+            w.crash_at = Some(n);
+            w.cut_on_crash = true;
+        }
+        let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+        assert_eq!(e.outcome, Outcome::Failed, "cut after change {n}");
+        assert!(
+            e.detail.contains("is back"),
+            "cut after change {n}: {}",
+            e.detail
+        );
+        assert_eq!(h.w().active, UNIT_CONFIG, "cut after change {n}");
+    }
+}
+
+#[tokio::test]
+async fn crash_in_restore_restores_again() {
+    let mut h = Harness::new();
+    h.w().trial_fails = true;
+    h.update(&Spec::new("update-new"), |_, _| {}).await;
+    let apply = h.w().log.iter().position(|l| l == "apply").unwrap() + 1;
+    for cut in [false, true] {
+        let mut h = Harness::new();
+        {
+            let mut w = h.w();
+            w.trial_fails = true;
+            w.crash_at = Some(apply);
+            w.cut_on_crash = cut;
+        }
+        let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+        assert_eq!(e.outcome, Outcome::Failed);
+        assert!(e.detail.contains("is back"), "{}", e.detail);
+        assert!(!h.saved().exists());
+        let w = h.w();
+        assert_eq!(w.log.iter().filter(|l| *l == "apply").count(), 2);
+        assert_eq!(
+            (w.active.as_str(), w.staged.as_deref()),
+            (UNIT_CONFIG, None)
+        );
+    }
+}
+
+#[tokio::test]
+async fn commit_deletes_saved_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = Harness::new();
+    let mut seen = false;
+    let e = h
+        .update(&Spec::new("update-new"), |h, _| {
+            if h.e().record.phase == Phase::Trial {
+                let p = h.saved();
+                assert_eq!(std::fs::read_to_string(&p).unwrap(), UNIT_CONFIG);
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+                seen = true;
+            }
+        })
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert!(seen);
+    assert!(!h.saved().exists(), "the saved config outlived the update");
 }
 
 #[tokio::test]
@@ -1104,6 +1190,30 @@ async fn a_unit_that_committed_while_the_engine_was_away_carries_on() {
 }
 
 #[tokio::test]
+async fn revert_while_away_restores_config() {
+    let mut h = Harness::new();
+    let e = h
+        .update(&Spec::new("update-new"), |h, _| {
+            if matches!(h.e().record.phase, Phase::Rebooting { .. }) {
+                let mut w = h.w();
+                w.power_cycle();
+                w.power_cycle();
+                drop(w);
+                h.reopen();
+            }
+        })
+        .await;
+    assert_eq!(e.outcome, Outcome::Failed);
+    assert!(
+        e.detail.contains("rebooted on its previous OS"),
+        "{}",
+        e.detail
+    );
+    assert!(e.detail.contains("is back"), "{}", e.detail);
+    assert_eq!(h.w().active, UNIT_CONFIG);
+}
+
+#[tokio::test]
 async fn a_stack_rolled_back_once_can_be_applied_again() {
     let mut h = Harness::new();
     h.w().verdict = Verdict::Bad;
@@ -1239,6 +1349,7 @@ async fn a_reboot_on_the_os_trial_backs_the_update_out() {
         e.detail
     );
     let w = h.w();
+    assert_eq!(w.active, UNIT_CONFIG);
     assert_eq!(
         (w.tag.as_str(), w.selected.as_str()),
         (OLD_TAG, "Talos-v1.14.1.efi")
