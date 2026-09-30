@@ -1,10 +1,11 @@
-//! Authoritative for its subnet; leases live in memory only.
+//! Authoritative for its subnet.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::Subnet;
+use crate::leases::{self, Record};
 use crate::wire::{Kind, Reply, Request, opt};
 
 pub const LEASE_DURATION: Duration = Duration::from_secs(12 * 3600);
@@ -30,6 +31,14 @@ enum Holder {
 struct Lease {
     holder: Holder,
     until: Instant,
+    /// Set once acknowledged: an offer is not yet anyone's.
+    granted: Option<Granted>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Granted {
+    mac: String,
+    hostname: Option<String>,
 }
 
 pub struct Server {
@@ -80,11 +89,60 @@ impl Server {
             .find(|&a| self.available(a, client, now))
     }
 
-    fn hold(&mut self, a: Ipv4Addr, holder: Holder, until: Instant) {
+    fn hold(&mut self, a: Ipv4Addr, holder: Holder, until: Instant) -> &mut Lease {
         if let Holder::Client(_) = holder {
             self.leases.retain(|b, l| l.holder != holder || *b == a);
         }
-        self.leases.insert(a, Lease { holder, until });
+        let granted = self
+            .leases
+            .remove(&a)
+            .filter(|l| l.holder == holder)
+            .and_then(|l| l.granted);
+        self.leases.entry(a).or_insert(Lease {
+            holder,
+            until,
+            granted,
+        })
+    }
+
+    /// Granted and unexpired, by address, their expiry on the wall clock.
+    pub fn records(&self, now: Instant, wall: SystemTime) -> Vec<Record> {
+        let mut out: Vec<Record> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| l.until > now)
+            .filter_map(|(a, l)| {
+                let (Holder::Client(key), Some(g)) = (&l.holder, &l.granted) else {
+                    return None;
+                };
+                Some(Record {
+                    ip: *a,
+                    mac: g.mac.clone(),
+                    hostname: g.hostname.clone(),
+                    key: key.clone(),
+                    expires: unix(wall + (l.until - now)),
+                })
+            })
+            .collect();
+        out.sort_by_key(|r| r.ip);
+        out
+    }
+
+    /// Takes back what a previous run granted, so a client that keeps its
+    /// address without asking again still holds it here.
+    pub fn restore(&mut self, records: Vec<Record>, now: Instant, wall: SystemTime) {
+        let wall = unix(wall);
+        for r in records {
+            let left = r.expires.saturating_sub(wall);
+            if left == 0 || !self.subnet.in_pool(r.ip) {
+                continue;
+            }
+            let lease = self.hold(r.ip, Holder::Client(r.key), now + Duration::from_secs(left));
+            lease.granted = Some(Granted {
+                mac: r.mac,
+                hostname: r.hostname,
+            });
+        }
     }
 
     pub fn handle(&mut self, req: &Request, now: Instant) -> Option<(Reply, Dest)> {
@@ -119,7 +177,10 @@ impl Server {
                     _ => return None,
                 };
                 if self.available(a, &client, now) {
-                    self.hold(a, client, now + LEASE_DURATION);
+                    self.hold(a, client, now + LEASE_DURATION).granted = Some(Granted {
+                        mac: mac.clone(),
+                        hostname: leases::hostname(hostname),
+                    });
                     tracing::info!(%mac, addr = %a, hostname, "lease granted");
                     Some(self.lease_reply(req, Kind::Ack, a))
                 } else {
@@ -195,6 +256,11 @@ impl Server {
         }
         o
     }
+}
+
+fn unix(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Stable across restarts and builds, unlike std's hasher.
@@ -596,6 +662,139 @@ mod tests {
                 "client {c}"
             );
         }
+    }
+
+    const WALL: u64 = 1_790_000_000;
+
+    fn wall() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(WALL)
+    }
+
+    fn named(client: u8, a: Ipv4Addr, name: &str) -> Request {
+        Request {
+            hostname: Some(name.into()),
+            ..init_reboot(client, a)
+        }
+    }
+
+    #[test]
+    fn granted_lease_recorded() {
+        let now = Instant::now();
+        let mut s = server();
+        acked_addr(&mut s, &named(1, ip(150), "field laptop"), now).unwrap();
+        assert_eq!(
+            s.records(now, wall()),
+            [Record {
+                ip: ip(150),
+                mac: "02:00:00:00:00:01".into(),
+                hostname: Some("field_laptop".into()),
+                key: vec![1, 2, 0, 0, 0, 0, 1],
+                expires: WALL + LEASE_DURATION.as_secs(),
+            }]
+        );
+    }
+
+    #[test]
+    fn offer_not_recorded() {
+        let now = Instant::now();
+        let mut s = server();
+        s.handle(&discover(1), now).unwrap();
+        assert_eq!(s.records(now, wall()), []);
+    }
+
+    #[test]
+    fn rediscovery_keeps_record() {
+        let now = Instant::now();
+        let mut s = server();
+        let a = lease(&mut s, 1, now);
+        assert_eq!(s.handle(&discover(1), now).unwrap().0.yiaddr, a);
+        assert_eq!(s.records(now, wall()).len(), 1);
+    }
+
+    #[test]
+    fn released_declined_expired_unrecorded() {
+        let now = Instant::now();
+        let mut s = server();
+        let released = lease(&mut s, 1, now);
+        let declined = lease(&mut s, 2, now);
+        lease(&mut s, 3, now);
+        s.handle(&with_ciaddr(Kind::Release, 1, released), now);
+        s.handle(&decline(2, declined), now);
+        assert_eq!(
+            s.records(now, wall())
+                .iter()
+                .map(|r| r.key[6])
+                .collect::<Vec<_>>(),
+            [3]
+        );
+        assert_eq!(s.records(now + LEASE_DURATION, wall()), []);
+    }
+
+    #[test]
+    fn records_by_address() {
+        let now = Instant::now();
+        let mut s = server();
+        for (c, last) in [(1, 170), (2, 120), (3, 150)] {
+            acked_addr(&mut s, &init_reboot(c, ip(last)), now).unwrap();
+        }
+        let ips: Vec<Ipv4Addr> = s.records(now, wall()).iter().map(|r| r.ip).collect();
+        assert_eq!(ips, [ip(120), ip(150), ip(170)]);
+    }
+
+    #[test]
+    fn restored_lease_kept_for_owner() {
+        let now = Instant::now();
+        let mut first = server();
+        acked_addr(&mut first, &named(1, ip(150), "laptop"), now).unwrap();
+        let later = now + Duration::from_secs(3600);
+        let records = first.records(later, wall());
+
+        let mut restarted = server();
+        restarted.restore(records.clone(), later, wall());
+        assert_eq!(restarted.records(later, wall()), records);
+        assert_nak(&mut restarted, &init_reboot(2, ip(150)), later);
+        assert_eq!(
+            acked_addr(&mut restarted, &renew(1, ip(150)), later),
+            Some(ip(150))
+        );
+        let expiry = later + LEASE_DURATION - Duration::from_secs(3600);
+        assert_eq!(
+            acked_addr(
+                &mut server_restored(&records, later),
+                &init_reboot(2, ip(150)),
+                expiry
+            ),
+            Some(ip(150))
+        );
+    }
+
+    fn server_restored(records: &[Record], now: Instant) -> Server {
+        let mut s = server();
+        s.restore(records.to_vec(), now, wall());
+        s
+    }
+
+    #[test]
+    fn restore_skips_expired_and_foreign() {
+        let now = Instant::now();
+        let record = |last: u8, expires: u64| Record {
+            ip: ip(last),
+            mac: "02:00:00:00:00:01".into(),
+            hostname: None,
+            key: vec![1, 2, 0, 0, 0, 0, last],
+            expires,
+        };
+        let s = server_restored(
+            &[
+                record(150, WALL),
+                record(151, WALL - 1),
+                record(20, WALL + 60),
+                record(152, WALL + 60),
+            ],
+            now,
+        );
+        let ips: Vec<Ipv4Addr> = s.records(now, wall()).iter().map(|r| r.ip).collect();
+        assert_eq!(ips, [ip(152)]);
     }
 
     #[derive(Clone, Debug)]

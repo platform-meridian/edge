@@ -144,10 +144,11 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start() -> Daemon {
+    fn start(leases: &Path) -> Daemon {
         let mut child = Command::new(env!("CARGO_BIN_EXE_edge-dhcp"))
             .env("EDGE_DHCP_ADDR", "10.51.0.1/24")
             .env("EDGE_DHCP_DOMAIN", "example.lan")
+            .env("EDGE_DHCP_LEASES", leases)
             .env("RUST_LOG", "debug")
             .stdout(Stdio::piped())
             .spawn()
@@ -232,8 +233,39 @@ fn laptop(dhcpcd: PathBuf) -> Laptop {
     Laptop { ns, dhcpcd }
 }
 
+/// Each line but the lease's expiry, once a file other than `stale` is there.
+fn lease_lines(file: &Path, stale: Option<u64>) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let fresh = std::fs::metadata(file).is_ok_and(|m| Some(m.ino()) != stale);
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        if fresh && text.lines().count() > 1 || Instant::now() > until {
+            return text
+                .lines()
+                .map(|l| {
+                    let mut f: Vec<&str> = l.split(' ').collect();
+                    if f[0] == "lease" {
+                        f.remove(1);
+                    }
+                    f.join(" ")
+                })
+                .collect();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn inode(file: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(file).ok().map(|m| m.ino())
+}
+
 fn inside() {
-    let dhcpcd = dhcpcd_sandbox(&Path::new(env!("CARGO_TARGET_TMPDIR")).join("edge-dhcp-netns"));
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("edge-dhcp-netns");
+    let dhcpcd = dhcpcd_sandbox(&scratch);
+    let leases = scratch.join("state/leases");
+    std::fs::remove_file(&leases).ok();
     let laptop = laptop(dhcpcd);
     let pid = laptop.ns.id();
     ip("link set lo up");
@@ -252,7 +284,7 @@ fn inside() {
         laptop.ip(&format!("link set {l} up"));
     }
 
-    let mut dhcp = Daemon::start();
+    let mut dhcp = Daemon::start(&leases);
     assert!(!laptop.dhcp("laptop", 3, &[]), "a lease with the port dark");
     assert!(dhcp.running(), "edge-dhcp gave up while the port was dark");
 
@@ -261,6 +293,13 @@ fn inside() {
     assert_eq!(laptop.addr("laptop").as_deref(), Some("10.51.0.150/24"));
     dhcp.wait_for("addr=10.51.0.150");
     assert_eq!(dhcp.lines("lease granted").len(), 1);
+    let recorded = lease_lines(&leases, None);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(recorded[0], "serving 10.51.0.1/24 example.lan");
+    assert!(
+        recorded[1].starts_with(&format!("lease {LAPTOP_MAC} 10.51.0.150 ")),
+        "{recorded:?}"
+    );
 
     let a = laptop.resolve("flux.example.lan.", RecordType::A);
     assert_eq!(a.metadata.response_code, ResponseCode::NoError);
@@ -284,7 +323,13 @@ fn inside() {
     assert!(dhcp.lines(STRANGER_MAC).is_empty());
 
     dhcp.stop();
-    let dhcp = Daemon::start();
+    let before = inode(&leases);
+    let dhcp = Daemon::start(&leases);
+    assert_eq!(
+        lease_lines(&leases, before),
+        recorded,
+        "the restart forgot the lease"
+    );
     assert!(laptop.dhcp("laptop", 15, &[]));
     assert_eq!(laptop.addr("laptop").as_deref(), Some("10.51.0.150/24"));
     dhcp.wait_for("addr=10.51.0.150");

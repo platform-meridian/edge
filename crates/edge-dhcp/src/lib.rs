@@ -3,6 +3,7 @@
 
 pub mod dhcp;
 pub mod dns;
+pub mod leases;
 pub mod net;
 pub mod wire;
 

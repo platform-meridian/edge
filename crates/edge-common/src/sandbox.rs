@@ -293,12 +293,13 @@ pub fn registry(root: &Path, port: u16, upstream_port: u16) -> Rules {
     }
 }
 
-/// DHCP and DNS are UDP, which Landlock cannot restrict.
-pub fn dhcp() -> Rules {
+/// DHCP and DNS are UDP, which Landlock cannot restrict. The lease file is
+/// replaced by rename, so the grant is its directory.
+pub fn dhcp(lease_file: Option<&Path>) -> Rules {
     Rules {
         bind_tcp: Some(vec![]),
         connect_tcp: Some(vec![]),
-        ..Rules::default()
+        ..Rules::default().with(Access::Write, lease_file.map(dir_of))
     }
 }
 
@@ -782,21 +783,40 @@ mod tests {
     }
 
     #[test]
+    fn dhcp_writes_only_its_lease_file() {
+        let d = scratch("dhcp-leases");
+        let secret = outside(&d);
+        let leases = d.join("leases/file");
+        sandboxed(
+            || dhcp(Some(&leases)),
+            || {
+                allowed("write the lease file", crate::durable_write(&leases, b"x"))?;
+                denied("read anything else", read(&secret))?;
+                denied("write anything else", write_in(&d))
+            },
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
     fn dhcp_udp_only() {
         let d = scratch("dhcp");
         let secret = outside(&d);
         let (_tcp, tcp) = listening();
         let port = free_port();
-        sandboxed(dhcp, || {
-            denied("read anything", read(&secret))?;
-            denied("write anything", write_in(&d))?;
-            denied("bind TCP", bind(port))?;
-            denied("dial TCP", dial(tcp))?;
-            let udp =
-                std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind UDP: {e}"))?;
-            allowed("send UDP", udp.send_to(b"x", udp.local_addr().unwrap()))?;
-            allowed("receive UDP", udp.recv(&mut [0u8; 1]))
-        });
+        sandboxed(
+            || dhcp(None),
+            || {
+                denied("read anything", read(&secret))?;
+                denied("write anything", write_in(&d))?;
+                denied("bind TCP", bind(port))?;
+                denied("dial TCP", dial(tcp))?;
+                let udp = std::net::UdpSocket::bind("127.0.0.1:0")
+                    .map_err(|e| format!("bind UDP: {e}"))?;
+                allowed("send UDP", udp.send_to(b"x", udp.local_addr().unwrap()))?;
+                allowed("receive UDP", udp.recv(&mut [0u8; 1]))
+            },
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

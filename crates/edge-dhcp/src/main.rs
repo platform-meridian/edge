@@ -1,15 +1,19 @@
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use edge_dhcp::wire::{self, CLIENT_PORT};
-use edge_dhcp::{Subnet, dhcp, dns, net};
+use edge_dhcp::{Subnet, dhcp, dns, leases, net};
 use hickory_proto::rr::Name;
 
 fn main() {
     edge_common::init_tracing();
     let subnet = subnet(std::env::var("EDGE_DHCP_ADDR").ok().as_deref());
     let domain = domain(std::env::var("EDGE_DHCP_DOMAIN").ok().as_deref());
-    edge_common::sandbox::restrict(&edge_common::sandbox::dhcp());
+    let lease_file = std::env::var_os("EDGE_DHCP_LEASES")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    edge_common::sandbox::restrict(&edge_common::sandbox::dhcp(lease_file.as_deref()));
     // A dead worker would leave the port dark behind a live process; exiting
     // lets the supervisor restart it, and clients keep their addresses across that.
     std::panic::set_hook(Box::new(|p| {
@@ -23,7 +27,7 @@ fn main() {
         let name = domain
             .as_ref()
             .map(|d| d.to_ascii().trim_end_matches('.').to_owned());
-        std::thread::spawn(move || serve_dhcp(subnet, name));
+        std::thread::spawn(move || serve_dhcp(subnet, name, lease_file));
         if let Some(domain) = domain {
             std::thread::spawn(move || serve_dns(subnet.addr, domain));
         }
@@ -78,11 +82,50 @@ fn recv_failed(what: &str, e: std::io::Error) {
     std::thread::sleep(Duration::from_millis(100));
 }
 
-fn serve_dhcp(subnet: Subnet, domain: Option<String>) {
+/// What a reader of the file sees; serving never waits on it.
+struct LeaseFile {
+    path: PathBuf,
+    written: Option<String>,
+}
+
+impl LeaseFile {
+    fn restore(path: PathBuf, server: &mut dhcp::Server) -> LeaseFile {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            server.restore(leases::parse(&text), Instant::now(), SystemTime::now());
+        }
+        LeaseFile {
+            path,
+            written: None,
+        }
+    }
+
+    fn write(&mut self, text: String) {
+        if self.written.as_ref() == Some(&text) {
+            return;
+        }
+        match edge_common::durable_write(&self.path, text.as_bytes()) {
+            Ok(()) => self.written = Some(text),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %self.path.display(), "lease file not written")
+            }
+        }
+    }
+}
+
+fn render(server: &dhcp::Server, subnet: Subnet, domain: Option<&str>) -> String {
+    let records = server.records(Instant::now(), SystemTime::now());
+    leases::render(subnet, domain, &records)
+}
+
+fn serve_dhcp(subnet: Subnet, domain: Option<String>, lease_file: Option<PathBuf>) {
     let sock = bind_retrying("dhcp", net::dhcp_socket);
-    let mut server = dhcp::Server::new(subnet, domain);
+    let mut server = dhcp::Server::new(subnet, domain.clone());
+    let mut file = lease_file.map(|p| LeaseFile::restore(p, &mut server));
     let mut buf = [0u8; 1500];
     loop {
+        if let Some(f) = &mut file {
+            f.write(render(&server, subnet, domain.as_deref()));
+        }
         let (n, ifindex) = match net::recv(&sock, &mut buf) {
             Ok(r) => r,
             Err(e) => {
