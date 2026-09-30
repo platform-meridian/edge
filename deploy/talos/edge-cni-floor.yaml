@@ -6,6 +6,8 @@ depends:
   # A Talos tmpfs: written before the mount, the conflist would be hidden under it.
   - path: /etc/cni
   - path: /opt
+  # Stopped with cri, before Talos unmounts /opt: its upper layer is on EPHEMERAL.
+  - service: cri
 restart: always
 container:
   entrypoint: /usr/local/bin/edge-cni

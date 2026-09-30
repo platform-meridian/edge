@@ -7,6 +7,9 @@
 name: edge-registry
 depends:
   - path: /var/mnt/edge-registry
+  # Talos stops cri's dependents before it unmounts volumes, and every other
+  # service after: this one's volume would still be in use.
+  - service: cri
 restart: always
 container:
   entrypoint: /edge-registry
