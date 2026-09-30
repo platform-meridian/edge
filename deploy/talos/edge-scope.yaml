@@ -10,25 +10,19 @@ container:
   environment:
     - EDGE_SCOPE_BUILD_EPOCH=@BUILD_EPOCH@
     - EDGE_SCOPE_DEV=/host/dev
-    - EDGE_SCOPE_RING=/var/mnt/edge-evidence/edge-scope/ring.bin
-    - EDGE_WATCH_STATE=/var/mnt/edge-evidence/edge-watch
-    - EDGE_EVIDENCE=/var/mnt/edge-evidence
+    - EDGE_SCOPE_CRI=/host/run/containerd/containerd.sock
+    - EDGE_SCOPE_MACHINED=/host/system/run/machined/machine.sock
+    - EDGE_SCOPE_RING=/host/var/mnt/edge-evidence/edge-scope/ring.bin
+    - EDGE_WATCH_STATE=/host/var/mnt/edge-evidence/edge-watch
+    - EDGE_EVIDENCE=/host/var/mnt/edge-evidence
   mounts:
-    # rslave: the edge-evidence volume may be mounted after this starts.
-    - source: /var/mnt
-      destination: /var/mnt
+    # The host's root, rslave: volumes mounted after this starts appear, and
+    # Talos's unmounts at shutdown reach this copy; a bind of a directory on a
+    # volume would hold it mounted until this stops, after the unmounts.
+    - source: /
+      destination: /host
       type: bind
       options: [rbind, rslave, rw]
-    # The directory, not the socket: containerd recreates it on every restart.
-    - source: /run/containerd
-      destination: /run/containerd
-      type: bind
-      options: [rbind, rw]
-    # Extension services get device access but not the host's device nodes.
-    - source: /dev
-      destination: /host/dev
-      type: bind
-      options: [rbind, ro]
   # No capabilities to list: machined grants extension services all of them
   # (CAP_SYS_TIME for the clock, CAP_SYS_ADMIN for the SMART log).
   security:
