@@ -832,6 +832,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-bundle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "ssh-key",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "edge-cni"
 version = "0.1.0"
 dependencies = [
@@ -1085,6 +1101,7 @@ dependencies = [
  "buffa",
  "connectrpc",
  "connectrpc-build",
+ "edge-bundle",
  "edge-common",
  "edge-registry",
  "futures",
@@ -1100,8 +1117,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "ssh-key",
- "tar",
  "tempfile",
  "tokio",
  "tokio-stream",

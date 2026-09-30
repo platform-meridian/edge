@@ -16,8 +16,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::bundle::{self, Manifest, Signer};
-use crate::machineconfig;
+use crate::bundle::{self, Manifest, Verifier, machineconfig};
 use crate::unit::{Cluster, Registry, Settings, Talos};
 use crate::upload::Uploads;
 
@@ -192,7 +191,7 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub struct Engine {
     dir: PathBuf,
     settings: Settings,
-    signer: Signer,
+    verifier: Verifier,
     talos: Arc<dyn Talos>,
     cluster: Arc<dyn Cluster>,
     registry: Arc<dyn Registry>,
@@ -226,7 +225,7 @@ impl Engine {
         registry: Arc<dyn Registry>,
         now: Clock,
     ) -> anyhow::Result<Self> {
-        let signer = Signer::new(&settings.signing_key, &settings.signature_namespace)?;
+        let verifier = Verifier::new(&settings.signing_key, &settings.signature_namespace)?;
         let path = dir.join("state.json");
         let record = match std::fs::read(&path) {
             Ok(b) => match serde_json::from_slice(&b) {
@@ -244,7 +243,7 @@ impl Engine {
         Ok(Self {
             dir: dir.into(),
             settings,
-            signer,
+            verifier,
             talos,
             cluster,
             registry,
@@ -493,9 +492,9 @@ impl Engine {
         let _ = std::fs::remove_dir_all(&dir);
         self.detail = "checking the signature and unpacking".into();
         let bundle = self.uploads().bundle();
-        let (d, signer) = (dir.clone(), self.signer.clone());
+        let (d, verifier) = (dir.clone(), self.verifier.clone());
         let unpacked =
-            tokio::task::spawn_blocking(move || bundle::unpack(&bundle, &d, &signer)).await?;
+            tokio::task::spawn_blocking(move || bundle::unpack(&bundle, &d, &verifier)).await?;
         let release = match unpacked.and_then(|manifest| {
             let refs = bundle::layout_refs(&dir.join(bundle::IMAGES))?;
             Ok(Release {

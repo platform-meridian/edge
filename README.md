@@ -26,6 +26,7 @@ recover without anyone on site.
 | [`edge-layers`](crates/edge-layers/) | Repairs container image layers damaged by power loss before the kubelet starts. |
 | [`edge-idle`](crates/edge-idle/) | Throttles the scheduler and controller-manager while the cluster is idle. |
 | [`edge-kube`](crates/edge-kube/) | Library: the Service, EndpointSlice and NetworkPolicy view shared by edge-cni and edge-dns. |
+| [`edge-bundle`](crates/edge-bundle/) | Library: the signed update bundle and the machine-config patch that never carries the device's secrets, read by edge-update and written by build tooling. |
 | [`edge-common`](crates/edge-common/) | Library: shutdown, logging, durable writes and sandboxing. |
 | [`conformance/`](conformance/) | Release tests: kube-apiserver's storage tests and etcd's robustness tests against edge-state. |
 | [`replay/`](replay/) | Records apiserver sessions and replays them against edge-state and etcd to compare the answers. |

@@ -10,7 +10,13 @@
 //!   (`machineconfig`).
 //! - `seed.yaml`: objects applied server-side before the stack moves.
 //! - `images/`: an OCI image layout holding every image, the installer and the
-//!   stack artifact, each named in its index by `io.containerd.image.name`.
+//!   stack artifact, each named in its index by `io.containerd.image.name`
+//!   (`oci`).
+
+pub mod machineconfig;
+pub mod oci;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -20,6 +26,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
 use ssh_key::{PublicKey, SshSig};
+
+pub use oci::layout_refs;
 
 pub const SUMS: &str = "SHA256SUMS";
 pub const SIG: &str = "SHA256SUMS.sig";
@@ -31,13 +39,14 @@ pub const IMAGES: &str = "images";
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIG: u64 = 64 << 10;
 
+/// The pinned key a unit checks a bundle's signature against.
 #[derive(Clone)]
-pub struct Signer {
+pub struct Verifier {
     key: PublicKey,
     namespace: String,
 }
 
-impl Signer {
+impl Verifier {
     pub fn new(openssh: &str, namespace: &str) -> anyhow::Result<Self> {
         let key = PublicKey::from_openssh(openssh.trim()).context("the pinned update key")?;
         ensure!(!namespace.is_empty(), "no signature namespace");
@@ -57,18 +66,19 @@ impl Signer {
 
 pub type Manifest = BTreeMap<String, String>;
 
+fn manifest_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 pub fn parse_manifest(text: &str) -> anyhow::Result<Manifest> {
     let mut m = Manifest::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let (k, v) = line
             .split_once('=')
             .with_context(|| format!("MANIFEST line {line:?} is not KEY=value"))?;
-        ensure!(
-            !k.is_empty()
-                && k.bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
-            "MANIFEST key {k:?} is not KEY"
-        );
+        ensure!(manifest_key(k), "MANIFEST key {k:?} is not KEY");
         ensure!(
             m.insert(k.into(), v.into()).is_none(),
             "MANIFEST names {k} twice"
@@ -119,18 +129,18 @@ fn read_small(entry: &mut impl Read, size: u64, max: u64, what: &str) -> anyhow:
     Ok(buf)
 }
 
-/// Verifies `tar` against `signer` and unpacks it into `dest`, which must not
-/// exist. On any failure `dest` is removed.
-pub fn unpack(tar: &Path, dest: &Path, signer: &Signer) -> anyhow::Result<Manifest> {
+/// Verifies `tar` against `verifier` and unpacks it into `dest`, which must
+/// not exist. On any failure `dest` is removed.
+pub fn unpack(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
     ensure!(!dest.exists(), "{} already exists", dest.display());
-    let r = unpack_into(tar, dest, signer);
+    let r = unpack_into(tar, dest, verifier);
     if r.is_err() {
         let _ = std::fs::remove_dir_all(dest);
     }
     r
 }
 
-fn unpack_into(tar: &Path, dest: &Path, signer: &Signer) -> anyhow::Result<Manifest> {
+fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
     let mut archive = tar::Archive::new(File::open(tar).context("open the bundle")?);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
 
@@ -149,7 +159,7 @@ fn unpack_into(tar: &Path, dest: &Path, signer: &Signer) -> anyhow::Result<Manif
     };
     let sums_bytes = next(SUMS, MAX_SUMS)?;
     let sig = next(SIG, MAX_SIG)?;
-    signer.verify(&sums_bytes, &sig)?;
+    verifier.verify(&sums_bytes, &sig)?;
     let sums = parse_sums(std::str::from_utf8(&sums_bytes).context("the sums are not text")?)?;
     for need in [MANIFEST, PATCH, SEED] {
         ensure!(
@@ -214,131 +224,14 @@ pub fn sync_fs(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The refs an OCI image layout names, from its index.
-pub fn layout_refs(layout: &Path) -> anyhow::Result<BTreeSet<String>> {
-    let index: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(layout.join("index.json")).context("the image layout's index")?,
-    )?;
-    let mut refs = BTreeSet::new();
-    for m in index["manifests"]
-        .as_array()
-        .context("the index lists no manifests")?
-    {
-        let a = &m["annotations"];
-        let name = a["io.containerd.image.name"]
-            .as_str()
-            .or_else(|| a["org.opencontainers.image.ref.name"].as_str())
-            .context("an index entry names no image")?;
-        refs.insert(name.to_string());
-    }
+/// What a unit checks of an unpacked bundle before it moves: a patch that
+/// carries nothing the unit keeps, and a layout naming at least one image.
+/// Returns the layout's refs.
+pub fn check(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
+    machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
+    let refs = layout_refs(&dir.join(IMAGES))?;
+    ensure!(!refs.is_empty(), "the image layout names no image");
     Ok(refs)
-}
-
-#[cfg(test)]
-pub mod testkit {
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-
-    pub const NAMESPACE: &str = "test-update";
-
-    pub fn keygen(dir: &Path, name: &str) -> (PathBuf, String) {
-        let key = dir.join(name);
-        let st = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
-            .arg(&key)
-            .status()
-            .expect("ssh-keygen");
-        assert!(st.success());
-        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
-        (key, public)
-    }
-
-    pub fn sign(key: &Path, file: &Path, namespace: &str) {
-        let _ = std::fs::remove_file(file.with_extension("sig"));
-        let st = Command::new("ssh-keygen")
-            .args(["-q", "-Y", "sign", "-n", namespace, "-f"])
-            .arg(key)
-            .arg(file)
-            .status()
-            .expect("ssh-keygen");
-        assert!(st.success());
-    }
-
-    pub const LAYOUT_INDEX: &str = r#"{"schemaVersion":2,"manifests":[
-{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aa","size":1,
- "annotations":{"io.containerd.image.name":"registry.example/app:v2","org.opencontainers.image.ref.name":"v2"}},
-{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bb","size":1,
- "annotations":{"io.containerd.image.name":"registry.example/installer@sha256:bb"}}]}"#;
-
-    /// A source tree as a build lays it out; `seal` sums and signs it.
-    pub fn tree(dir: &Path, manifest: &str) {
-        std::fs::create_dir_all(dir.join("images/blobs/sha256")).unwrap();
-        std::fs::write(dir.join("MANIFEST"), manifest).unwrap();
-        std::fs::write(dir.join("config-patch.yaml"), "version: v1alpha1\n").unwrap();
-        std::fs::write(dir.join("seed.yaml"), "").unwrap();
-        std::fs::write(
-            dir.join("images/oci-layout"),
-            r#"{"imageLayoutVersion":"1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(dir.join("images/index.json"), LAYOUT_INDEX).unwrap();
-        std::fs::write(dir.join("images/blobs/sha256/aa"), "layer").unwrap();
-    }
-
-    pub fn files(dir: &Path) -> Vec<String> {
-        let mut out = Vec::new();
-        for e in walk(dir) {
-            let rel = e.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
-            if rel != "SHA256SUMS" && rel != "SHA256SUMS.sig" {
-                out.push(rel);
-            }
-        }
-        out.sort();
-        out
-    }
-
-    fn walk(dir: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            if p.is_dir() {
-                out.extend(walk(&p));
-            } else {
-                out.push(p);
-            }
-        }
-        out
-    }
-
-    pub fn seal(dir: &Path, key: &Path, namespace: &str) {
-        use sha2::Digest;
-        let mut sums = String::new();
-        for f in files(dir) {
-            let h = sha2::Sha256::digest(std::fs::read(dir.join(&f)).unwrap());
-            sums.push_str(&format!("{}  {f}\n", hex::encode(h)));
-        }
-        std::fs::write(dir.join("SHA256SUMS"), sums).unwrap();
-        sign(key, &dir.join("SHA256SUMS"), namespace);
-    }
-
-    /// The tar, in the order a build writes it; `order` overrides the head.
-    pub fn pack(dir: &Path, out: &Path, head: &[&str]) {
-        let mut b = tar::Builder::new(std::fs::File::create(out).unwrap());
-        let mut names: Vec<String> = head.iter().map(|s| s.to_string()).collect();
-        for f in files(dir) {
-            if !names.contains(&f) {
-                names.push(f);
-            }
-        }
-        for n in names {
-            if dir.join(&n).exists() {
-                b.append_path_with_name(dir.join(&n), &n).unwrap();
-            }
-        }
-        b.finish().unwrap();
-    }
-
-    pub const HEAD: &[&str] = &["SHA256SUMS", "SHA256SUMS.sig"];
 }
 
 #[cfg(test)]
@@ -372,7 +265,7 @@ mod tests {
             let t = self.dir.path().join("b.tar");
             pack(&self.src(), &t, head);
             let _ = std::fs::remove_dir_all(self.out());
-            unpack(&t, &self.out(), &Signer::new(public, ns)?)
+            unpack(&t, &self.out(), &Verifier::new(public, ns)?)
         }
         fn out(&self) -> PathBuf {
             self.dir.path().join("out")
@@ -500,7 +393,7 @@ mod tests {
         b.append_link(&mut h, MANIFEST, "/etc/shadow").unwrap();
         b.finish().unwrap();
         drop(b);
-        let r = unpack(&t, &c.out(), &Signer::new(&c.public, NAMESPACE).unwrap());
+        let r = unpack(&t, &c.out(), &Verifier::new(&c.public, NAMESPACE).unwrap());
         refused(&c, r, "not a regular file");
     }
 

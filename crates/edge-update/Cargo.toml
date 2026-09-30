@@ -10,13 +10,13 @@ rust-version.workspace = true
 [dependencies]
 edge-common = { path = "../edge-common" }
 edge-registry = { path = "../edge-registry" }
+edge-bundle = { path = "../edge-bundle" }
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-tar.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs"] }
 kube.workspace = true
@@ -26,7 +26,6 @@ tonic-prost.workspace = true
 prost.workspace = true
 connectrpc = { version = "0.9", default-features = false, features = ["server", "client", "gzip"] }
 buffa = "0.9"
-ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 sha2 = "0.10"
 hex = "0.4"
 rustls.workspace = true
@@ -34,6 +33,7 @@ base64 = "0.22"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+edge-bundle = { path = "../edge-bundle", features = ["testkit"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = "0.14"

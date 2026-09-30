@@ -7,10 +7,8 @@
 //!                               an import into a scratch registry store
 
 mod api;
-mod bundle;
 mod cluster;
 mod engine;
-mod machineconfig;
 mod registry;
 mod talos;
 mod unit;
@@ -26,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use edge_bundle as bundle;
 use tokio::sync::{mpsc, watch};
 
 use api::{Command, Snapshot};
@@ -42,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         Some("strip-config") => {
             let mut full = String::new();
             std::io::stdin().read_to_string(&mut full)?;
-            print!("{}", machineconfig::strip(&full)?);
+            print!("{}", bundle::machineconfig::strip(&full)?);
             return Ok(());
         }
         Some("check-bundle") if args.len() == 6 => return check_bundle(&args[2..]),
@@ -54,14 +53,12 @@ fn main() -> anyhow::Result<()> {
 
 /// Signature, sums, patch and layout, as the unit checks them; prints the MANIFEST.
 fn check_bundle(a: &[String]) -> anyhow::Result<()> {
-    let signer = bundle::Signer::new(&std::fs::read_to_string(&a[1])?, &a[2])?;
+    let verifier = bundle::Verifier::new(&std::fs::read_to_string(&a[1])?, &a[2])?;
     let dest = PathBuf::from(&a[3]).join("check-bundle");
     let _ = std::fs::remove_dir_all(&dest);
     let r = (|| {
-        let manifest = bundle::unpack(std::path::Path::new(&a[0]), &dest, &signer)?;
-        machineconfig::check_patch(&std::fs::read_to_string(dest.join(bundle::PATCH))?)?;
-        let refs = bundle::layout_refs(&dest.join(bundle::IMAGES))?;
-        anyhow::ensure!(!refs.is_empty(), "the image layout names no image");
+        let manifest = bundle::unpack(std::path::Path::new(&a[0]), &dest, &verifier)?;
+        let refs = bundle::check(&dest)?;
         // Into a scratch store, as the unit imports it.
         let store = edge_registry::Store::open(dest.join("store"))?;
         let tagged = store.import_layout(&dest.join(bundle::IMAGES))?;
