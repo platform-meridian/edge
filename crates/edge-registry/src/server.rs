@@ -78,10 +78,16 @@ fn lower_priority() {
     use nix::libc;
     const IOPRIO_WHO_PROCESS: libc::c_long = 1;
     const IOPRIO_CLASS_IDLE: libc::c_long = 3;
-    let param = libc::sched_param { sched_priority: 0 };
-    // SAFETY: both act on the calling thread (0) and take no pointers but `param`.
+    // Raw syscalls: musl stubs sched_setscheduler with ENOSYS. The kernel's sched_param is one int.
+    let priority: libc::c_int = 0;
+    // SAFETY: both act on the calling thread (0) and take no pointers but `priority`.
     unsafe {
-        libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+        libc::syscall(
+            libc::SYS_sched_setscheduler,
+            0,
+            libc::SCHED_IDLE,
+            &priority,
+        );
         libc::syscall(
             libc::SYS_ioprio_set,
             IOPRIO_WHO_PROCESS,
@@ -386,7 +392,7 @@ mod tests {
             // SAFETY: queries for the calling thread only.
             unsafe {
                 (
-                    libc::sched_getscheduler(0),
+                    libc::syscall(libc::SYS_sched_getscheduler, 0) as libc::c_int,
                     libc::syscall(libc::SYS_ioprio_get, 1, 0),
                 )
             }
