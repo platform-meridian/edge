@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use common::{Canned, Layout, MANIFEST, Registry, Stub, free_port, tempdir};
 use edge_registry::{Digest, Store};
@@ -197,4 +198,31 @@ fn writes_never_reach_upstream() {
         405
     );
     assert!(f.stub.requests().is_empty());
+}
+
+#[test]
+fn unmounted_volume_passes_through_until_mounted() {
+    let f = fixture();
+    let vol = f.root.with_file_name("vol");
+    let plain = f.root.with_file_name("plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::os::unix::fs::symlink(&plain, &vol).unwrap();
+    let held = "/v2/o/app/manifests/v2?ns=ghcr.io";
+
+    let mut r = Registry::on_volume(&f.root, f.stub.port, &vol);
+    assert_eq!(r.get(held).status, 404, "served a store before its volume");
+    assert_eq!(r.get("/v2/o/app/manifests/v1?ns=ghcr.io").body, BAKED);
+    assert!(!r.exits_within(Duration::from_secs(2)));
+
+    // A link to / stands in for the mount.
+    let next = f.root.with_file_name("vol.next");
+    std::os::unix::fs::symlink("/", &next).unwrap();
+    std::fs::rename(&next, &vol).unwrap();
+    assert!(
+        r.exits_within(Duration::from_secs(10)),
+        "never restarted to serve the mounted volume"
+    );
+
+    let r = Registry::on_volume(&f.root, f.stub.port, &vol);
+    assert_eq!(r.get(held).body, f.held.manifest.bytes);
 }

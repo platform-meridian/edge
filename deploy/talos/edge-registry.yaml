@@ -2,6 +2,8 @@
 # What its store lacks it passes through, read-only, to Talos's registryd and
 # the image cache baked into the media. It writes the store only to remove
 # content that fails its digest; the updater imports into it and sweeps it.
+# Until its volume is mounted it passes every pull through, then it exits for
+# restart: always to bring it back serving the volume.
 name: edge-registry
 depends:
   - path: /var/mnt/edge-registry
@@ -10,6 +12,7 @@ container:
   entrypoint: /edge-registry
   environment:
     - EDGE_REGISTRY_ROOT=/var/mnt/edge-registry
+    - EDGE_REGISTRY_VOLUME=/var/mnt/edge-registry
     - EDGE_REGISTRY_LISTEN=127.0.0.1:5000
     - EDGE_REGISTRY_UPSTREAM=127.0.0.1:3172
   mounts:

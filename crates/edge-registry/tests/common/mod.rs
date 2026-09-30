@@ -176,8 +176,20 @@ impl Registry {
     }
 
     pub fn with_upstream(root: &Path, upstream: u16) -> Registry {
+        Registry::launch(root, upstream, None)
+    }
+
+    pub fn on_volume(root: &Path, upstream: u16, volume: &Path) -> Registry {
+        Registry::launch(root, upstream, Some(volume))
+    }
+
+    fn launch(root: &Path, upstream: u16, volume: Option<&Path>) -> Registry {
         let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_edge-registry"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_edge-registry"));
+        if let Some(v) = volume {
+            cmd.args(["--volume".as_ref(), v.as_os_str()]);
+        }
+        let child = cmd
             .args(["--root".as_ref(), root.as_os_str()])
             .args(["--listen", &format!("127.0.0.1:{port}")])
             .args(["--upstream", &format!("127.0.0.1:{upstream}")])
@@ -235,6 +247,17 @@ impl Registry {
 
     pub fn get(&self, path: &str) -> Response {
         self.request("GET", path, &[])
+    }
+
+    pub fn exits_within(&mut self, patience: Duration) -> bool {
+        let until = Instant::now() + patience;
+        while Instant::now() < until {
+            if self.child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 }
 

@@ -27,23 +27,31 @@ type Body = UnsyncBoxBody<Bytes, io::Error>;
 
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
-pub async fn serve(store: Store, listen: SocketAddr, upstream: SocketAddr) -> anyhow::Result<()> {
+pub async fn serve(
+    store: Option<Store>,
+    listen: SocketAddr,
+    upstream: SocketAddr,
+    stop: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    tracing::info!(addr = %listener.local_addr()?, root = %store.root().display(), %upstream, "serving images");
-    let verifier = store.clone();
-    tokio::task::spawn_blocking(move || {
-        lower_priority();
-        match verifier.verify() {
-            Ok(0) => tracing::info!("every blob and manifest matches its digest"),
-            Ok(n) => tracing::warn!(
-                removed = n,
-                "removed content that no longer matches its digest"
-            ),
-            Err(e) => tracing::error!(error = %e, "could not finish verifying the store"),
-        }
-    });
+    let root = store.as_ref().map(|s| s.root().display().to_string());
+    tracing::info!(addr = %listener.local_addr()?, ?root, %upstream, "serving images");
+    if let Some(verifier) = store.clone() {
+        tokio::task::spawn_blocking(move || {
+            lower_priority();
+            match verifier.verify() {
+                Ok(0) => tracing::info!("every blob and manifest matches its digest"),
+                Ok(n) => tracing::warn!(
+                    removed = n,
+                    "removed content that no longer matches its digest"
+                ),
+                Err(e) => tracing::error!(error = %e, "could not finish verifying the store"),
+            }
+        });
+    }
     let state = Arc::new((store, Upstream(upstream)));
     let mut term = edge_common::Terminator::new();
+    tokio::pin!(stop);
     loop {
         let stream = tokio::select! {
             r = listener.accept() => match r {
@@ -56,12 +64,13 @@ pub async fn serve(store: Store, listen: SocketAddr, upstream: SocketAddr) -> an
                 }
             },
             _ = term.wait() => return Ok(()),
+            _ = &mut stop => return Ok(()),
         };
         let state = state.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, Infallible>(respond(&state.0, &state.1, &req).await) }
+                async move { Ok::<_, Infallible>(respond(state.0.as_ref(), &state.1, &req).await) }
             });
             if let Err(e) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), svc)
@@ -132,22 +141,29 @@ fn decode(segment: &str) -> Option<String> {
         .map(|s| s.into_owned())
 }
 
-async fn respond<B>(store: &Store, upstream: &Upstream, req: &Request<B>) -> Response<Body> {
+async fn respond<B>(
+    store: Option<&Store>,
+    upstream: &Upstream,
+    req: &Request<B>,
+) -> Response<Body> {
     let head = match *req.method() {
         Method::GET => false,
         Method::HEAD => true,
         _ => return error(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "read-only"),
     };
     let range = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
-    let held = match route(req.uri().path(), req.uri().query()) {
-        Some(Route::Base) => Some(json(StatusCode::OK, Bytes::from_static(b"{}"))),
-        Some(Route::Manifest {
-            name,
-            ns,
-            reference,
-        }) => manifest(store, &name, ns.as_deref(), &reference),
-        Some(Route::Blob(digest)) => blob(store, &digest, range).await,
-        None => None,
+    let held = match (route(req.uri().path(), req.uri().query()), store) {
+        (Some(Route::Base), _) => Some(json(StatusCode::OK, Bytes::from_static(b"{}"))),
+        (
+            Some(Route::Manifest {
+                name,
+                ns,
+                reference,
+            }),
+            Some(store),
+        ) => manifest(store, &name, ns.as_deref(), &reference),
+        (Some(Route::Blob(digest)), Some(store)) => blob(store, &digest, range).await,
+        _ => None,
     };
     let mut resp = match held {
         Some(r) => r,
