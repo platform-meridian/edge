@@ -284,6 +284,13 @@ impl Talos for FakeTalos {
         w.staged = Some(config.into());
         w.change("stage".into())
     }
+    async fn apply_config(&self, config: &str) -> anyhow::Result<()> {
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        w.active = config.into();
+        w.staged = None;
+        w.change("apply".into())
+    }
     async fn install(&self, image: &str) -> anyhow::Result<()> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;

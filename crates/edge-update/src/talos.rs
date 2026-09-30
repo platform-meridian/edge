@@ -143,6 +143,25 @@ impl Node {
         }
         bail!("the node has no machine config")
     }
+
+    async fn apply(&self, config: &str, mode: Mode, dry_run: bool) -> anyhow::Result<()> {
+        let r = self
+            .machine()?
+            .apply_configuration(req(pb::ApplyConfigurationRequest {
+                data: config.as_bytes().to_vec(),
+                mode: mode as i32,
+                dry_run,
+            }))
+            .await?
+            .into_inner();
+        for m in &r.messages {
+            upstream(m.metadata.as_ref())?;
+            for w in &m.warnings {
+                tracing::warn!(warning = %w, "machine config");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -227,22 +246,11 @@ impl crate::unit::Talos for Node {
     }
 
     async fn stage_config(&self, config: &str, dry_run: bool) -> anyhow::Result<()> {
-        let r = self
-            .machine()?
-            .apply_configuration(req(pb::ApplyConfigurationRequest {
-                data: config.as_bytes().to_vec(),
-                mode: Mode::Staged as i32,
-                dry_run,
-            }))
-            .await?
-            .into_inner();
-        for m in &r.messages {
-            upstream(m.metadata.as_ref())?;
-            for w in &m.warnings {
-                tracing::warn!(warning = %w, "machine config");
-            }
-        }
-        Ok(())
+        self.apply(config, Mode::Staged, dry_run).await
+    }
+
+    async fn apply_config(&self, config: &str) -> anyhow::Result<()> {
+        self.apply(config, Mode::NoReboot, false).await
     }
 
     async fn install(&self, image: &str) -> anyhow::Result<()> {
@@ -321,7 +329,7 @@ mod tests {
 
     type Stream<T> = std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
 
-    /// Answers as apid does, and says which power calls it took.
+    /// Answers as apid does, and says which config and power calls it took.
     #[derive(Clone, Default)]
     struct Apid(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -331,9 +339,14 @@ mod tests {
         type ReadStream = Stream<pb::Data>;
         async fn apply_configuration(
             &self,
-            _: Request<pb::ApplyConfigurationRequest>,
+            r: Request<pb::ApplyConfigurationRequest>,
         ) -> Result<Response<pb::ApplyConfigurationResponse>, Status> {
-            Err(Status::unimplemented(""))
+            let r = r.into_inner();
+            let call = format!("{:?} dry_run={}", r.mode(), r.dry_run);
+            self.0.lock().unwrap().push(call);
+            Ok(Response::new(pb::ApplyConfigurationResponse {
+                messages: vec![],
+            }))
         }
         async fn list(
             &self,
@@ -531,6 +544,30 @@ mod tests {
         assert_eq!(
             *apid.0.lock().unwrap(),
             ["reboot Powercycle", "shutdown force=false"]
+        );
+    }
+
+    #[tokio::test]
+    async fn configs_stage_or_apply_without_reboot() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = Pki::new();
+        let apid = Apid::default();
+        let addr = serve(&pki, &pki, apid.clone()).await;
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::new(
+            &talosconfig(d.path(), &pki.ca, pki.leaf(&[])),
+            &addr.to_string(),
+        );
+        node.stage_config("c", true).await.unwrap();
+        node.stage_config("c", false).await.unwrap();
+        node.apply_config("c").await.unwrap();
+        assert_eq!(
+            *apid.0.lock().unwrap(),
+            [
+                "Staged dry_run=true",
+                "Staged dry_run=false",
+                "NoReboot dry_run=false"
+            ]
         );
     }
 }

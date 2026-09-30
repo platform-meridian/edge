@@ -23,6 +23,8 @@ pub trait Talos: Send + Sync {
     async fn running_config(&self) -> anyhow::Result<String>;
     /// Stages a config for the next boot, or only validates it.
     async fn stage_config(&self, config: &str, dry_run: bool) -> anyhow::Result<()>;
+    /// Applies a config now and for every boot after, without a reboot.
+    async fn apply_config(&self, config: &str) -> anyhow::Result<()>;
     /// Pulls the installer and writes the new OS beside the running one.
     async fn install(&self, image: &str) -> anyhow::Result<()>;
     /// A power cycle: a kexec would boot the default and lose the trial.
