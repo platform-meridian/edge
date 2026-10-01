@@ -1,11 +1,12 @@
 //! Flight recorder into a power-cut-safe ring on flash. `edge-scope dump` prints
-//! the ring, then each log ring, oldest first, one JSON object per line.
+//! the ring, the services ring, then each log ring, oldest first, one JSON
+//! object per line.
 
 mod cri;
 mod ntp;
 mod shutdown;
 
-use edge_scope::{cause, clock, logs, nvme, record, ring, sample};
+use edge_scope::{cause, clock, logs, nvme, record, ring, sample, services};
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -395,9 +396,15 @@ fn main() -> anyhow::Result<()> {
         .into();
 
     let logs_dir = path.with_file_name("logs");
+    let services_ring = path.with_file_name(services::FILE);
 
     if std::env::args().nth(1).as_deref() == Some("dump") {
-        return dump(&path, &logs_dir, &mut std::io::stdout().lock());
+        return dump(
+            &path,
+            &services_ring,
+            &logs_dir,
+            &mut std::io::stdout().lock(),
+        );
     }
     // Before the ring is read and the sandbox grants its directory.
     edge_common::mount::await_evidence_volume();
@@ -495,8 +502,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     let (tx, going_down) = std::sync::mpsc::channel();
-    if let Err(e) = shutdown::spawn(machined, tx) {
-        tracing::error!(error = %e, "cannot watch for shutdown; the ring stays open to the end");
+    let transitions = services::Store::new(services_ring, boot.clone());
+    if let Err(e) = shutdown::spawn(machined, transitions, tx) {
+        tracing::error!(error = %e, "cannot watch machined; the ring stays open to the end");
     }
 
     let start = Instant::now();
@@ -562,8 +570,16 @@ fn watch_pending(state_dir: &Path) -> bool {
     watch_state(state_dir).is_some_and(|st| st.reset_pending)
 }
 
-fn dump(path: &Path, logs_dir: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+fn dump(path: &Path, services: &Path, logs_dir: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let mut all = ring::Ring::open_read_only(path)?.read_all()?;
+    match ring::Ring::open_read_only_with(services, services::RECORD_SIZE)
+        .and_then(|mut r| r.read_all())
+    {
+        Ok(entries) => all.extend(entries),
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "{}: {e:#}", services.display());
+        }
+    }
     all.extend(logs::read_all(logs_dir));
     match write_records(out, &all) {
         Ok(()) => {}
@@ -726,15 +742,23 @@ mod tests {
         let d = scratch("dump");
         let p = d.join("ring.bin");
         let logs_dir = d.join("logs");
-        assert!(dump(&p, &logs_dir, &mut Vec::new()).is_err(), "no ring");
+        let svc = d.join(services::FILE);
+        assert!(
+            dump(&p, &svc, &logs_dir, &mut Vec::new()).is_err(),
+            "no ring"
+        );
         {
             let mut r = ring::Ring::open(&p, 4).unwrap();
             r.append(b"{\"t\":1}").unwrap();
             r.append(b"{\"t\":2}").unwrap();
         }
         let mut out = Vec::new();
-        dump(&p, &logs_dir, &mut out).unwrap();
+        dump(&p, &svc, &logs_dir, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "{\"t\":1}\n{\"t\":2}\n");
+        ring::Ring::open_with(&svc, 4, services::RECORD_SIZE)
+            .unwrap()
+            .append(b"{\"k\":\"svc\"}")
+            .unwrap();
         for (source, line) in [
             ("kubelet", "{\"k\":\"log\",\"src\":\"kubelet\"}"),
             ("kernel", "{\"k\":\"log\",\"src\":\"kernel\"}"),
@@ -749,13 +773,19 @@ mod tests {
             .unwrap();
         }
         let mut out = Vec::new();
-        dump(&p, &logs_dir, &mut out).unwrap();
+        dump(&p, &svc, &logs_dir, &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"t\":1}\n{\"t\":2}\n{\"k\":\"log\",\"src\":\"kernel\"}\n{\"k\":\"log\",\"src\":\"kubelet\"}\n"
+            "{\"t\":1}\n{\"t\":2}\n{\"k\":\"svc\"}\n{\"k\":\"log\",\"src\":\"kernel\"}\n{\"k\":\"log\",\"src\":\"kubelet\"}\n"
         );
-        dump(&p, &logs_dir, &mut Refuses(std::io::ErrorKind::BrokenPipe)).unwrap();
-        assert!(dump(&p, &logs_dir, &mut Refuses(std::io::ErrorKind::Other)).is_err());
+        dump(
+            &p,
+            &svc,
+            &logs_dir,
+            &mut Refuses(std::io::ErrorKind::BrokenPipe),
+        )
+        .unwrap();
+        assert!(dump(&p, &svc, &logs_dir, &mut Refuses(std::io::ErrorKind::Other)).is_err());
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -55,7 +55,7 @@ fn text<'a>(event: &'a Map<String, Value>, key: &str, max: usize) -> &'a str {
     &s[..floor_char_boundary(s, max)]
 }
 
-fn floor_char_boundary(s: &str, at: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, at: usize) -> usize {
     if at >= s.len() {
         return s.len();
     }
@@ -128,7 +128,19 @@ pub fn repeated(payload: &[u8], n: u64, limit: usize) -> Option<Vec<u8>> {
 }
 
 fn fit(record: Record, msg: &str, limit: usize) -> Option<Vec<u8>> {
-    let encode = |msg: &str| serde_json::to_vec(&Record { msg, ..record }).ok();
+    fit_msg(
+        |msg| serde_json::to_vec(&Record { msg, ..record }).ok(),
+        msg,
+        limit,
+    )
+}
+
+/// `encode(msg)`, the message cut short with `…` when the whole is over `limit`.
+pub(crate) fn fit_msg(
+    encode: impl Fn(&str) -> Option<Vec<u8>>,
+    msg: &str,
+    limit: usize,
+) -> Option<Vec<u8>> {
     let mut payload = encode(msg)?;
     if payload.len() > limit {
         let budget = limit.checked_sub(encode(CUT)?.len())?;

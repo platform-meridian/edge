@@ -8,3 +8,4 @@ pub mod nvme;
 pub mod record;
 pub mod ring;
 pub mod sample;
+pub mod services;

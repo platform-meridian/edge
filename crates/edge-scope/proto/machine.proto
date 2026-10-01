@@ -9,7 +9,10 @@ service MachineService {
     rpc Events(EventsRequest) returns (stream Event);
 }
 
-message EventsRequest {}
+message EventsRequest {
+    // Negative: every event machined still holds, then new ones.
+    int32 tail_events = 1;
+}
 
 message Any {
     string type_url = 1;
@@ -18,6 +21,7 @@ message Any {
 
 message Event {
     Any data = 2;
+    string id = 3;
 }
 
 message SequenceEvent {
@@ -28,4 +32,27 @@ message SequenceEvent {
         STOP = 2;
     }
     Action action = 2;
+}
+
+message ServiceStateEvent {
+    string service = 1;
+    enum Action {
+        INITIALIZED = 0;
+        PREPARING = 1;
+        WAITING = 2;
+        RUNNING = 3;
+        STOPPING = 4;
+        FINISHED = 5;
+        FAILED = 6;
+        SKIPPED = 7;
+        STARTING = 8;
+    }
+    Action action = 2;
+    string message = 3;
+    ServiceHealth health = 4;
+}
+
+message ServiceHealth {
+    bool unknown = 1;
+    bool healthy = 2;
 }
