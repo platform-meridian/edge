@@ -73,6 +73,10 @@ pub(crate) struct World {
 
     held: BTreeSet<String>,
     last_installed: String,
+    /// The unit already runs the bundle's OS.
+    os_current: bool,
+    /// Talos refuses a config without a reboot.
+    apply_refused: bool,
     no_store: bool,
     install_fails: bool,
 
@@ -125,6 +129,8 @@ impl World {
             running: BTreeSet::new(),
             held: BTreeSet::new(),
             last_installed: String::new(),
+            os_current: false,
+            apply_refused: false,
             no_store: false,
             install_fails: false,
             log: Vec::new(),
@@ -162,8 +168,9 @@ impl World {
 
     fn committed_new(&self) -> bool {
         !self.on_trial()
-            && !self.last_installed.is_empty()
-            && self.default.eq_ignore_ascii_case(&self.last_installed)
+            && (self.os_current && self.last_installed.is_empty()
+                || !self.last_installed.is_empty()
+                    && self.default.eq_ignore_ascii_case(&self.last_installed))
     }
 
     /// sd-boot: the one-shot once, else the default; a staged config applies.
@@ -297,6 +304,7 @@ impl Talos for FakeTalos {
     async fn apply_config(&self, config: &str) -> anyhow::Result<()> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
+        anyhow::ensure!(!w.apply_refused, "the change needs a reboot");
         w.active = config.into();
         w.staged = None;
         w.change("apply".into())
@@ -663,6 +671,108 @@ impl Harness {
         assert_eq!(w.judge["good"], tag);
         assert!(w.held.contains(&format!("reg/app:{tag}")));
     }
+}
+
+/// The unit's config names `installer`, as a provisioned one does.
+fn running_installer(h: &Harness, installer: &str) {
+    let mut w = h.w();
+    w.active = format!(
+        "{UNIT_CONFIG}---\napiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n  image: {installer}\n"
+    );
+    w.os_current = true;
+}
+
+#[tokio::test]
+async fn the_os_the_unit_runs_is_not_installed_again() {
+    let mut h = Harness::new();
+    running_installer(&h, &format!("reg/installer:provisioned@{DIGEST}"));
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    let w = h.w();
+    assert_eq!(
+        w.log,
+        ["import", "stage", "apply", "seed", "repoint update-new"]
+    );
+    assert_eq!(w.boot_id, 1, "rebooted");
+}
+
+#[tokio::test]
+async fn a_config_that_needs_a_reboot_installs_the_os_as_usual() {
+    let mut h = Harness::new();
+    running_installer(&h, &format!("reg/installer@{DIGEST}"));
+    {
+        let mut w = h.w();
+        w.os_current = false;
+        w.apply_refused = true;
+    }
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert_eq!(
+        h.w().log,
+        [
+            "import",
+            "stage",
+            "install",
+            "reboot",
+            "seed",
+            "repoint update-new"
+        ]
+    );
+}
+
+#[test]
+fn the_running_installer_is_the_unattended_installs_else_machine_installs() {
+    let unattended = "version: v1alpha1\nmachine:\n  install:\n    image: old@sha256:1\n---\n\
+                      apiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n  image: new@sha256:2\n";
+    assert_eq!(installer_of(unattended), "new@sha256:2");
+    assert_eq!(
+        installer_of("version: v1alpha1\nmachine:\n  install:\n    image: old@sha256:1\n"),
+        "old@sha256:1"
+    );
+    assert_eq!(installer_of(UNIT_CONFIG), "");
+}
+
+#[tokio::test]
+async fn another_installer_is_installed() {
+    let mut h = Harness::new();
+    running_installer(
+        &h,
+        "reg/installer@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    );
+    h.w().os_current = false;
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert!(h.w().log.contains(&"install".to_string()));
+}
+
+#[tokio::test]
+async fn the_same_installer_on_an_older_talos_is_installed() {
+    let mut h = Harness::new();
+    running_installer(&h, &format!("reg/installer@{DIGEST}"));
+    {
+        let mut w = h.w();
+        w.os_current = false;
+        w.version = "v1.14.0".into();
+        w.entries
+            .insert("talos-v1.14.1.efi".into(), "v1.14.0".into());
+    }
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert!(h.w().log.contains(&"install".to_string()));
+}
+
+#[tokio::test]
+async fn a_tag_alone_never_matches_the_bundles_installer() {
+    let mut h = Harness::new();
+    running_installer(&h, "reg/installer:update-new");
+    h.w().os_current = false;
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert!(h.w().log.contains(&"install".to_string()));
 }
 
 async fn happy() -> (Harness, usize, usize) {

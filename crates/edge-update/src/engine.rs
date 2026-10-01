@@ -82,6 +82,9 @@ pub struct Before {
     /// An operator powered the unit down on the OS trial.
     #[serde(default)]
     pub backed_out: bool,
+    /// The installer the unit's config names.
+    #[serde(default)]
+    pub installer: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,6 +701,7 @@ impl Engine {
             started: (self.now)(),
             snapshot: None,
             backed_out: false,
+            installer: installer_of(&running),
         });
         Ok(Go(Phase::Importing))
     }
@@ -803,8 +807,25 @@ impl Engine {
         {
             return Ok(Go(Phase::Trial));
         }
+        let rel = self.release()?.clone();
+        let installer = installer_pin(rel.get("INSTALLER_REF"));
+        if installer == installer_pin(&self.before()?.installer)
+            && self.talos.version().await? == rel.get("TALOS_VERSION")
+        {
+            // The unit runs this OS already: the config alone, and no reboot.
+            match self.talos.apply_config(&self.merged(&rel).await?).await {
+                Ok(()) => {
+                    if let Some(r) = self.record.release.as_mut() {
+                        r.os_done = true;
+                    }
+                    return Ok(Go(Phase::Seeding));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "the config needs a reboot: installing the OS as usual");
+                }
+            }
+        }
         self.detail = "installing the new OS beside the running one".into();
-        let installer = installer_pin(self.release()?.get("INSTALLER_REF"));
         if let Err(e) = self.talos.install(&installer).await {
             if (self.now)() - self.record.since <= INSTALL {
                 return Err(e);
@@ -1037,6 +1058,28 @@ impl Engine {
         self.registry.retain(&self.keep(keep).await?)?;
         Ok(Done)
     }
+}
+
+/// The installer a machine config names: its unattended install's, else `machine.install`'s.
+fn installer_of(config: &str) -> String {
+    use serde::Deserialize;
+    let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(config)
+        .filter_map(|d| serde_yaml::Value::deserialize(d).ok())
+        .collect();
+    let image = |d: &serde_yaml::Value, path: &[&str]| {
+        path.iter()
+            .try_fold(d, |v, k| v.get(k))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    docs.iter()
+        .filter(|d| d.get("kind").and_then(|k| k.as_str()) == Some("UnattendedInstallConfig"))
+        .find_map(|d| image(d, &["installer", "image"]))
+        .or_else(|| {
+            docs.iter()
+                .find_map(|d| image(d, &["machine", "install", "image"]))
+        })
+        .unwrap_or_default()
 }
 
 /// `repo:tag@sha256:…` to `repo@sha256:…`: containerd keeps a tag@digest pull as repo@digest.
