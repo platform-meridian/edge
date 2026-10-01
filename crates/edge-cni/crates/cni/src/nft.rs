@@ -1,6 +1,10 @@
 //! Netfilter rather than a BPF NAT: conntrack handles IP fragments, ICMP errors and
-//! tuples a host socket already owns. Only off-node traffic reaches here, without
-//! session affinity: local sockets are translated at connect().
+//! tuples a host socket already owns. Only off-node traffic reaches here: local
+//! sockets are translated at connect().
+//!
+//! ClientIP affinity hashes the source address over the backends instead of
+//! remembering a choice, so it has no timeout, and a client may move when the
+//! backend set changes.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -70,6 +74,13 @@ const NFTA_NG_DREG: u16 = 1;
 const NFTA_NG_MODULUS: u16 = 2;
 const NFTA_NG_TYPE: u16 = 3;
 const NFTA_NG_OFFSET: u16 = 4;
+const NFTA_HASH_SREG: u16 = 1;
+const NFTA_HASH_DREG: u16 = 2;
+const NFTA_HASH_LEN: u16 = 3;
+const NFTA_HASH_MODULUS: u16 = 4;
+const NFTA_HASH_SEED: u16 = 5;
+const NFTA_HASH_OFFSET: u16 = 6;
+const NFTA_HASH_TYPE: u16 = 7;
 const NFTA_IMMEDIATE_DREG: u16 = 1;
 const NFTA_IMMEDIATE_DATA: u16 = 2;
 const NFTA_NAT_TYPE: u16 = 1;
@@ -93,6 +104,9 @@ const NFT_FIB_RESULT_ADDRTYPE: u32 = 3;
 const NFTA_FIB_F_DADDR: u32 = 2;
 const RTN_LOCAL: u32 = 2;
 const NFT_NG_RANDOM: u32 = 1;
+const NFT_HASH_JENKINS: u32 = 0;
+// Without a seed each rule draws its own, and the dump leaves it out.
+const HASH_SEED: u32 = 0;
 const NFT_NAT_DNAT: u32 = 1;
 // The kernel sets these itself when the address and port registers are given.
 const NF_NAT_RANGE_IMPLIED: u32 = 0x1 | 0x2;
@@ -111,6 +125,8 @@ pub enum Expr {
     Meta { key: u32 },
     Fib { result: u32, flags: u32 },
     Numgen { modulus: u32 },
+    // jhash of the 4 bytes in register 1, scaled to 0..modulus.
+    Hash { modulus: u32 },
     Immediate { reg: u32, data: Vec<u8> },
     Dnat,
     Other(String),
@@ -122,6 +138,7 @@ pub struct Forward {
     pub addr: Option<Ipv4Addr>,
     pub port: u16,
     pub backends: Vec<SocketAddrV4>,
+    pub affinity: bool,
 }
 
 fn mask(prefix: u8) -> [u8; 4] {
@@ -167,7 +184,7 @@ fn cmp_eq(data: &[u8]) -> Expr {
 }
 
 // One rule per backend: rule i of n takes 1/(n-i) of what reaches it, so each
-// backend gets 1/n.
+// backend gets 1/n. With affinity, rule i takes the sources that hash to i.
 pub fn dnat_rules(f: &Forward) -> Vec<Vec<Expr>> {
     let destination = match f.addr {
         Some(addr) => vec![
@@ -205,7 +222,17 @@ pub fn dnat_rules(f: &Forward) -> Vec<Vec<Expr>> {
                 cmp_eq(&f.port.to_be_bytes()),
             ]);
             let remaining = (n - i) as u32;
-            if remaining > 1 {
+            if remaining > 1 && f.affinity {
+                rule.extend([
+                    Expr::Payload {
+                        base: NFT_PAYLOAD_NETWORK_HEADER,
+                        offset: IPV4_SADDR_OFFSET,
+                        len: 4,
+                    },
+                    Expr::Hash { modulus: n as u32 },
+                    cmp_eq(&(i as u32).to_ne_bytes()),
+                ]);
+            } else if remaining > 1 {
                 rule.push(Expr::Numgen { modulus: remaining });
                 rule.push(cmp_eq(&0u32.to_ne_bytes()));
             }
@@ -346,6 +373,17 @@ fn encode_expr(buf: &mut Vec<u8>, e: &Expr) {
                 attr_u32_be(b, NFTA_NG_DREG, NFT_REG_1);
                 attr_u32_be(b, NFTA_NG_MODULUS, *modulus);
                 attr_u32_be(b, NFTA_NG_TYPE, NFT_NG_RANDOM);
+            });
+        }
+        Expr::Hash { modulus } => {
+            attr_str(b, NFTA_EXPR_NAME, "hash");
+            nested(b, NFTA_EXPR_DATA, |b| {
+                attr_u32_be(b, NFTA_HASH_SREG, NFT_REG_1);
+                attr_u32_be(b, NFTA_HASH_DREG, NFT_REG_1);
+                attr_u32_be(b, NFTA_HASH_LEN, 4);
+                attr_u32_be(b, NFTA_HASH_MODULUS, *modulus);
+                attr_u32_be(b, NFTA_HASH_SEED, HASH_SEED);
+                attr_u32_be(b, NFTA_HASH_TYPE, NFT_HASH_JENKINS);
             });
         }
         Expr::Immediate { reg, data } => {
@@ -631,6 +669,10 @@ pub fn decode_exprs(list: &[u8]) -> Vec<Expr> {
                 }
                 _ => Expr::Other(name),
             },
+            "hash" if is_plain_jhash(&d) => match find(&d, NFTA_HASH_MODULUS).and_then(be32) {
+                Some(modulus) => Expr::Hash { modulus },
+                None => Expr::Other(name),
+            },
             "immediate" => match (
                 find(&d, NFTA_IMMEDIATE_DREG).and_then(be32),
                 find(&d, NFTA_IMMEDIATE_DATA).and_then(data),
@@ -644,6 +686,16 @@ pub fn decode_exprs(list: &[u8]) -> Vec<Expr> {
         out.push(e);
     }
     out
+}
+
+fn is_plain_jhash(d: &[(u16, &[u8])]) -> bool {
+    let reg = |ty| find(d, ty).and_then(be32);
+    reg(NFTA_HASH_TYPE) == Some(NFT_HASH_JENKINS)
+        && reg(NFTA_HASH_SREG) == Some(NFT_REG_1)
+        && reg(NFTA_HASH_DREG) == Some(NFT_REG_1)
+        && reg(NFTA_HASH_LEN) == Some(4)
+        && reg(NFTA_HASH_SEED) == Some(HASH_SEED)
+        && reg(NFTA_HASH_OFFSET).unwrap_or(0) == 0
 }
 
 fn is_plain_dnat(d: &[(u16, &[u8])]) -> bool {
@@ -968,6 +1020,7 @@ mod tests {
             backends: (1..=backends)
                 .map(|i| SocketAddrV4::new(Ipv4Addr::new(10, 244, 0, i), 8080))
                 .collect(),
+            affinity: false,
         }
     }
 
@@ -1051,9 +1104,151 @@ mod tests {
         assert!(matches!(rules[1][0], Expr::Fib { .. }), "{rules:?}");
     }
 
+    fn sticky(backends: u8) -> Forward {
+        Forward {
+            affinity: true,
+            ..forward(None, backends)
+        }
+    }
+
+    #[test]
+    fn affinity_hashes_the_source() {
+        let rules = dnat_rules(&sticky(3));
+        assert_eq!(rules.len(), 3);
+        for (i, rule) in rules.iter().enumerate().take(2) {
+            assert_eq!(
+                rule[6..9],
+                [
+                    Expr::Payload {
+                        base: NFT_PAYLOAD_NETWORK_HEADER,
+                        offset: IPV4_SADDR_OFFSET,
+                        len: 4
+                    },
+                    Expr::Hash { modulus: 3 },
+                    cmp_eq(&(i as u32).to_ne_bytes()),
+                ],
+                "rule {i}"
+            );
+            assert_eq!(rule.len(), 12);
+        }
+        assert_eq!(rules[2].len(), 9, "the last rule takes the rest");
+        let random = dnat_rules(&forward(None, 3));
+        for (r, plain) in rules.iter().zip(&random) {
+            assert_eq!(r[..6], plain[..6], "same match");
+            assert_eq!(r[r.len() - 3..], plain[plain.len() - 3..], "same backend");
+        }
+        assert!(
+            rules
+                .iter()
+                .flatten()
+                .all(|e| !matches!(e, Expr::Numgen { .. })),
+            "{rules:?}"
+        );
+        assert_eq!(dnat_rules(&sticky(1)), dnat_rules(&forward(None, 1)));
+    }
+
+    // NFTA_HASH_* from linux/netfilter/nf_tables.h, as libnftnl lays them out.
+    #[test]
+    fn hash_wire_layout() {
+        let mut got = Vec::new();
+        encode_expr(&mut got, &Expr::Hash { modulus: 3 });
+        let u32_attr = |ty: u16, v: u32| {
+            let mut a = 8u16.to_ne_bytes().to_vec();
+            a.extend(ty.to_ne_bytes());
+            a.extend(v.to_be_bytes());
+            a
+        };
+        let data: Vec<u8> = [(1, 1), (2, 1), (3, 4), (4, 3), (5, 0), (7, 0)]
+            .into_iter()
+            .flat_map(|(ty, v)| u32_attr(ty, v))
+            .collect();
+        let mut want = 9u16.to_ne_bytes().to_vec();
+        want.extend(1u16.to_ne_bytes());
+        want.extend(b"hash\0\0\0\0");
+        want.extend((4 + data.len() as u16).to_ne_bytes());
+        want.extend((2u16 | 0x8000).to_ne_bytes());
+        want.extend(data);
+        let mut elem = (4 + want.len() as u16).to_ne_bytes().to_vec();
+        elem.extend((1u16 | 0x8000).to_ne_bytes());
+        elem.extend(want);
+        assert_eq!(got, elem);
+        assert_eq!(decode_exprs(&got), [Expr::Hash { modulus: 3 }]);
+    }
+
+    #[test]
+    fn unlike_hash_is_foreign() {
+        let hash = |attrs: &[(u16, u32)]| {
+            let mut list = Vec::new();
+            nested(&mut list, NFTA_LIST_ELEM, |b| {
+                attr_str(b, NFTA_EXPR_NAME, "hash");
+                nested(b, NFTA_EXPR_DATA, |b| {
+                    attrs.iter().for_each(|(ty, v)| attr_u32_be(b, *ty, *v))
+                });
+            });
+            decode_exprs(&list)
+        };
+        let ours = [
+            (NFTA_HASH_SREG, NFT_REG_1),
+            (NFTA_HASH_DREG, NFT_REG_1),
+            (NFTA_HASH_LEN, 4),
+            (NFTA_HASH_MODULUS, 2),
+            (NFTA_HASH_SEED, HASH_SEED),
+            (NFTA_HASH_TYPE, NFT_HASH_JENKINS),
+        ];
+        assert_eq!(hash(&ours), [Expr::Hash { modulus: 2 }]);
+        assert_eq!(
+            hash(&[ours.as_slice(), &[(NFTA_HASH_OFFSET, 0)]].concat()),
+            [Expr::Hash { modulus: 2 }]
+        );
+        let foreign = |at: usize, v: u32| {
+            let mut a = ours;
+            a[at].1 = v;
+            hash(&a)
+        };
+        let other = [Expr::Other("hash".into())];
+        assert_eq!(foreign(0, NFT_REG_2), other, "sreg");
+        assert_eq!(foreign(1, NFT_REG_2), other, "dreg");
+        assert_eq!(foreign(2, 16), other, "len");
+        assert_eq!(foreign(4, 1), other, "seed");
+        assert_eq!(foreign(5, 1), other, "symhash");
+        assert_eq!(hash(&ours[..4]), other, "random seed");
+        assert_eq!(
+            hash(&[&ours[..3], &ours[4..]].concat()),
+            other,
+            "no modulus"
+        );
+        assert_eq!(hash(&ours[..5]), other, "no type");
+        assert_eq!(
+            hash(&[ours.as_slice(), &[(NFTA_HASH_OFFSET, 1)]].concat()),
+            other,
+            "offset"
+        );
+    }
+
+    #[test]
+    fn affinity_change_is_drift() {
+        let installed = fold_dump(
+            &[chain_msg(CHAIN, 4, 100, "nat"), dnat_chain()],
+            &std::iter::once(rule_msg(CHAIN, &masquerade_rule(net(), 24)))
+                .chain(
+                    dnat_rules(&sticky(2))
+                        .iter()
+                        .map(|r| rule_msg(DNAT_CHAIN, r)),
+                )
+                .collect::<Vec<_>>(),
+        );
+        assert!(matches(&installed, net(), 24, &[sticky(2)]));
+        assert!(!matches(&installed, net(), 24, &[forward(None, 2)]));
+        assert!(!matches(&installed, net(), 24, &[sticky(3)]));
+    }
+
     #[test]
     fn dnat_rules_round_trip() {
-        for rule in all_dnat_rules(&[forward(None, 2), forward(Some([10, 70, 0, 1]), 1)]) {
+        for rule in all_dnat_rules(&[
+            forward(None, 2),
+            forward(Some([10, 70, 0, 1]), 1),
+            sticky(3),
+        ]) {
             let mut list = Vec::new();
             rule.iter().for_each(|e| encode_expr(&mut list, e));
             assert_eq!(decode_exprs(&list), rule);

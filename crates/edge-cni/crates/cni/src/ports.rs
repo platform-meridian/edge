@@ -52,6 +52,7 @@ pub fn forwards(entries: &BTreeMap<ServiceKey, BackendVal>) -> Vec<Forward> {
                 addr,
                 port: u16::from_be(k.port),
                 backends: vec![socket_addr(b)],
+                affinity: false,
             })
         })
         .collect()
@@ -208,12 +209,14 @@ mod tests {
                     addr: None,
                     port: 80,
                     backends: vec![SocketAddrV4::new(ip("10.244.0.3"), 8080)],
+                    affinity: false,
                 },
                 Forward {
                     proto: IPPROTO_UDP,
                     addr: Some(ip("10.70.0.1")),
                     port: 54323,
                     backends: vec![SocketAddrV4::new(ip("10.244.0.2"), 8080)],
+                    affinity: false,
                 },
             ]
         );

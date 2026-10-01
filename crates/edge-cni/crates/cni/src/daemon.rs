@@ -651,6 +651,7 @@ mod tests {
             addr: None,
             port,
             backends: vec!["10.244.0.5:8080".parse().unwrap()],
+            affinity: false,
         }
     }
 

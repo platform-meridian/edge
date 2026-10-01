@@ -60,7 +60,24 @@ fn forward(proto: u8, addr: Option<Ipv4Addr>, port: u16, backends: &[(Ipv4Addr, 
             .iter()
             .map(|(ip, port)| SocketAddrV4::new(*ip, *port))
             .collect(),
+        affinity: false,
     }
+}
+
+// Each probe is a new flow from a fresh source port.
+fn udp_backend(ns: &File, from: Ipv4Addr, to: SocketAddr) -> Option<String> {
+    on_ns(ns, || {
+        let s = UdpSocket::bind((from, 0)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(700)))
+            .unwrap();
+        s.send_to(b"x", to).unwrap();
+        let mut b = [0u8; 64];
+        let n = s.recv(&mut b).ok()?;
+        let reply = String::from_utf8_lossy(&b[..n]).into_owned();
+        let (pod, seen) = reply.split_once(' ')?;
+        assert_eq!(seen, from.to_string(), "the pod sees the client");
+        Some(pod.to_string())
+    })
 }
 
 fn reached(ext: &File, to: SocketAddr, tries: usize) -> BTreeSet<Option<String>> {
@@ -175,6 +192,40 @@ fn kernel_child() {
     assert_eq!(nft::installed().unwrap().rules.len(), 1);
     assert_eq!(ensure(Some(&forwards)), Outcome::Installed);
     assert!(seen_as(Some(&ext), node_port).is_some(), "repaired");
+
+    let clients: Vec<Ipv4Addr> = (10..30).map(|i| Ipv4Addr::new(192, 0, 2, i)).collect();
+    on_ns(&ext, || {
+        rt().block_on(async {
+            let net = Net::open().unwrap();
+            for c in &clients {
+                net.add_addr("upx", *c, 24).await.unwrap();
+            }
+        })
+    });
+    let sticky = Forward {
+        affinity: true,
+        ..forward(UDP, None, 30054, &[(a.ip, 5353), (b.ip, 5353)])
+    };
+    let forwards = [forwards[0].clone(), sticky];
+    assert_eq!(ensure(Some(&forwards)), Outcome::Installed);
+    assert_eq!(
+        ensure(Some(&forwards)),
+        Outcome::Present,
+        "the kernel's dump of a hashed rule decodes to what was installed"
+    );
+    let sticky_port = SocketAddr::from((NODE, 30054));
+    let mut landed = BTreeSet::new();
+    for c in &clients {
+        let seen: BTreeSet<Option<String>> =
+            (0..5).map(|_| udp_backend(&ext, *c, sticky_port)).collect();
+        assert_eq!(seen.len(), 1, "{c} stays on one backend: {seen:?}");
+        landed.extend(seen);
+    }
+    assert_eq!(
+        landed,
+        BTreeSet::from([Some(a.ip.to_string()), Some(b.ip.to_string())]),
+        "clients spread over the backends"
+    );
 }
 
 #[test]

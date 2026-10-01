@@ -173,6 +173,7 @@ impl<M: ServiceMaps> Programmer<M> {
                     .into_iter()
                     .flat_map(|slots| slots.range(..v.backend_count).map(|(_, b)| socket_addr(b)))
                     .collect(),
+                affinity: v.affinity_secs > 0,
             })
             .collect();
         out.sort_by_key(|f| (f.proto, f.port));
@@ -669,6 +670,13 @@ mod tests {
                     30053,
                 ),
                 svc_named("ns", "c", "10.96.0.3", &[(None, 80, "TCP")]),
+                with_affinity(
+                    with_node_port(
+                        svc_named("ns", "d", "10.96.0.4", &[(None, 80, "TCP")]),
+                        30090,
+                    ),
+                    None,
+                ),
             ],
             vec![
                 slice_for(
@@ -678,18 +686,29 @@ mod tests {
                     &[("10.244.0.4", Some(true)), ("10.244.0.3", Some(true))],
                 ),
                 slice_for("c", None, 8080, &[("10.244.0.5", Some(true))]),
+                slice_for("d", None, 8080, &[("10.244.0.6", Some(true))]),
             ],
         );
         p.on_synced(&v).unwrap();
         let backend = |a: [u8; 4]| SocketAddrV4::new(Ipv4Addr::from(a), 8080);
         assert_eq!(
             p.node_ports(),
-            [Forward {
-                proto: IPPROTO_TCP,
-                addr: None,
-                port: 30080,
-                backends: vec![backend([10, 244, 0, 3]), backend([10, 244, 0, 4])],
-            }],
+            [
+                Forward {
+                    proto: IPPROTO_TCP,
+                    addr: None,
+                    port: 30080,
+                    backends: vec![backend([10, 244, 0, 3]), backend([10, 244, 0, 4])],
+                    affinity: false,
+                },
+                Forward {
+                    proto: IPPROTO_TCP,
+                    addr: None,
+                    port: 30090,
+                    backends: vec![backend([10, 244, 0, 6])],
+                    affinity: true,
+                },
+            ],
             "no rule for a node port without backends, none for a ClusterIP"
         );
     }
