@@ -11,8 +11,8 @@ service UpdateService {
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
   // Checks a complete upload against the pinned key and this unit, changing nothing.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
-  // Applies the verified bundle. Refused until the unit has committed the OS
-  // it booted, since the update's own trial falls back to it.
+  // Applies the verified bundle. Refused while the OS the unit booted is on
+  // trial, since the update's own trial falls back to a blessed one.
   rpc Apply(ApplyRequest) returns (ApplyResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   // The status now, then every change to it.
@@ -20,7 +20,7 @@ service UpdateService {
   // Updates applied or refused, newest first.
   rpc ListHistory(ListHistoryRequest) returns (ListHistoryResponse);
   // Power-cycles the unit. Refused while an update is under way, except on
-  // its OS trial: the reboot then boots the previous OS, backing the update out.
+  // its OS trial: the reboot spends one of the new OS's boot tries.
   rpc Reboot(RebootRequest) returns (RebootResponse);
   // Powers the unit off, on the same terms as Reboot.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
@@ -150,7 +150,7 @@ message Unit {
   string trial = 5;
   // "<tag> <time>" of the last rollback.
   string rolled_back = 6;
-  // The running OS is on trial: a reset boots the previous one.
+  // The running OS is on trial: a boot-counted UKI not yet blessed.
   bool os_trial = 7;
 }
 

@@ -46,10 +46,11 @@ enum Verdict {
 
 pub(crate) struct World {
     version: String,
-    entries: BTreeMap<String, String>,
+    /// sd-boot's entries by id: version, and boot tries left while counted.
+    entries: BTreeMap<String, (String, Option<u32>)>,
     default: String,
     selected: String,
-    one_shot: String,
+    count_path: String,
     boot_id: u64,
     secure_boot: bool,
     active: String,
@@ -99,10 +100,10 @@ impl World {
     fn new() -> Self {
         Self {
             version: "v1.14.1".into(),
-            entries: BTreeMap::from([("talos-v1.14.1.efi".into(), "v1.14.1".into())]),
+            entries: BTreeMap::from([("talos-v1.14.1.efi".into(), ("v1.14.1".into(), None))]),
             default: "Talos-v1.14.1.efi".into(),
             selected: "Talos-v1.14.1.efi".into(),
-            one_shot: String::new(),
+            count_path: String::new(),
             boot_id: 1,
             secure_boot: true,
             active: UNIT_CONFIG.into(),
@@ -154,7 +155,7 @@ impl World {
     }
 
     fn on_trial(&self) -> bool {
-        !self.selected.eq_ignore_ascii_case(&self.default)
+        !self.count_path.is_empty()
     }
 
     fn judge_pulls(&self) -> bool {
@@ -165,18 +166,32 @@ impl World {
         !self.on_trial()
             && (self.os_current && self.last_installed.is_empty()
                 || !self.last_installed.is_empty()
-                    && self.default.eq_ignore_ascii_case(&self.last_installed))
+                    && self.default.eq_ignore_ascii_case(&self.last_installed)
+                    && self.selected.eq_ignore_ascii_case(&self.last_installed))
     }
 
-    /// sd-boot: the one-shot once, else the default; a staged config applies.
+    /// sd-boot: the default, counting its boot while it has tries, else the
+    /// uncounted entry; a staged config applies.
     fn power_cycle(&mut self) {
         self.boot_id += 1;
-        self.selected = if self.one_shot.is_empty() {
-            self.default.clone()
-        } else {
-            std::mem::take(&mut self.one_shot)
+        let id = self.default.to_lowercase();
+        let (selected, count_path) = match self.entries.get_mut(&id) {
+            Some((_, Some(left))) if *left > 0 => {
+                *left -= 1;
+                (id.clone(), format!("\\EFI\\Linux\\{id}+{left}"))
+            }
+            Some((_, None)) => (id.clone(), String::new()),
+            _ => (
+                self.entries
+                    .iter()
+                    .find(|(_, (_, tries))| tries.is_none())
+                    .map(|(id, _)| id.clone())
+                    .expect("a good entry"),
+                String::new(),
+            ),
         };
-        self.version = self.entries[&self.selected.to_lowercase()].clone();
+        (self.selected, self.count_path) = (selected, count_path);
+        self.version = self.entries[&self.selected].0.clone();
         if let Some(c) = self.staged.take() {
             self.active = c;
         }
@@ -195,8 +210,16 @@ impl World {
         if self.trial_fails {
             self.power_cycle();
         } else {
-            self.default = self.selected.clone();
+            self.bless();
         }
+    }
+
+    /// boot-commit's bless: the running UKI loses its counter, and LoaderBootCountPath goes.
+    fn bless(&mut self) {
+        if let Some((_, tries)) = self.entries.get_mut(&self.selected.to_lowercase()) {
+            *tries = None;
+        }
+        self.count_path.clear();
     }
 
     /// The stack judge: a new ref is committed or rolled back after a few looks.
@@ -258,7 +281,7 @@ impl Talos for FakeTalos {
                 var(&w.selected)
             }
             p if p.contains("/LoaderEntryDefault-") => var(&w.default),
-            p if p.contains("/LoaderEntryOneShot-") => var(&w.one_shot),
+            p if p.contains("/LoaderBootCountPath-") => var(&w.count_path),
             BOOT_ID => Some(format!("{}\n", w.boot_id).into_bytes()),
             _ => None,
         })
@@ -314,8 +337,9 @@ impl Talos for FakeTalos {
         assert!(image.ends_with(&format!("@{DIGEST}")) && !image.contains(":update-new@"));
         anyhow::ensure!(!w.install_fails, "pulling {image}: not found");
         let entry = format!("Talos-v1.14.1~{}.efi", w.entries.len());
-        w.entries.insert(entry.to_lowercase(), "v1.14.1".into());
-        w.one_shot = entry.clone();
+        w.entries
+            .insert(entry.to_lowercase(), ("v1.14.1".into(), Some(3)));
+        w.default = entry.clone();
         w.last_installed = entry;
         w.seeded = false;
         w.change("install".into())
@@ -722,7 +746,8 @@ async fn the_os_is_installed_unless_the_unit_runs_it_already() {
             let mut w = h.w();
             w.os_current = false;
             w.version = version.into();
-            w.entries.insert("talos-v1.14.1.efi".into(), version.into());
+            w.entries
+                .insert("talos-v1.14.1.efi".into(), (version.into(), None));
             w.apply_refused = apply_refused;
         }
         let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
@@ -1073,28 +1098,28 @@ async fn refusals_change_nothing() {
 
 #[tokio::test]
 async fn a_unit_on_trial_verifies_but_waits_to_apply() {
-    for (default, why) in [("Talos-v1.14.1.efi", "on trial"), ("", "first boot")] {
-        let mut h = Harness::new();
-        const TRIAL: &str = "Talos-v1.14.1~9.efi";
-        {
-            let mut w = h.w();
-            w.selected = TRIAL.into();
-            w.entries.insert(TRIAL.to_lowercase(), "v1.14.1".into());
-            w.default = default.into();
-        }
-        let s = Spec::new("update-new");
-        assert_eq!(h.verify(&s).await, None, "verify was refused");
-        let e = h.e().request_apply(&s.tag).await.unwrap_err();
-        assert!(e.to_string().contains(why), "{e}");
-        assert_eq!(h.e().record.phase, Phase::Idle);
-        assert!(h.e().record.history.is_empty());
-        assert!(h.w().log.is_empty());
-
-        h.w().default = TRIAL.into();
-        h.e().request_apply(&s.tag).await.unwrap();
-        h.run(|_, _| {}).await;
-        assert_eq!(h.e().record.history[0].outcome, Outcome::Committed);
+    let mut h = Harness::new();
+    {
+        let mut w = h.w();
+        w.entries
+            .insert("talos-v1.14.1~9.efi".into(), ("v1.14.1".into(), Some(2)));
+        w.default = "Talos-v1.14.1~9.efi".into();
+        w.power_cycle();
     }
+    let s = Spec::new("update-new");
+    assert_eq!(h.verify(&s).await, None, "verify was refused");
+    let e = h.e().request_apply(&s.tag).await.unwrap_err();
+    assert!(e.to_string().contains("on trial"), "{e}");
+    assert_eq!(h.e().record.phase, Phase::Idle);
+    assert!(h.e().record.history.is_empty());
+
+    // Its tries spent, sd-boot falls back: the default still names it.
+    h.w().power_cycle();
+    h.w().power_cycle();
+    assert_eq!(h.w().selected, "talos-v1.14.1.efi");
+    h.e().request_apply(&s.tag).await.unwrap();
+    h.run(|_, _| {}).await;
+    assert_eq!(h.e().record.history[0].outcome, Outcome::Committed);
 }
 
 #[tokio::test]
@@ -1159,20 +1184,29 @@ fn versions_compare_numerically() {
 
 #[test]
 fn trial_is_read_as_boot_commit_reads_it() {
-    let b = |s: &str, d: &str, o: &str| Boot {
+    let b = |s: &str, d: &str, o: &str, c: &str| Boot {
         selected: s.into(),
         default: d.into(),
         one_shot: o.into(),
+        count_path: c.into(),
     };
-    assert!(b("Talos-b.efi", "Talos-a.efi", "").trial());
-    assert!(!b("Talos-A.efi", "talos-a.efi", "").trial());
-    assert!(!b("Talos-b.efi", "Talos-a.efi", "kexec reboot").trial());
-    assert!(!b("", "Talos-a.efi", "").trial());
+    let counted = "\\EFI\\Linux\\Talos-b+2-1.efi";
+    assert!(b("talos-b.efi", "Talos-b.efi", "", counted).trial());
+    assert!(!b("talos-b.efi", "Talos-b.efi", "", "").trial(), "blessed");
     assert!(
-        !b("Talos-a.efi", "", "").trial(),
-        "fresh media has nothing to revert to"
+        !b("talos-a.efi", "Talos-b.efi", "", "").trial(),
+        "fell back"
     );
-    assert!(b("Talos-a.efi", "", "").uncommitted());
+    assert!(!b("talos-b.efi", "Talos-b.efi", "kexec reboot", counted).trial());
+    assert_eq!(
+        b("talos-a.efi", "Talos-b.efi", "", "").running(),
+        "talos-a.efi"
+    );
+    assert_eq!(
+        b("talos-a.efi", "Talos-b.efi", "kexec reboot", "").running(),
+        "Talos-b.efi"
+    );
+    assert_eq!(b("", "Talos-b.efi", "", "").running(), "Talos-b.efi");
     assert_eq!(decode_efivar(&utf16("Talos-v1.efi")), "Talos-v1.efi");
 }
 
@@ -1214,8 +1248,8 @@ async fn an_install_that_never_succeeds_stops_it() {
         assert_eq!(w.staged.as_deref().unwrap_or(&w.active), w.active);
         assert!(!w.active.contains("store:update-new"));
         assert_eq!(
-            (w.selected.as_str(), w.one_shot.as_str()),
-            ("Talos-v1.14.1.efi", "")
+            (w.selected.as_str(), w.default.as_str()),
+            ("Talos-v1.14.1.efi", "Talos-v1.14.1.efi")
         );
     }
     assert!(h.e().record.history[0].snapshot.is_some());
@@ -1330,7 +1364,7 @@ async fn a_unit_that_committed_while_the_engine_was_away_carries_on() {
             if matches!(h.e().record.phase, Phase::Rebooting { .. }) {
                 let mut w = h.w();
                 w.power_cycle();
-                w.default = w.selected.clone();
+                w.bless();
                 drop(w);
                 h.reopen();
             }
@@ -1347,8 +1381,10 @@ async fn revert_while_away_restores_config() {
         .update(&Spec::new("update-new"), |h, _| {
             if matches!(h.e().record.phase, Phase::Rebooting { .. }) {
                 let mut w = h.w();
-                w.power_cycle();
-                w.power_cycle();
+                // Three counted boots, then sd-boot falls back.
+                for _ in 0..4 {
+                    w.power_cycle();
+                }
                 drop(w);
                 h.reopen();
             }
@@ -1356,7 +1392,7 @@ async fn revert_while_away_restores_config() {
         .await;
     assert_eq!(e.outcome, Outcome::Failed);
     assert!(
-        e.detail.contains("rebooted on its previous OS"),
+        e.detail.contains("went back to its previous OS"),
         "{}",
         e.detail
     );
@@ -1434,7 +1470,7 @@ async fn the_unit_is_read_whatever_the_engine_does() {
 
     {
         let mut w = h.w();
-        w.selected = "Talos-v1.14.1~9.efi".into();
+        w.count_path = "\\EFI\\Linux\\Talos-v1.14.1~9+2-1.efi".into();
         w.tag = "update-next".into();
         w.apiserver_down = true;
     }
@@ -1483,30 +1519,21 @@ async fn power_is_refused_while_an_update_runs() {
 }
 
 #[tokio::test]
-async fn a_reboot_on_the_os_trial_backs_the_update_out() {
+async fn a_reboot_on_the_os_trial_spends_a_try_and_the_trial_goes_on() {
     let mut h = Harness::new();
     applied(&mut h, &Spec::new("update-new")).await;
     step_until(&mut h, |p| *p == Phase::Trial).await;
     let said = h.e().power(Power::Reboot).await.unwrap();
     assert_eq!(
         said,
-        "rebooting: the OS on trial, Talos-v1.14.1~1.efi, is backed out and the unit boots Talos-v1.14.1.efi again"
+        "rebooting: the OS on trial, talos-v1.14.1~1.efi, spends one of its boot tries"
     );
+    assert_eq!(h.w().entries["talos-v1.14.1~1.efi"].1, Some(1));
     h.reopen();
     h.run(|_, _| {}).await;
     let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Failed);
-    assert!(
-        e.detail.contains("an operator backed the new OS out"),
-        "{}",
-        e.detail
-    );
-    let w = h.w();
-    assert_eq!(w.active, UNIT_CONFIG);
-    assert_eq!(
-        (w.tag.as_str(), w.selected.as_str()),
-        (OLD_TAG, "Talos-v1.14.1.efi")
-    );
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
 }
 
 #[tokio::test]
@@ -1514,10 +1541,14 @@ async fn power_when_idle_says_what_boots_next() {
     let mut h = Harness::new();
     assert_eq!(h.e().power(Power::Shutdown).await.unwrap(), "shutting down");
     assert_eq!(h.w().log, ["shutdown"]);
-    h.w().selected = "Talos-v1.14.1~9.efi".into();
+    {
+        let mut w = h.w();
+        w.selected = "talos-v1.14.1~9.efi".into();
+        w.count_path = "\\EFI\\Linux\\Talos-v1.14.1~9+2-1.efi".into();
+    }
     let said = h.e().power(Power::Reboot).await.unwrap();
     assert!(
-        said.starts_with("rebooting: the OS on trial, Talos-v1.14.1~9.efi, is backed out"),
+        said.starts_with("rebooting: the OS on trial, talos-v1.14.1~9.efi, spends one"),
         "{said}"
     );
     assert!(h.e().record.before.is_none());

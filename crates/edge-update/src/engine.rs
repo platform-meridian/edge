@@ -88,9 +88,6 @@ pub struct Before {
     pub default_entry: String,
     pub started: i64,
     pub snapshot: Option<String>,
-    /// An operator powered the unit down on the OS trial.
-    #[serde(default)]
-    pub backed_out: bool,
     /// The installer the unit's config names.
     #[serde(default)]
     pub installer: String,
@@ -169,19 +166,28 @@ pub struct Boot {
     pub selected: String,
     pub default: String,
     pub one_shot: String,
+    pub count_path: String,
 }
 
 impl Boot {
-    /// As boot-commit judges it: sd-boot chose an entry other than the default.
-    fn uncommitted(&self) -> bool {
-        !(self.one_shot == "kexec reboot" || self.selected.is_empty())
-            && !self.selected.eq_ignore_ascii_case(&self.default)
+    /// sd-boot did not run this boot: its variables describe an earlier one.
+    fn kexec(&self) -> bool {
+        self.one_shot == "kexec reboot"
     }
 
-    /// Uncommitted with a default to go back to. Fresh media has none until
-    /// boot-commit's first commit, and nothing to revert to.
+    /// The entry running now: a kexec boots the default.
+    fn running(&self) -> &str {
+        if self.kexec() || self.selected.is_empty() {
+            &self.default
+        } else {
+            &self.selected
+        }
+    }
+
+    /// As boot-commit judges it: sd-boot counted this boot, and the UKI is not
+    /// blessed yet (the bless deletes LoaderBootCountPath).
     pub fn trial(&self) -> bool {
-        self.uncommitted() && !self.default.is_empty()
+        !self.kexec() && !self.count_path.is_empty()
     }
 }
 
@@ -300,12 +306,7 @@ impl Engine {
         let boot = self.boot().await?;
         anyhow::ensure!(
             !boot.trial(),
-            "the unit is on trial of {}: wait for it to commit or revert",
-            boot.selected
-        );
-        anyhow::ensure!(
-            !boot.uncommitted(),
-            "the unit has not committed its first boot, {}, yet: wait for it to",
+            "the unit is on trial of {}: wait for it to be blessed or to fall back",
             boot.selected
         );
         self.record.error.clear();
@@ -363,15 +364,9 @@ impl Engine {
         if !b.trial() {
             return Ok(action.into());
         }
-        if self.record.phase == Phase::Trial
-            && let Some(before) = self.record.before.as_mut()
-        {
-            before.backed_out = true;
-            self.save()?;
-        }
         Ok(format!(
-            "{action}: the OS on trial, {}, is backed out and the unit boots {} again",
-            b.selected, b.default
+            "{action}: the OS on trial, {}, spends one of its boot tries",
+            b.selected
         ))
     }
 
@@ -643,6 +638,7 @@ impl Engine {
             ("LoaderEntrySelected", &mut b.selected),
             ("LoaderEntryDefault", &mut b.default),
             ("LoaderEntryOneShot", &mut b.one_shot),
+            ("LoaderBootCountPath", &mut b.count_path),
         ] {
             *dst = self
                 .talos
@@ -702,7 +698,6 @@ impl Engine {
             default_entry: self.boot().await?.default,
             started: (self.now)(),
             snapshot: None,
-            backed_out: false,
             installer: installer_of(&running),
         });
         Ok(Go(Phase::Importing))
@@ -801,8 +796,18 @@ impl Engine {
         if self.release()?.os_done {
             return Ok(Go(Phase::Seeding));
         }
-        if self.left_old_os().await? {
+        let b = self.boot().await?;
+        if b.trial() {
             return Ok(Go(Phase::Trial));
+        }
+        // Installed (the default names the new UKI) but not yet rebooted into it.
+        if !b
+            .default
+            .eq_ignore_ascii_case(&self.before()?.default_entry)
+        {
+            return Ok(Go(Phase::Rebooting {
+                boot_id: self.boot_id().await?,
+            }));
         }
         let rel = self.release()?.clone();
         let installer = installer_pin(rel.get("INSTALLER_REF"));
@@ -877,20 +882,19 @@ impl Engine {
             return poll(
                 30,
                 format!(
-                    "{} is on trial; the unit commits it once it has stayed healthy",
+                    "{} is on trial; the unit blesses it once it has stayed healthy",
                     b.selected
                 ),
             );
         }
         let before = self.before()?;
-        if b.default.eq_ignore_ascii_case(&before.default_entry) {
-            let why = if before.backed_out {
-                "an operator backed the new OS out by powering the unit down on its trial"
-            } else {
-                "the new OS did not stay up, and the unit went back to its previous OS by itself"
-            };
+        // Fallen back (its tries spent) or rolled back: the default is not what runs, or is the old one.
+        if !b.running().eq_ignore_ascii_case(&b.default)
+            || b.default.eq_ignore_ascii_case(&before.default_entry)
+        {
             return Ok(Fail(format!(
-                "{why}; {}. The stack did not move; applying again repeats the upgrade",
+                "the new OS did not stay up, and the unit went back to its previous OS by itself; {}. \
+                 The stack did not move; applying again repeats the upgrade",
                 self.restore().await?
             )));
         }

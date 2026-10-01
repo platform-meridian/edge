@@ -27,7 +27,7 @@ pub trait Talos: Send + Sync {
     async fn apply_config(&self, config: &str) -> anyhow::Result<()>;
     /// Pulls the installer and writes the new OS beside the running one.
     async fn install(&self, image: &str) -> anyhow::Result<()>;
-    /// A power cycle: a kexec would boot the default and lose the trial.
+    /// A power cycle: sd-boot counts the new OS's boots, and a kexec would bypass it.
     async fn reboot(&self) -> anyhow::Result<()>;
     async fn shutdown(&self) -> anyhow::Result<()>;
 }
