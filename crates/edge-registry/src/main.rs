@@ -2,8 +2,6 @@
 //! hold through to an upstream registry. Images arrive through the library, from
 //! the process that imports them, never over the network.
 
-mod server;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -84,7 +82,12 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(server::serve(store, listen, upstream, mounted(unmounted)))
+        .block_on(edge_registry::serve(
+            store,
+            listen,
+            Some(upstream),
+            mounted(unmounted),
+        ))
 }
 
 fn open(root: &std::path::Path) -> anyhow::Result<Store> {

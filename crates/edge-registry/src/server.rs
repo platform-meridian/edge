@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use edge_registry::{Digest, Store, normalize_repo};
 use futures::TryStreamExt;
 use http::header::{
     ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, RANGE,
@@ -23,19 +22,22 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::ReaderStream;
 
+use crate::{Digest, Store, normalize_repo};
+
 type Body = UnsyncBoxBody<Bytes, io::Error>;
 
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
+/// Serves `store` on `listen` until `stop`, passing misses through to `upstream`.
 pub async fn serve(
     store: Option<Store>,
     listen: SocketAddr,
-    upstream: SocketAddr,
+    upstream: Option<SocketAddr>,
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let root = store.as_ref().map(|s| s.root().display().to_string());
-    tracing::info!(addr = %listener.local_addr()?, ?root, %upstream, "serving images");
+    tracing::info!(addr = %listener.local_addr()?, ?root, ?upstream, "serving images");
     if let Some(verifier) = store.clone() {
         tokio::task::spawn_blocking(move || {
             lower_priority();
@@ -260,28 +262,29 @@ async fn blob(store: &Store, digest: &Digest, range: Option<&str>) -> Option<Res
 
 /// A read-only pass-through to another registry, Talos's registryd by default,
 /// for what the store does not hold. Nothing it serves is kept.
-struct Upstream(SocketAddr);
+struct Upstream(Option<SocketAddr>);
 
 /// Covers the answer's head only: a blob then streams as long as it takes.
 const UPSTREAM_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Upstream {
     async fn fetch<B>(&self, req: &Request<B>) -> Option<Response<Body>> {
-        match tokio::time::timeout(UPSTREAM_PATIENCE, self.send(req)).await {
+        let up = self.0?;
+        match tokio::time::timeout(UPSTREAM_PATIENCE, Self::send(up, req)).await {
             Ok(Ok(resp)) => Some(resp),
             Ok(Err(e)) => {
                 tracing::debug!(uri = %req.uri(), error = %e, "not upstream either");
                 None
             }
             Err(_) => {
-                tracing::warn!(uri = %req.uri(), upstream = %self.0, "upstream did not answer in time");
+                tracing::warn!(uri = %req.uri(), upstream = %up, "upstream did not answer in time");
                 None
             }
         }
     }
 
-    async fn send<B>(&self, req: &Request<B>) -> anyhow::Result<Response<Body>> {
-        let stream = TcpStream::connect(self.0).await?;
+    async fn send<B>(up: SocketAddr, req: &Request<B>) -> anyhow::Result<Response<Body>> {
+        let stream = TcpStream::connect(up).await?;
         let (mut sender, conn) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         tokio::spawn(async move {
@@ -291,7 +294,7 @@ impl Upstream {
         let mut up = Request::builder()
             .method(req.method())
             .uri(path)
-            .header(HOST, self.0.to_string());
+            .header(HOST, up.to_string());
         for name in [ACCEPT, RANGE] {
             for v in req.headers().get_all(&name) {
                 up = up.header(&name, v);
