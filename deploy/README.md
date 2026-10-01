@@ -30,6 +30,7 @@ Then provide:
   signingKey: ssh-ed25519 AAAA...     # signs every bundle
   signatureNamespace: my-update       # ssh-keygen -Y sign -n
   store: /var/lib/etcd/state.log      # copied off before each update
+  bless: /var/mnt/my-volume/blessed   # boot-commit's record of the boot it blessed
   stack:
     url: oci://127.0.0.1:5000/my-stack  # the stack artifact's repository on the unit
     fluxInstance: flux-system/flux

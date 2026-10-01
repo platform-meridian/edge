@@ -21,6 +21,12 @@ use crate::unit::{Cluster, Registry, Settings, Talos};
 use crate::upload::Uploads;
 
 const LOADER: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+
+/// boot-commit's record of a bless: the boot it ran in, and the UKI it blessed.
+#[derive(Deserialize)]
+struct Blessed {
+    boot_id: String,
+}
 const SECURE_BOOT: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
@@ -167,6 +173,8 @@ pub struct Boot {
     pub default: String,
     pub one_shot: String,
     pub count_path: String,
+    /// boot-commit blessed the running UKI this boot.
+    pub blessed: bool,
 }
 
 impl Boot {
@@ -184,10 +192,9 @@ impl Boot {
         }
     }
 
-    /// As boot-commit judges it: sd-boot counted this boot, and the UKI is not
-    /// blessed yet (the bless deletes LoaderBootCountPath).
+    /// sd-boot counted this boot, and boot-commit has not blessed the UKI yet.
     pub fn trial(&self) -> bool {
-        !self.kexec() && !self.count_path.is_empty()
+        !self.kexec() && !self.count_path.is_empty() && !self.blessed
     }
 }
 
@@ -647,6 +654,15 @@ impl Engine {
                 .with_context(|| format!("read {name}"))?
                 .map(|v| decode_efivar(&v))
                 .unwrap_or_default();
+        }
+        // LoaderBootCountPath stays set for the whole boot: the bless is recorded beside it.
+        let record = self
+            .talos
+            .read(&self.settings.bless)
+            .await
+            .context("read boot-commit's record")?;
+        if let Some(r) = record.and_then(|r| serde_json::from_slice::<Blessed>(&r).ok()) {
+            b.blessed = r.boot_id.trim() == self.boot_id().await?;
         }
         Ok(b)
     }

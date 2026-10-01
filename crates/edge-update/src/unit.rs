@@ -112,6 +112,8 @@ pub struct Settings {
     pub signature_namespace: String,
     /// The node path of the store log copied before an update.
     pub store: String,
+    /// The node path of boot-commit's record of the boot it blessed.
+    pub bless: String,
     pub stack: Stack,
 }
 

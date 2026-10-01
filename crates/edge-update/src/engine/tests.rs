@@ -51,6 +51,10 @@ pub(crate) struct World {
     default: String,
     selected: String,
     count_path: String,
+    /// The boot boot-commit's record names.
+    blessed_boot: Option<u64>,
+    /// The record is torn.
+    bless_torn: bool,
     boot_id: u64,
     secure_boot: bool,
     active: String,
@@ -104,6 +108,8 @@ impl World {
             default: "Talos-v1.14.1.efi".into(),
             selected: "Talos-v1.14.1.efi".into(),
             count_path: String::new(),
+            blessed_boot: None,
+            bless_torn: false,
             boot_id: 1,
             secure_boot: true,
             active: UNIT_CONFIG.into(),
@@ -155,7 +161,7 @@ impl World {
     }
 
     fn on_trial(&self) -> bool {
-        !self.count_path.is_empty()
+        !self.count_path.is_empty() && self.blessed_boot != Some(self.boot_id)
     }
 
     fn judge_pulls(&self) -> bool {
@@ -214,12 +220,13 @@ impl World {
         }
     }
 
-    /// boot-commit's bless: the running UKI loses its counter, and LoaderBootCountPath goes.
+    /// boot-commit's bless: the running UKI loses its counter, and the record names this
+    /// boot; LoaderBootCountPath stays set until the next boot, as firmware keeps it.
     fn bless(&mut self) {
         if let Some((_, tries)) = self.entries.get_mut(&self.selected.to_lowercase()) {
             *tries = None;
         }
-        self.count_path.clear();
+        self.blessed_boot = Some(self.boot_id);
     }
 
     /// The stack judge: a new ref is committed or rolled back after a few looks.
@@ -283,6 +290,12 @@ impl Talos for FakeTalos {
             p if p.contains("/LoaderEntryDefault-") => var(&w.default),
             p if p.contains("/LoaderBootCountPath-") => var(&w.count_path),
             BOOT_ID => Some(format!("{}\n", w.boot_id).into_bytes()),
+            BLESS if w.bless_torn => w
+                .blessed_boot
+                .map(|b| format!(r#"{{"boot_id": "{b}"#).into_bytes()),
+            BLESS => w.blessed_boot.map(|b| {
+                format!(r#"{{"boot_id": "{b}\n", "uki": "Talos-v1.14.1~1.efi"}}"#).into_bytes()
+            }),
             _ => None,
         })
     }
@@ -527,12 +540,15 @@ spec:
     )
 }
 
+const BLESS: &str = "/var/mnt/edge-evidence/boot-commit/blessed";
+
 fn settings(public: &str) -> Settings {
     let r = |n: &str| Ref::try_from(format!("flux-system/{n}")).unwrap();
     Settings {
         signing_key: public.into(),
         signature_namespace: testkit::NAMESPACE.into(),
         store: "/var/lib/etcd/state.log".into(),
+        bless: BLESS.into(),
         stack: Stack {
             url: "oci://127.0.0.1:5000/stack".into(),
             flux_instance: r("flux"),
@@ -1123,6 +1139,50 @@ async fn a_unit_on_trial_verifies_but_waits_to_apply() {
 }
 
 #[tokio::test]
+async fn a_bless_recorded_on_an_earlier_boot_is_not_this_ones() {
+    let mut h = Harness::new();
+    {
+        let mut w = h.w();
+        w.entries
+            .insert("talos-v1.14.1~9.efi".into(), ("v1.14.1".into(), Some(2)));
+        w.default = "Talos-v1.14.1~9.efi".into();
+        w.power_cycle();
+        w.blessed_boot = Some(w.boot_id - 1);
+    }
+    let s = Spec::new("update-new");
+    assert_eq!(h.verify(&s).await, None, "verify was refused");
+    let e = h.e().request_apply(&s.tag).await.unwrap_err();
+    assert!(e.to_string().contains("on trial"), "{e}");
+
+    // The record names this boot: blessed, while LoaderBootCountPath stays set.
+    {
+        let mut w = h.w();
+        w.blessed_boot = Some(w.boot_id);
+        assert!(!w.count_path.is_empty());
+    }
+    h.e().request_apply(&s.tag).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unreadable_bless_record_is_no_bless() {
+    let mut h = Harness::new();
+    {
+        let mut w = h.w();
+        w.entries
+            .insert("talos-v1.14.1~9.efi".into(), ("v1.14.1".into(), Some(2)));
+        w.default = "Talos-v1.14.1~9.efi".into();
+        w.power_cycle();
+        w.blessed_boot = Some(w.boot_id);
+        w.bless_torn = true;
+    }
+    h.e().refresh_unit().await;
+    assert!(h.e().unit.os_trial);
+    h.w().bless_torn = false;
+    h.e().refresh_unit().await;
+    assert!(!h.e().unit.os_trial);
+}
+
+#[tokio::test]
 async fn a_bundle_signed_by_another_key_is_refused_before_any_call() {
     let mut h = Harness::new();
     let (other, _) = testkit::keygen(h.dir.path(), "other");
@@ -1189,10 +1249,18 @@ fn trial_is_read_as_boot_commit_reads_it() {
         default: d.into(),
         one_shot: o.into(),
         count_path: c.into(),
+        blessed: false,
     };
     let counted = "\\EFI\\Linux\\Talos-b+2-1.efi";
     assert!(b("talos-b.efi", "Talos-b.efi", "", counted).trial());
-    assert!(!b("talos-b.efi", "Talos-b.efi", "", "").trial(), "blessed");
+    assert!(
+        !Boot {
+            blessed: true,
+            ..b("talos-b.efi", "Talos-b.efi", "", counted)
+        }
+        .trial(),
+        "blessed this boot"
+    );
     assert!(
         !b("talos-a.efi", "Talos-b.efi", "", "").trial(),
         "fell back"
