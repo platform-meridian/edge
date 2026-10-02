@@ -46,7 +46,6 @@ const HELD_KINDS: &[&str] = &[
     "HostnameConfig",
     "KubeClusterConfig",
     "ResolverConfig",
-    "StaticHostConfig",
     "LinkConfig",
     "LinkAliasConfig",
     "DummyLinkConfig",
@@ -513,6 +512,17 @@ image: kubelet:new
     fn build_drops_what_it_stopped_rendering() {
         let out = parse(&merge(UNIT, PATCH).unwrap()).unwrap();
         assert!(doc(&out, "KubePrismConfig", "").is_none());
+    }
+
+    #[test]
+    fn static_hosts_are_the_builds() {
+        let hosts = "---\napiVersion: v1alpha1\nkind: StaticHostConfig\nname: 127.0.0.1\nhostnames: [a.example]\n";
+        let unit = format!("{UNIT}{hosts}");
+        assert!(strip(&unit).unwrap().contains("a.example"));
+        let out = parse(&merge(&unit, PATCH).unwrap()).unwrap();
+        assert!(doc(&out, "StaticHostConfig", "127.0.0.1").is_none());
+        let out = parse(&merge(UNIT, &format!("{PATCH}{hosts}")).unwrap()).unwrap();
+        assert!(doc(&out, "StaticHostConfig", "127.0.0.1").is_some());
     }
 
     #[test]
