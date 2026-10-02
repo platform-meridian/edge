@@ -885,7 +885,7 @@ impl Engine {
             return poll(
                 30,
                 format!(
-                    "{} is on trial; the unit commits it after ten healthy minutes",
+                    "{} is on trial; the unit commits it once it has stayed healthy",
                     b.selected
                 ),
             );
@@ -1048,7 +1048,7 @@ impl Engine {
         }
         poll(
             30,
-            format!("{tag} is on trial; the unit's judge commits it after ten healthy minutes"),
+            format!("{tag} is on trial; the unit's judge commits it once it has stayed healthy"),
         )
     }
 
