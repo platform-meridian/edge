@@ -6,8 +6,8 @@ use std::process::Command;
 use std::collections::BTreeSet;
 
 use edge_bundle::{
-    Contents, Manifest, SigningKey, Verifier, check, listed_refs, machineconfig, oci, release_refs,
-    unpack, write,
+    Contents, Manifest, SigningKey, Verifier, check, listed_refs, machineconfig, oci, read_head,
+    release_refs, unpack, write,
 };
 use sha2::{Digest, Sha256};
 
@@ -112,6 +112,7 @@ impl Build {
             seed: "kind: ConfigMap\n",
             images: &self.images,
             refs: None,
+            notes: None,
         }
     }
 
@@ -171,6 +172,64 @@ fn a_written_bundle_unpacks_as_a_unit_reads_it() {
             .resolve("registry.example/installer", digest)
             .is_some()
     );
+}
+
+#[test]
+fn notes_ride_signed_and_the_head_reads_from_the_start_alone() {
+    let b = Build::new();
+    let mut c = b.contents();
+    c.notes = Some("# 2.1\n\nFaster boots.\n");
+    let tar = b.path("n.tar");
+    write(&c, &b.key, 2000, &tar).unwrap();
+    b.open(&tar).unwrap();
+    assert_eq!(edge_bundle::notes(&b.path("unpacked")).as_deref(), c.notes);
+    assert_eq!(edge_bundle::notes(&b.path("nowhere")), None);
+
+    let bytes = std::fs::read(&tar).unwrap();
+    let v = Verifier::new(&b.public, NS).unwrap();
+    let head = read_head(bytes.as_slice(), &v).unwrap().unwrap();
+    assert_eq!(head.manifest, b.manifest);
+    assert_eq!(head.notes.as_deref(), c.notes);
+    assert!(
+        head.signer.starts_with("SHA256:") && head.signer.ends_with(" test"),
+        "{}",
+        head.signer
+    );
+    // The head is whole well before the images.
+    let whole = (0..bytes.len())
+        .step_by(512)
+        .find(|&n| read_head(&bytes[..n], &v).unwrap().is_some())
+        .unwrap();
+    let images = bytes.windows(7).position(|w| w == b"layer 0").unwrap();
+    assert!(whole < images, "{whole} >= {images}");
+    for n in [0, 100, 512, 1024, whole - 512] {
+        assert_eq!(read_head(&bytes[..n], &v).unwrap(), None, "{n}");
+    }
+
+    // Without notes, the manifest alone completes it.
+    let plain = std::fs::read(b.write("p.tar")).unwrap();
+    assert_eq!(
+        read_head(plain.as_slice(), &v).unwrap().unwrap().notes,
+        None
+    );
+
+    // A stranger's bundle fails as soon as its signature has arrived.
+    let (other, _) = keygen(b.dir.path(), "other", "");
+    let other = SigningKey::from_openssh(&other, NS).unwrap();
+    write(&c, &other, 2000, &b.path("o.tar")).unwrap();
+    let o = std::fs::read(b.path("o.tar")).unwrap();
+    assert!(err(read_head(&o[..whole], &v)).contains("pinned update key"));
+    assert!(read_head(&b"not a tar at all".repeat(64)[..], &v).is_err());
+
+    let mut bad = bytes.clone();
+    let at = bad.windows(6).position(|w| w == b"Faster").unwrap();
+    bad[at] = b'f';
+    assert!(err(read_head(bad.as_slice(), &v)).contains("NOTES.md does not match"));
+
+    let mut c = b.contents();
+    let long = "x".repeat(65 << 10);
+    c.notes = Some(&long);
+    assert!(err(write(&c, &b.key, 0, &b.path("l.tar"))).contains("notes"));
 }
 
 #[test]

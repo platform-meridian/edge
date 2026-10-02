@@ -14,9 +14,14 @@
 //!   (`oci`).
 //! - optionally `refs`: every ref the release runs, one per line, when the
 //!   layout carries only those the unit lacks (a partial bundle).
+//! - `NOTES.md`, optional: release notes for a person, at most 64 KiB.
+//!
+//! `MANIFEST` may also name the images a person cares about, one
+//! `COMPONENT_<NAME>=<ref> <digest> <version> dirty=<bool>` line each
+//! ([`components`]).
 //!
 //! A build writes one with [`write`]; a unit reads one with [`unpack`] and
-//! [`check`].
+//! [`check`], or its signed head alone, as it arrives, with [`read_head`].
 
 pub mod machineconfig;
 pub mod oci;
@@ -26,13 +31,13 @@ pub mod testkit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
 use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 
-pub use oci::layout_refs;
+pub use oci::{layout_images, layout_refs};
 
 pub const SUMS: &str = "SHA256SUMS";
 pub const SIG: &str = "SHA256SUMS.sig";
@@ -41,9 +46,12 @@ pub const PATCH: &str = "config-patch.yaml";
 pub const SEED: &str = "seed.yaml";
 pub const IMAGES: &str = "images";
 pub const REFS: &str = "refs";
+pub const NOTES: &str = "NOTES.md";
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIG: u64 = 64 << 10;
+const MAX_MANIFEST: u64 = 1 << 20;
+const MAX_NOTES: u64 = 64 << 10;
 
 /// The pinned key a unit checks a bundle's signature against.
 #[derive(Clone)]
@@ -60,6 +68,15 @@ impl Verifier {
             key,
             namespace: namespace.into(),
         })
+    }
+
+    /// The pinned key as a person checks it: `SHA256:<fingerprint> <comment>`.
+    pub fn signer(&self) -> String {
+        let fp = self.key.fingerprint(HashAlg::Sha256).to_string();
+        match self.key.comment() {
+            "" => fp,
+            c => format!("{fp} {c}"),
+        }
     }
 
     pub fn verify(&self, msg: &[u8], armored: &[u8]) -> anyhow::Result<()> {
@@ -168,7 +185,7 @@ fn safe(path: &Path) -> anyhow::Result<PathBuf> {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
-            Component::Normal(p) => out.push(p),
+            std::path::Component::Normal(p) => out.push(p),
             _ => bail!("{} is not a plain relative path", path.display()),
         }
     }
@@ -194,10 +211,13 @@ pub fn unpack(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Ma
     r
 }
 
-fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
-    let mut archive = tar::Archive::new(File::open(tar).context("open the bundle")?);
-    let mut entries = archive.entries().context("the bundle is not a tar")?;
+type Sums = BTreeMap<PathBuf, [u8; 32]>;
 
+/// The first two entries, the sums and their signature, verified.
+fn signed_sums<R: Read>(
+    entries: &mut tar::Entries<'_, R>,
+    verifier: &Verifier,
+) -> anyhow::Result<Sums> {
     let mut next = |want: &str, max: u64| -> anyhow::Result<Vec<u8>> {
         let mut e = entries
             .next()
@@ -221,6 +241,91 @@ fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<M
             "the signed sums do not cover {need}"
         );
     }
+    Ok(sums)
+}
+
+/// What a bundle says of itself, signed: readable before the rest has arrived.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Head {
+    pub manifest: Manifest,
+    pub notes: Option<String>,
+    /// [`Verifier::signer`] of the key it verified against.
+    pub signer: String,
+}
+
+/// The signed head of a bundle from as much of its start as is at hand:
+/// `Ok(None)` until enough has arrived, an error as soon as what has arrived
+/// is not a bundle signed by the pinned key.
+pub fn read_head(start: impl Read, verifier: &Verifier) -> anyhow::Result<Option<Head>> {
+    let mut start = Start {
+        inner: start,
+        ended: false,
+    };
+    let r = head_of(&mut start, verifier);
+    match r {
+        Err(_) if start.ended => Ok(None),
+        r => r.map(Some),
+    }
+}
+
+/// Notes whether a read ran out: what failed then may only be unfinished.
+struct Start<R> {
+    inner: R,
+    ended: bool,
+}
+
+impl<R: Read> Read for Start<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            self.ended = true;
+        }
+        Ok(n)
+    }
+}
+
+fn head_of(start: &mut impl Read, verifier: &Verifier) -> anyhow::Result<Head> {
+    let mut archive = tar::Archive::new(start);
+    let mut entries = archive.entries().context("the bundle is not a tar")?;
+    let sums = signed_sums(&mut entries, verifier)?;
+    let mut head = Head {
+        signer: verifier.signer(),
+        ..Head::default()
+    };
+    let (mut manifest, want_notes) = (None, sums.contains_key(Path::new(NOTES)));
+    while manifest.is_none() || (want_notes && head.notes.is_none()) {
+        let mut e = entries
+            .next()
+            .with_context(|| format!("the bundle ends before {MANIFEST}"))??;
+        let path = safe(&e.path()?)?;
+        let max = match path.to_str() {
+            Some(MANIFEST) => MAX_MANIFEST,
+            Some(NOTES) => MAX_NOTES,
+            _ => continue,
+        };
+        let size = e.size();
+        let body = read_small(&mut e, size, max, &path.to_string_lossy())?;
+        ensure!(
+            sums.get(&path).map(|h| h.as_slice()) == Some(Sha256::digest(&body).as_slice()),
+            "{} does not match the signed sums",
+            path.display()
+        );
+        let text =
+            String::from_utf8(body).with_context(|| format!("{} is not text", path.display()))?;
+        if path == Path::new(MANIFEST) {
+            manifest = Some(parse_manifest(&text)?);
+        } else {
+            head.notes = Some(text);
+        }
+    }
+    head.manifest = manifest.unwrap_or_default();
+    Ok(head)
+}
+
+fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
+    let mut archive = tar::Archive::new(File::open(tar).context("open the bundle")?);
+    let mut entries = archive.entries().context("the bundle is not a tar")?;
+    let sums = signed_sums(&mut entries, verifier)?;
 
     std::fs::create_dir_all(dest)?;
     let mut seen = BTreeSet::new();
@@ -269,6 +374,47 @@ fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<M
     }
     sync_fs(dest)?;
     parse_manifest(&std::fs::read_to_string(dest.join(MANIFEST))?)
+}
+
+/// An unpacked bundle's notes, if it carries any.
+pub fn notes(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(NOTES)).ok()
+}
+
+/// An image a person cares about, as a `COMPONENT_<NAME>` line names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Component {
+    /// `<NAME>`, lower-cased with dashes: `EDGE_CNI` is `edge-cni`.
+    pub name: String,
+    pub image: String,
+    pub digest: String,
+    /// What the build calls it, often `git describe`.
+    pub version: String,
+    /// Built from a tree with uncommitted changes, if the line says.
+    pub dirty: Option<bool>,
+}
+
+/// Every `COMPONENT_<NAME>=<ref> <digest> <version> dirty=<bool>` line. Any
+/// field may be empty; a line too short to read is skipped.
+pub fn components(m: &Manifest) -> Vec<Component> {
+    m.iter()
+        .filter_map(|(k, v)| {
+            let name = k.strip_prefix("COMPONENT_")?;
+            let mut f = v.split(' ');
+            let (image, digest, version) = (f.next()?, f.next()?, f.next()?);
+            let dirty = f
+                .next()
+                .and_then(|d| d.strip_prefix("dirty="))
+                .and_then(|d| d.parse().ok());
+            Some(Component {
+                name: name.to_ascii_lowercase().replace('_', "-"),
+                image: image.into(),
+                digest: digest.into(),
+                version: version.into(),
+                dirty,
+            })
+        })
+        .collect()
 }
 
 /// One syncfs for the whole unpack rather than an fsync per blob.
@@ -342,6 +488,8 @@ pub struct Contents<'a> {
     pub images: &'a Path,
     /// Every ref the release runs, when `images` carries only some of them.
     pub refs: Option<&'a BTreeSet<String>>,
+    /// Release notes for a person: [`NOTES`].
+    pub notes: Option<&'a str>,
 }
 
 enum Source {
@@ -370,6 +518,13 @@ impl Source {
 /// what a unit would refuse.
 pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> anyhow::Result<()> {
     machineconfig::check_patch(contents.patch)?;
+    if let Some(n) = contents.notes {
+        ensure!(
+            n.len() as u64 <= MAX_NOTES,
+            "the notes are {} bytes, more than {MAX_NOTES}",
+            n.len()
+        );
+    }
     let carried = layout_refs(contents.images)?;
     ensure!(!carried.is_empty(), "the image layout names no image");
     if let Some(refs) = contents.refs {
@@ -389,6 +544,9 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
     if let Some(refs) = contents.refs {
         let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
         files.insert(REFS.into(), Source::Bytes(text.into_bytes()));
+    }
+    if let Some(n) = contents.notes {
+        files.insert(NOTES.into(), Source::Bytes(n.as_bytes().into()));
     }
     for p in walk(contents.images)? {
         let name = Path::new(IMAGES).join(p.strip_prefix(contents.images)?);
@@ -657,6 +815,36 @@ mod tests {
         assert!(parse_manifest("lower=1\n").is_err());
         assert!(parse_manifest("NOEQUALS\n").is_err());
         assert_eq!(parse_manifest("A_1=x=y\n").unwrap()["A_1"], "x=y");
+    }
+
+    #[test]
+    fn components_are_read_from_their_lines() {
+        let m = parse_manifest(
+            "COMPONENT_EDGE_CNI=reg/edge-cni:t2 sha256:aa v1.2-3-gabc dirty=false\n\
+             COMPONENT_APP= sha256:bb  dirty=\n\
+             COMPONENT_SHORT=reg/x:1 sha256:cc\n\
+             STACK_TAG=t2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            components(&m),
+            [
+                Component {
+                    name: "app".into(),
+                    image: "".into(),
+                    digest: "sha256:bb".into(),
+                    version: "".into(),
+                    dirty: None,
+                },
+                Component {
+                    name: "edge-cni".into(),
+                    image: "reg/edge-cni:t2".into(),
+                    digest: "sha256:aa".into(),
+                    version: "v1.2-3-gabc".into(),
+                    dirty: Some(false),
+                },
+            ]
+        );
     }
 
     #[test]

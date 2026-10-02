@@ -1,7 +1,7 @@
 //! A bundle's images: one OCI image layout, every image named in its index by
 //! `io.containerd.image.name`, as the unit's registry imports it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
@@ -13,10 +13,15 @@ const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// The refs an OCI image layout names, from its index.
 pub fn layout_refs(layout: &Path) -> anyhow::Result<BTreeSet<String>> {
+    Ok(layout_images(layout)?.into_keys().collect())
+}
+
+/// Each ref the layout's index names, and the digest it names it at.
+pub fn layout_images(layout: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(layout.join("index.json")).context("the image layout's index")?,
     )?;
-    let mut refs = BTreeSet::new();
+    let mut images = BTreeMap::new();
     for m in index["manifests"]
         .as_array()
         .context("the index lists no manifests")?
@@ -26,9 +31,10 @@ pub fn layout_refs(layout: &Path) -> anyhow::Result<BTreeSet<String>> {
             .as_str()
             .or_else(|| a["org.opencontainers.image.ref.name"].as_str())
             .context("an index entry names no image")?;
-        refs.insert(name.to_string());
+        let digest = m["digest"].as_str().unwrap_or_default();
+        images.insert(name.to_string(), digest.to_string());
     }
-    Ok(refs)
+    Ok(images)
 }
 
 /// Lays a Talos flat image cache (`talosctl images cache-create --layout
