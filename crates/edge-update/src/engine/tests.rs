@@ -576,6 +576,7 @@ pub(crate) struct Spec {
     carried: Option<Vec<String>>,
     /// A partial bundle's list of every ref.
     refs: Option<Vec<String>>,
+    notes: Option<String>,
 }
 
 impl Spec {
@@ -590,6 +591,7 @@ impl Spec {
             format: "2",
             carried: None,
             refs: None,
+            notes: None,
         }
     }
 
@@ -709,6 +711,9 @@ impl Harness {
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
         std::fs::write(src.join("config-patch.yaml"), &s.patch).unwrap();
         std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
+        if let Some(n) = &s.notes {
+            std::fs::write(src.join(crate::bundle::NOTES), n).unwrap();
+        }
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
         let carried = s.carried.clone().unwrap_or_else(|| {
             vec![
@@ -1900,8 +1905,11 @@ async fn an_update_without_a_new_os_skips_its_steps() {
 #[tokio::test]
 async fn verification_says_what_applying_changes() {
     let (mut h, _, _) = happy().await;
-    assert!(h.verify(&newer()).await.is_none());
+    let mut s = newer();
+    s.notes = Some("# 2\n- faster\n".into());
+    assert!(h.verify(&s).await.is_none());
     let r = h.e().record.release.clone().unwrap();
+    assert_eq!(r.notes.as_deref(), Some("# 2\n- faster\n"));
     let checks: Vec<(&str, CheckState)> = r
         .checks
         .iter()
@@ -1925,11 +1933,14 @@ async fn verification_says_what_applying_changes() {
     );
     assert!(d.removals_known && d.reboot && d.config_changes);
     // The last reboot through an update, as the clock saw it.
-    assert!(
-        d.downtime_secs > 0 && d.downtime_secs != REBOOT,
-        "{}",
-        d.downtime_secs
-    );
+    let rebooted = h.e().record.history[0]
+        .steps
+        .iter()
+        .find(|t| t.step == Step::Reboot)
+        .map(|t| t.finished - t.started)
+        .unwrap();
+    assert!(rebooted > 1 && rebooted != REBOOT);
+    assert_eq!(d.downtime_secs, rebooted);
     let changes: Vec<(&str, diff::Change)> = d
         .components
         .iter()
@@ -2084,4 +2095,82 @@ async fn storage_counts_what_a_collection_frees() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("were collected"), "{e}");
+}
+
+#[tokio::test]
+async fn only_a_whole_upload_of_that_bundle_is_verified() {
+    let mut h = Harness::new();
+    let sha = h.upload(&Spec::new("update-new"));
+    let e = h.e().request_verify(&"0".repeat(64)).unwrap_err();
+    assert!(e.to_string().contains("no complete upload"), "{e}");
+    // The same bundle begun again, nothing held yet.
+    h.e().uploads().discard();
+    h.e().uploads().begin(10_000, &sha, "").unwrap();
+    assert!(h.e().request_verify(&sha).is_err());
+}
+
+#[tokio::test]
+async fn an_update_refused_at_apply_is_dated_from_the_apply() {
+    let mut h = Harness::new();
+    assert!(h.verify(&Spec::new("update-new")).await.is_none());
+    h.w().lock.insert("built_epoch".into(), "5000".into());
+    let at = h.clock.fetch_add(3, Ordering::SeqCst) + 3;
+    h.e().request_apply("update-new", "").await.unwrap();
+    h.clock.fetch_add(7, Ordering::SeqCst);
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Refused, "{}", e.detail);
+    assert_eq!((e.started, e.finished), (at, at + 7));
+}
+
+#[test]
+fn progress_is_counted_only_while_started() {
+    let p = Progress::default();
+    assert_eq!(p.now(), None);
+    p.start(100, 7);
+    p.done.fetch_add(40, Ordering::Relaxed);
+    assert_eq!(p.now(), Some((40, 100, 7)));
+    p.start(50, 9);
+    assert_eq!(p.now(), Some((0, 50, 9)), "a new start counts afresh");
+    p.stop();
+    assert_eq!(p.now(), None);
+}
+
+#[tokio::test]
+async fn a_trial_the_judge_holds_with_the_engine_idle_is_asked_of_it() {
+    let (mut h, _, _) = happy().await;
+    judge_takes_requests(&h);
+    h.e().refresh_unit().await;
+    let e = h.e().request_commit("update-new", "ann").await.unwrap_err();
+    assert!(e.to_string().contains("no stack is on trial"), "{e}");
+    {
+        let mut w = h.w();
+        w.judge.insert("trial".into(), "update-other".into());
+        w.tag = "update-new".into();
+    }
+    h.e().refresh_unit().await;
+    assert!(
+        h.e().request_commit("update-other", "ann").await.is_err(),
+        "the unit runs another"
+    );
+    h.w().tag = "update-other".into();
+    h.e().refresh_unit().await;
+    h.e().request_commit("update-other", "ann").await.unwrap();
+    assert_eq!(h.w().judge["request"], "commit update-other");
+    h.w().judge.insert("request".into(), String::new());
+    h.e().request_rollback("update-other", "ann").await.unwrap();
+    assert_eq!(h.w().judge["request"], "rollback update-other");
+}
+
+#[tokio::test]
+async fn the_same_release_again_changes_no_config() {
+    let (mut h, _, _) = happy().await;
+    assert!(h.verify(&Spec::new("update-new")).await.is_none());
+    let d = h.e().record.release.clone().unwrap().diff.unwrap();
+    assert!(!d.config_changes);
+    assert!(
+        d.components
+            .iter()
+            .all(|c| c.change == diff::Change::Unchanged)
+    );
 }

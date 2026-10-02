@@ -460,6 +460,23 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_upload_without_a_head_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let (key, public) = crate::bundle::testkit::keygen(d.path(), "k");
+        let up = checking(d.path(), &public);
+        // The sums and signature alone: it ends before its MANIFEST.
+        let full = signed(d.path(), &key, MF);
+        let cut = full.windows(8).position(|w| w == b"MANIFEST").unwrap() + 2048;
+        let data = &full[..cut];
+        let u = up
+            .begin(data.len() as u64, &hex::encode(sha(data)), "")
+            .unwrap();
+        assert_eq!(u.chunks(), 1);
+        let e = format!("{:#}", put_one(&up, data, 0).unwrap_err());
+        assert!(e.contains("ends before its MANIFEST"), "{e}");
+    }
+
+    #[test]
     fn anothers_live_upload_is_not_replaced() {
         let d = tempfile::tempdir().unwrap();
         let clock = Arc::new(std::sync::atomic::AtomicI64::new(1000));

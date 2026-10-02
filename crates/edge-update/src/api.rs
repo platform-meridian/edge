@@ -1010,6 +1010,8 @@ mod tests {
                 ("healthy_since", "1970-01-01T00:10:00Z"),
                 ("checks", "pass applied\nfail ready: no"),
                 ("requests", "rollback"),
+                ("fail_after_secs", "900"),
+                ("unhealthy_secs", "45"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1030,11 +1032,16 @@ mod tests {
             ("s2", 500, 300, 600)
         );
         assert_eq!(t.checks.len(), 2);
+        assert_eq!((t.fail_after_secs, t.unhealthy_secs), (900, 45));
         assert!(!t.can_commit && t.can_roll_back);
+        s.unit.judge.requests.insert("commit".into());
+        assert!(trial(&s).unwrap().can_commit);
 
         s.record.phase = Phase::Trial;
+        steps::enter(&mut s.record.steps, Step::OsTrial, 700);
         let t = trial(&s).unwrap();
         assert_eq!(t.kind, buffa::EnumValue::from(pb::TrialKind::TRIAL_KIND_OS));
+        assert_eq!((t.stack_tag.as_str(), t.started_unix), ("s2", 700));
         assert!(t.can_roll_back && !t.can_commit);
         s.record.phase = Phase::Settling;
         assert!(!trial(&s).unwrap().can_roll_back, "the OS is committed");
@@ -1045,6 +1052,11 @@ mod tests {
         (s.unit.trial, s.unit.stack_tag) = ("s1".into(), "s1".into());
         let t = trial(&s).unwrap();
         assert_eq!((t.stack_tag.as_str(), t.can_roll_back), ("s1", true));
+        s.unit.judge.requests.clear();
+        assert!(
+            !trial(&s).unwrap().can_roll_back,
+            "the judge takes no rollback"
+        );
     }
 
     #[test]
@@ -1392,6 +1404,202 @@ mod tests {
                 .progress
                 .as_option()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_status_carries_every_part() {
+        let mut s = Snapshot::default();
+        s.record.phase = Phase::Judging {
+            rolled_back: String::new(),
+        };
+        s.record.release = Some(Release {
+            manifest: [("STACK_TAG".to_string(), "s2".to_string())].into(),
+            ..Release::default()
+        });
+        s.record.error = "last one failed".into();
+        s.record.since = 321;
+        s.record.by = "ann".into();
+        steps::enter(&mut s.record.steps, Step::Trial, 300);
+        let up = uploading(None);
+        let st = status(&s, Some(&up), 1000);
+        assert_eq!(
+            st.release.as_option().map(|r| r.stack_tag.as_str()),
+            Some("s2")
+        );
+        assert_eq!(
+            (st.error.as_str(), st.updated_unix),
+            ("last one failed", 321)
+        );
+        assert_eq!(st.upload.as_option().map(|u| u.by.as_str()), Some("ann"));
+        assert_eq!(st.steps.len(), 9, "the trial running, the rest planned");
+        assert_eq!(
+            st.trial.as_option().map(|t| t.stack_tag.as_str()),
+            Some("s2")
+        );
+        assert_eq!(st.lock.as_option().map(|l| l.by.as_str()), Some("ann"));
+
+        let e = entry(&Entry {
+            release: s.record.release.clone(),
+            outcome: Outcome::Committed,
+            detail: String::new(),
+            started: 1,
+            finished: 2,
+            snapshot: None,
+            steps: Vec::new(),
+            log: Vec::new(),
+            by: String::new(),
+            rollback_reason: String::new(),
+        });
+        assert_eq!(
+            e.release.as_option().map(|r| r.stack_tag.as_str()),
+            Some("s2")
+        );
+        let r = Record {
+            log: vec![crate::engine::LogLine {
+                unix: 42,
+                text: "x".into(),
+            }],
+            ..Record::default()
+        };
+        assert_eq!(log(&r, 0).unwrap()[0].unix, 42);
+    }
+
+    #[tokio::test]
+    async fn trial_actions_storage_and_cleanup_reach_the_engine_and_answer() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, publish, mut rx) = serve(d.path()).await;
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let busy = |by: String| Snapshot {
+                    record: Record {
+                        phase: Phase::Importing,
+                        by,
+                        ..Record::default()
+                    },
+                    ..Snapshot::default()
+                };
+                match cmd {
+                    Command::Apply(_, by, reply) | Command::Commit(_, by, reply) => {
+                        publish.send_replace(busy(by));
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::RollBack(tag, by, reply) => {
+                        publish.send_replace(busy(by));
+                        let _ = reply.send(Ok(tag));
+                    }
+                    Command::Storage(reply) => {
+                        let _ = reply.send(Ok(Storage {
+                            held: 4,
+                            previous: 3,
+                            reclaimable: 2,
+                            free: 1,
+                        }));
+                    }
+                    Command::Collect(previous, reply) => {
+                        let _ = reply.send(Ok(if previous { 9 } else { 8 }));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+        let by = |r: Option<String>| r;
+        let s = c
+            .apply(pb::ApplyRequest {
+                stack_tag: "s2".into(),
+                by: "ann".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned()
+            .status;
+        assert_eq!(
+            by(s.lock.as_option().map(|l| l.by.clone())).as_deref(),
+            Some("ann")
+        );
+        let s = c
+            .commit_trial(pb::CommitTrialRequest {
+                stack_tag: "s2".into(),
+                by: "bob".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned()
+            .status;
+        assert_eq!(s.lock.as_option().map(|l| l.by.as_str()), Some("bob"));
+        let s = c
+            .roll_back(pb::RollBackRequest {
+                stack_tag: "s2".into(),
+                by: "cy".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned()
+            .status;
+        assert_eq!(s.lock.as_option().map(|l| l.by.as_str()), Some("cy"));
+        let st = c
+            .get_storage(pb::GetStorageRequest::default())
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            (
+                st.held_bytes,
+                st.previous_bytes,
+                st.reclaimable_bytes,
+                st.free_bytes
+            ),
+            (4, 3, 2, 1)
+        );
+        for (previous, freed) in [(false, 8), (true, 9)] {
+            let got = c
+                .collect_garbage(pb::CollectGarbageRequest {
+                    previous,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_owned();
+            assert_eq!(got.freed_bytes, freed);
+        }
+        let l = c
+            .get_log(pb::GetLogRequest {
+                started_unix: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(l.code, connectrpc::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_log_comes_over_the_wire() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, publish, _rx) = serve(d.path()).await;
+        publish.send_replace(Snapshot {
+            record: Record {
+                log: vec![crate::engine::LogLine {
+                    unix: 7,
+                    text: "verifying".into(),
+                }],
+                ..Record::default()
+            },
+            ..Snapshot::default()
+        });
+        let got = c
+            .get_log(pb::GetLogRequest::default())
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            got.lines
+                .iter()
+                .map(|l| (l.unix, l.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(7, "verifying")]
         );
     }
 }
