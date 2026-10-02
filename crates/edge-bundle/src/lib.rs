@@ -2,7 +2,7 @@
 //! the sums name. Nothing past the first two entries is written anywhere until
 //! the signature has verified against the pinned key.
 //!
-//! - `MANIFEST`: `KEY=value` lines. `FORMAT=2`, `STACK_TAG`, `STACK_DIGEST`,
+//! - `MANIFEST`: `KEY=value` lines. `FORMAT=2` (`3` with `refs`), `STACK_TAG`, `STACK_DIGEST`,
 //!   `INSTALLER_REF` (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version
 //!   anti-rollback compares), `SECUREBOOT`; optionally `STACK_PATH`, and
 //!   `LOCK_<KEY>=v`, which the unit's stack lock must match.
@@ -12,6 +12,8 @@
 //! - `images/`: an OCI image layout holding every image, the installer and the
 //!   stack artifact, each named in its index by `io.containerd.image.name`
 //!   (`oci`).
+//! - optionally `refs`: every ref the release runs, one per line, when the
+//!   layout carries only those the unit lacks (a partial bundle).
 //!
 //! A build writes one with [`write`]; a unit reads one with [`unpack`] and
 //! [`check`].
@@ -38,6 +40,7 @@ pub const MANIFEST: &str = "MANIFEST";
 pub const PATCH: &str = "config-patch.yaml";
 pub const SEED: &str = "seed.yaml";
 pub const IMAGES: &str = "images";
+pub const REFS: &str = "refs";
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIG: u64 = 64 << 10;
@@ -282,7 +285,51 @@ pub fn check(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
     machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
     let refs = layout_refs(&dir.join(IMAGES))?;
     ensure!(!refs.is_empty(), "the image layout names no image");
+    if let Some(listed) = listed_refs(dir)? {
+        unlisted(&refs, &listed)?;
+    }
     Ok(refs)
+}
+
+/// Every ref the release runs: its `refs`, else its layout's.
+pub fn release_refs(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
+    match listed_refs(dir)? {
+        Some(r) => Ok(r),
+        None => layout_refs(&dir.join(IMAGES)),
+    }
+}
+
+/// An unpacked bundle's `refs`, if it has one.
+pub fn listed_refs(dir: &Path) -> anyhow::Result<Option<BTreeSet<String>>> {
+    match std::fs::read_to_string(dir.join(REFS)) {
+        Ok(t) => parse_refs(&t).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("reading the refs"),
+    }
+}
+
+fn parse_refs(text: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for r in text.lines() {
+        ensure!(
+            !r.is_empty() && !r.contains(char::is_whitespace),
+            "{REFS} line {r:?} is not one ref"
+        );
+        ensure!(out.insert(r.to_string()), "{REFS} names {r} twice");
+    }
+    ensure!(!out.is_empty(), "{REFS} names no image");
+    Ok(out)
+}
+
+/// A carried image the list leaves out would be imported and then collected.
+fn unlisted(carried: &BTreeSet<String>, listed: &BTreeSet<String>) -> anyhow::Result<()> {
+    let missing: Vec<&str> = carried.difference(listed).map(String::as_str).collect();
+    ensure!(
+        missing.is_empty(),
+        "{REFS} leaves out images the layout carries: {}",
+        missing.join(", ")
+    );
+    Ok(())
 }
 
 /// What a build puts in a bundle.
@@ -293,6 +340,8 @@ pub struct Contents<'a> {
     pub seed: &'a str,
     /// An OCI image layout ([`oci::from_flat_cache`]).
     pub images: &'a Path,
+    /// Every ref the release runs, when `images` carries only some of them.
+    pub refs: Option<&'a BTreeSet<String>>,
 }
 
 enum Source {
@@ -321,10 +370,12 @@ impl Source {
 /// what a unit would refuse.
 pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> anyhow::Result<()> {
     machineconfig::check_patch(contents.patch)?;
-    ensure!(
-        !layout_refs(contents.images)?.is_empty(),
-        "the image layout names no image"
-    );
+    let carried = layout_refs(contents.images)?;
+    ensure!(!carried.is_empty(), "the image layout names no image");
+    if let Some(refs) = contents.refs {
+        let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
+        unlisted(&carried, &parse_refs(&text)?)?;
+    }
     let mut files = BTreeMap::new();
     files.insert(
         MANIFEST.to_string(),
@@ -335,6 +386,10 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
         Source::Bytes(contents.patch.as_bytes().into()),
     );
     files.insert(SEED.into(), Source::Bytes(contents.seed.as_bytes().into()));
+    if let Some(refs) = contents.refs {
+        let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
+        files.insert(REFS.into(), Source::Bytes(text.into_bytes()));
+    }
     for p in walk(contents.images)? {
         let name = Path::new(IMAGES).join(p.strip_prefix(contents.images)?);
         let name = name.to_str().context("an image layout path is not UTF-8")?;
@@ -556,6 +611,44 @@ mod tests {
         drop(b);
         let r = unpack(&t, &c.out(), &Verifier::new(&c.public, NAMESPACE).unwrap());
         refused(&c, r, "not a regular file");
+    }
+
+    #[test]
+    fn a_units_list_must_name_what_the_layout_carries() {
+        let c = Case::new();
+        std::fs::write(c.src().join(REFS), "registry.example/base:v1\n").unwrap();
+        seal(&c.src(), &c.key, NAMESPACE);
+        c.open(HEAD).unwrap();
+        let e = format!("{:#}", check(&c.out()).unwrap_err());
+        assert!(e.contains("registry.example/app:v2"), "{e}");
+
+        std::fs::write(
+            c.src().join(REFS),
+            "registry.example/app:v2\nregistry.example/installer@sha256:bb\nregistry.example/base:v1\n",
+        )
+        .unwrap();
+        seal(&c.src(), &c.key, NAMESPACE);
+        c.open(HEAD).unwrap();
+        assert_eq!(check(&c.out()).unwrap().len(), 2);
+        assert_eq!(release_refs(&c.out()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_unreadable_list_is_no_full_bundle() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(listed_refs(d.path()).unwrap(), None);
+        std::fs::write(d.path().join(REFS), b"\xff\xfe\n").unwrap();
+        assert!(listed_refs(d.path()).is_err());
+        assert!(release_refs(d.path()).is_err());
+    }
+
+    #[test]
+    fn a_refs_line_is_one_ref() {
+        assert!(parse_refs("a:1\na:1\n").is_err());
+        assert!(parse_refs("a:1\n\nb:2\n").is_err());
+        assert!(parse_refs("a:1 b:2\n").is_err());
+        assert!(parse_refs("").is_err());
+        assert_eq!(parse_refs("b:2\na:1\n").unwrap().len(), 2);
     }
 
     #[test]

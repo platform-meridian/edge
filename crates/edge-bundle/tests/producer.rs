@@ -3,8 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use std::collections::BTreeSet;
+
 use edge_bundle::{
-    Contents, Manifest, SigningKey, Verifier, check, machineconfig, oci, unpack, write,
+    Contents, Manifest, SigningKey, Verifier, check, listed_refs, machineconfig, oci, release_refs,
+    unpack, write,
 };
 use sha2::{Digest, Sha256};
 
@@ -108,6 +111,7 @@ impl Build {
             patch: &self.patch,
             seed: "kind: ConfigMap\n",
             images: &self.images,
+            refs: None,
         }
     }
 
@@ -254,6 +258,45 @@ fn a_build_refuses_what_a_unit_would() {
 
     std::os::unix::fs::symlink("/etc/passwd", b.path("images/link")).unwrap();
     assert!(err(write(&b.contents(), &b.key, 0, &out)).contains("not a regular file"));
+    assert!(!out.exists());
+}
+
+#[test]
+fn a_partial_bundle_lists_what_it_does_not_carry() {
+    let b = Build::new();
+    let mut all: BTreeSet<String> = b.refs.iter().cloned().collect();
+    all.insert("registry.example/base:v1".into());
+    let mut c = b.contents();
+    c.refs = Some(&all);
+    let out = b.path("partial.tar");
+    write(&c, &b.key, 0, &out).unwrap();
+    b.open(&out).unwrap();
+    let dest = b.path("unpacked");
+    let carried = check(&dest).unwrap();
+    assert_eq!(carried.into_iter().collect::<Vec<_>>(), b.refs);
+    assert_eq!(listed_refs(&dest).unwrap().as_ref(), Some(&all));
+    assert_eq!(release_refs(&dest).unwrap(), all);
+
+    let full = b.write("full.tar");
+    b.open(&full).unwrap();
+    assert_eq!(listed_refs(&dest).unwrap(), None);
+    assert_eq!(
+        release_refs(&dest).unwrap().into_iter().collect::<Vec<_>>(),
+        b.refs
+    );
+}
+
+#[test]
+fn a_list_must_name_every_carried_image() {
+    let b = Build::new();
+    let out = b.path("b.tar");
+    let some: BTreeSet<String> = ["registry.example/base:v1".to_string()].into();
+    let mut c = b.contents();
+    c.refs = Some(&some);
+    assert!(err(write(&c, &b.key, 0, &out)).contains("leaves out images the layout carries"));
+    let none = BTreeSet::new();
+    c.refs = Some(&none);
+    assert!(err(write(&c, &b.key, 0, &out)).contains("names no image"));
     assert!(!out.exists());
 }
 

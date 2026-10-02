@@ -65,6 +65,8 @@ pub trait Registry: Send + Sync {
     fn import(&self, layout: &Path) -> anyhow::Result<()>;
     /// Drops every image `keep` does not name, and whatever only they held.
     fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<()>;
+    /// Whether the store holds the image a ref names.
+    fn holds(&self, image: &str) -> bool;
 }
 
 /// `namespace/name`.

@@ -33,6 +33,18 @@ impl crate::unit::Registry for Registry {
         tracing::info!(?swept, "collected what no kept release names");
         Ok(())
     }
+
+    fn holds(&self, image: &str) -> bool {
+        let Ok(i) = image.parse::<ImageRef>() else {
+            return false;
+        };
+        let reference = match (&i.digest, &i.tag) {
+            (Some(d), _) => d.to_string(),
+            (None, Some(t)) => t.clone(),
+            (None, None) => return false,
+        };
+        self.0.resolve(&i.repo, &reference).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +116,10 @@ mod tests {
         let held = held(&root);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held.iter().all(|h| !h.contains(":t1")), "{held:?}");
+        assert!(r.holds("127.0.0.1:5999/app:t2"));
+        assert!(!r.holds("127.0.0.1:5999/app:t1"));
+        assert!(!r.holds("127.0.0.1:5999/other:t2"));
+        assert!(!r.holds("not a ref!"));
         let blob = |b: &[u8]| {
             Store::open(&root)
                 .unwrap()

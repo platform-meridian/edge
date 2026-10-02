@@ -492,6 +492,9 @@ impl Registry for FakeRegistry {
         }
         Ok(())
     }
+    fn holds(&self, image: &str) -> bool {
+        self.0.lock().unwrap().held.contains(image)
+    }
 }
 
 pub(crate) struct Harness {
@@ -510,6 +513,11 @@ pub(crate) struct Spec {
     secureboot: &'static str,
     extra: String,
     patch: String,
+    format: &'static str,
+    /// What the layout carries; default: the release's app and judge, and a shared base.
+    carried: Option<Vec<String>>,
+    /// A partial bundle's list of every ref.
+    refs: Option<Vec<String>>,
 }
 
 impl Spec {
@@ -521,9 +529,27 @@ impl Spec {
             secureboot: "1",
             extra: "LOCK_PROFILE=edge\nSTACK_PATH=./base\n".into(),
             patch: patch(tag),
+            format: "2",
+            carried: None,
+            refs: None,
+        }
+    }
+
+    /// Carries its app and judge, and relies on the shared base it lists.
+    fn partial(tag: &str) -> Self {
+        let own = [format!("reg/app:{tag}"), format!("reg/judge:{tag}")];
+        let mut refs = own.to_vec();
+        refs.push(BASE.into());
+        Self {
+            format: "3",
+            carried: Some(own.to_vec()),
+            refs: Some(refs),
+            ..Self::new(tag)
         }
     }
 }
+
+const BASE: &str = "reg/base@sha256:shared";
 
 fn seed(tag: &str) -> String {
     format!(
@@ -618,20 +644,31 @@ impl Harness {
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(src.join("images/blobs/sha256")).unwrap();
         let mf = format!(
-            "FORMAT=2\nSTACK_TAG={}\nSTACK_DIGEST={DIGEST}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
+            "FORMAT={}\nSTACK_TAG={}\nSTACK_DIGEST={DIGEST}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
              TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
-            s.tag, s.tag, s.talos, s.epoch, s.secureboot, s.extra
+            s.format, s.tag, s.tag, s.talos, s.epoch, s.secureboot, s.extra
         );
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
         std::fs::write(src.join("config-patch.yaml"), &s.patch).unwrap();
         std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
-        let index = serde_json::json!({"manifests": [
-            {"annotations": {"io.containerd.image.name": format!("reg/app:{}", s.tag)}},
-            {"annotations": {"io.containerd.image.name": format!("reg/judge:{}", s.tag)}},
-            {"annotations": {"io.containerd.image.name": "reg/base@sha256:shared"}},
-        ]});
+        let carried = s.carried.clone().unwrap_or_else(|| {
+            vec![
+                format!("reg/app:{}", s.tag),
+                format!("reg/judge:{}", s.tag),
+                BASE.into(),
+            ]
+        });
+        let manifests: Vec<_> = carried
+            .iter()
+            .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}}))
+            .collect();
+        let index = serde_json::json!({ "manifests": manifests });
         std::fs::write(src.join("images/index.json"), index.to_string()).unwrap();
+        if let Some(refs) = &s.refs {
+            let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
+            std::fs::write(src.join(crate::bundle::REFS), text).unwrap();
+        }
         std::fs::write(src.join("images/blobs/sha256/aa"), &s.tag).unwrap();
         testkit::seal(&src, key, testkit::NAMESPACE);
         let tar = self.dir.path().join("bundle.tar");
@@ -1033,6 +1070,82 @@ async fn registry_keeps_two_releases_and_what_runs() {
         .map(String::from)
         .collect()
     );
+}
+
+#[tokio::test]
+async fn partial_bundles_keep_what_they_rely_on() {
+    let mut h = Harness::new();
+    for (i, s) in [
+        Spec::new("update-a"),
+        Spec::partial("update-b"),
+        Spec::partial("update-c"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut s = s;
+        s.epoch = 2000 + i as i64 * 10;
+        h.w()
+            .lock
+            .insert("built_epoch".into(), (s.epoch - 1).to_string());
+        let e = h.update(&s, |_, _| {}).await;
+        assert_eq!(e.outcome, Outcome::Committed, "{}: {}", s.tag, e.detail);
+        assert!(h.w().held.contains(BASE), "{} collected the base", s.tag);
+    }
+    let c = h.e().record.history[0].release.clone().unwrap();
+    assert!(c.refs.contains(BASE));
+    assert!(!h.w().held.contains("reg/app:update-a"));
+}
+
+#[tokio::test]
+async fn a_partial_bundle_needs_what_it_does_not_carry() {
+    let mut h = Harness::new();
+    refused(
+        &mut h,
+        &Spec::partial("update-new"),
+        &format!("does not hold: {BASE}"),
+    )
+    .await;
+
+    h.w().held.insert(BASE.into());
+    let e = h.update(&Spec::partial("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+}
+
+#[tokio::test]
+async fn a_partial_bundle_keeps_what_a_failed_release_left_it() {
+    let mut h = Harness::new();
+    h.w().verdict = Verdict::Bad;
+    let e = h.update(&Spec::new("update-a"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert!(h.w().held.contains(BASE));
+
+    h.w().verdict = Verdict::Good;
+    let mut s = Spec::partial("update-b");
+    s.epoch = 2010;
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert!(
+        h.w().held.contains(BASE),
+        "the import collected what it runs on"
+    );
+}
+
+#[tokio::test]
+async fn the_format_says_whether_refs_are_listed() {
+    let mut h = Harness::new();
+    let mut s = Spec::partial("update-new");
+    s.format = "2";
+    refused(&mut h, &s, "a format 2 bundle carries every image").await;
+
+    let mut s = Spec::new("update-new");
+    s.format = "3";
+    refused(&mut h, &s, "a format 3 bundle lists its refs").await;
+
+    let mut s = Spec::new("update-new");
+    s.format = "4";
+    refused(&mut h, &s, "not 2 or 3").await;
 }
 
 #[tokio::test]

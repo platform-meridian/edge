@@ -497,7 +497,7 @@ impl Engine {
         let unpacked =
             tokio::task::spawn_blocking(move || bundle::unpack(&bundle, &d, &verifier)).await?;
         let release = match unpacked.and_then(|manifest| {
-            let refs = bundle::layout_refs(&dir.join(bundle::IMAGES))?;
+            let refs = bundle::release_refs(&dir)?;
             Ok(Release {
                 sha256: sha.into(),
                 manifest,
@@ -543,10 +543,30 @@ impl Engine {
         ] {
             ensure!(!rel.get(k).is_empty(), "the MANIFEST lacks {k}");
         }
+        let dir = self.release_dir(&rel.sha256);
+        let listed = bundle::listed_refs(&dir)?.is_some();
+        match rel.get("FORMAT") {
+            "2" => ensure!(
+                !listed,
+                "a format 2 bundle carries every image, and this one lists refs"
+            ),
+            "3" => ensure!(
+                listed,
+                "a format 3 bundle lists its refs, and this one does not"
+            ),
+            f => anyhow::bail!("the bundle is format {f}, not 2 or 3"),
+        }
+        let carried = bundle::layout_refs(&dir.join(bundle::IMAGES))?;
+        let lacking: Vec<&str> = rel
+            .refs
+            .iter()
+            .filter(|r| !carried.contains(*r) && !self.registry.holds(r))
+            .map(String::as_str)
+            .collect();
         ensure!(
-            rel.get("FORMAT") == "2",
-            "the bundle is format {}, not 2",
-            rel.get("FORMAT")
+            lacking.is_empty(),
+            "the bundle relies on images the unit does not hold: {}",
+            lacking.join(", ")
         );
         ensure!(
             rel.get("INSTALLER_REF").contains("@sha256:"),
@@ -743,7 +763,10 @@ impl Engine {
 
     async fn importing(&mut self) -> anyhow::Result<Next> {
         self.detail = "importing the images".into();
-        let keep = self.keep(self.committed_refs(2)).await?;
+        let mut keep = self.committed_refs(2);
+        // A partial bundle's release runs on images an older release brought.
+        keep.extend(self.release()?.refs.iter().cloned());
+        let keep = self.keep(keep).await?;
         let layout = self
             .release_dir(&self.release()?.sha256)
             .join(bundle::IMAGES);
