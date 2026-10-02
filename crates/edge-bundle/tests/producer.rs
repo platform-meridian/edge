@@ -147,6 +147,12 @@ fn err<T>(r: anyhow::Result<T>) -> String {
 fn a_written_bundle_unpacks_as_a_unit_reads_it() {
     let b = Build::new();
     let tar = b.write("b.tar");
+    let read = std::sync::atomic::AtomicU64::new(0);
+    let v = Verifier::new(&b.public, NS).unwrap();
+    edge_bundle::unpack_counting(&tar, &b.path("counted"), &v, &read).unwrap();
+    // All but the tar's closing padding.
+    let (read, len) = (read.into_inner(), std::fs::metadata(&tar).unwrap().len());
+    assert!(read <= len && read + 10240 >= len, "{read} of {len}");
     assert_eq!(b.open(&tar).unwrap(), b.manifest);
     let dest = b.path("unpacked");
     let refs = check(&dest).unwrap();

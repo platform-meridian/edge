@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
@@ -203,8 +204,19 @@ fn read_small(entry: &mut impl Read, size: u64, max: u64, what: &str) -> anyhow:
 /// Verifies `tar` against `verifier` and unpacks it into `dest`, which must
 /// not exist. On any failure `dest` is removed.
 pub fn unpack(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
+    unpack_counting(tar, dest, verifier, &AtomicU64::new(0))
+}
+
+/// [`unpack`], adding to `read` each byte of the bundle as it is read.
+pub fn unpack_counting(
+    tar: &Path,
+    dest: &Path,
+    verifier: &Verifier,
+    read: &AtomicU64,
+) -> anyhow::Result<Manifest> {
     ensure!(!dest.exists(), "{} already exists", dest.display());
-    let r = unpack_into(tar, dest, verifier);
+    let file = File::open(tar).context("open the bundle")?;
+    let r = unpack_into(Counting { inner: file, read }, dest, verifier);
     if r.is_err() {
         let _ = std::fs::remove_dir_all(dest);
     }
@@ -322,8 +334,21 @@ fn head_of(start: &mut impl Read, verifier: &Verifier) -> anyhow::Result<Head> {
     Ok(head)
 }
 
-fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
-    let mut archive = tar::Archive::new(File::open(tar).context("open the bundle")?);
+struct Counting<'a, R> {
+    inner: R,
+    read: &'a AtomicU64,
+}
+
+impl<R: Read> Read for Counting<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+fn unpack_into(tar: impl Read, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
+    let mut archive = tar::Archive::new(tar);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
     let sums = signed_sums(&mut entries, verifier)?;
 
