@@ -12,6 +12,7 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::bundle::testkit;
+use crate::judge::CheckState;
 use crate::unit::{Ref, Stack};
 
 pub(crate) const OLD_TAG: &str = "update-old";
@@ -98,6 +99,7 @@ pub(crate) struct World {
     judge_idle: bool,
     apid_down: bool,
     apiserver_down: bool,
+    registry_free: u64,
 }
 
 impl World {
@@ -145,6 +147,7 @@ impl World {
             judge_idle: false,
             apid_down: false,
             apiserver_down: false,
+            registry_free: 1 << 40,
         }
     }
 
@@ -229,9 +232,25 @@ impl World {
         self.blessed_boot = Some(self.boot_id);
     }
 
-    /// The stack judge: a new ref is committed or rolled back after a few looks.
+    /// The stack judge: a new ref is committed or rolled back after a few
+    /// looks, or at once when asked.
     fn tick_judge(&mut self) {
         let good = self.judge.get("good").cloned().unwrap_or_default();
+        let asked = self.judge.insert("request".into(), String::new());
+        match asked.as_deref().and_then(|r| r.split_once(' ')) {
+            Some((what, tag)) if tag == self.tag && tag != good => {
+                if what == "commit" {
+                    self.judge.insert("previous".into(), good);
+                    self.judge.insert("good".into(), self.tag.clone());
+                } else {
+                    self.judge
+                        .insert("rolled_back".into(), format!("{} 12:00", self.tag));
+                    self.tag = good;
+                }
+                return;
+            }
+            _ => {}
+        }
         if self.tag == good || self.judge_idle {
             return;
         }
@@ -363,6 +382,19 @@ impl Talos for FakeTalos {
         w.power_cycle();
         w.change("reboot".into())
     }
+    async fn rollback(&self) -> anyhow::Result<()> {
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        let previous = w
+            .entries
+            .iter()
+            .find(|(id, (_, tries))| tries.is_none() && !id.eq_ignore_ascii_case(&w.default))
+            .map(|(id, _)| id.clone())
+            .context("no previous entry")?;
+        w.default = previous;
+        w.power_cycle();
+        w.change("rollback".into())
+    }
     async fn shutdown(&self) -> anyhow::Result<()> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
@@ -385,6 +417,16 @@ impl Cluster for FakeCluster {
             }
             _ => None,
         })
+    }
+    async fn set_key(&self, at: &Ref, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        assert_eq!(at.name, "judge");
+        w.judge.insert(key.into(), value.into());
+        w.change(format!("judge {key}={value}"))
+    }
+    async fn flux_version(&self, _: &Ref) -> anyhow::Result<String> {
+        Ok("v2.6.4".into())
     }
     async fn sync(&self, _: &Ref) -> anyhow::Result<(String, String)> {
         let mut w = self.0.lock().unwrap();
@@ -482,7 +524,7 @@ impl Registry for FakeRegistry {
         w.held.extend(refs);
         w.change("import".into())
     }
-    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<()> {
+    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
         let before = w.held.len();
@@ -490,10 +532,26 @@ impl Registry for FakeRegistry {
         if w.held.len() != before {
             w.change("collect".into())?;
         }
-        Ok(())
+        Ok(((before - w.held.len()) * 100) as u64)
     }
-    fn holds(&self, image: &str) -> bool {
-        self.0.lock().unwrap().held.contains(image)
+    fn reclaimable(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
+        let w = self.0.lock().unwrap();
+        Ok((w.held.iter().filter(|r| !keep.contains(*r)).count() * 100) as u64)
+    }
+    fn usage(&self) -> anyhow::Result<(u64, u64)> {
+        let w = self.0.lock().unwrap();
+        Ok(((w.held.len() * 100) as u64, w.registry_free))
+    }
+    fn missing(&self, layout: &Path) -> anyhow::Result<u64> {
+        let refs = crate::bundle::layout_refs(layout)?;
+        let w = self.0.lock().unwrap();
+        Ok((refs.iter().filter(|r| !w.held.contains(*r)).count() * 100) as u64)
+    }
+    fn digest(&self, image: &str) -> Option<String> {
+        let w = self.0.lock().unwrap();
+        w.held
+            .contains(image)
+            .then(|| format!("sha256:{}", image.len()))
     }
 }
 
@@ -676,11 +734,14 @@ impl Harness {
         let data = std::fs::read(&tar).unwrap();
         let sha = crate::upload::hash_file(&tar).unwrap();
         let up = self.e().uploads();
-        up.begin(data.len() as u64, &sha).unwrap();
+        up.begin(data.len() as u64, &sha, "").unwrap();
         let chunk = crate::upload::CHUNK as usize;
         for (i, c) in data.chunks(chunk).enumerate() {
             use sha2::Digest;
-            up.put(&sha, i as u32, c, &sha2::Sha256::digest(c)).unwrap();
+            // A bundle refused as it arrives is sent no further.
+            if up.put(&sha, i as u32, c, &sha2::Sha256::digest(c)).is_err() {
+                break;
+            }
         }
         sha
     }
@@ -722,7 +783,7 @@ impl Harness {
             "refused: {:?}",
             self.e().record.history.first()
         );
-        self.e().request_apply(&s.tag).await.unwrap();
+        self.e().request_apply(&s.tag, "").await.unwrap();
         self.run(interrupt).await;
         self.e().record.history[0].clone()
     }
@@ -913,7 +974,7 @@ async fn a_power_cut_after_any_phase_converges() {
             .await;
         if e.outcome != Outcome::Committed {
             // A cut on trial reverts the OS; nothing else may have moved.
-            assert_eq!(e.outcome, Outcome::Failed);
+            assert_eq!(e.outcome, Outcome::RolledBack);
             assert!(
                 e.detail.contains("previous OS"),
                 "cut after phase {k}: {}",
@@ -922,7 +983,7 @@ async fn a_power_cut_after_any_phase_converges() {
             assert_eq!(h.w().tag, OLD_TAG, "cut after phase {k}");
             assert_eq!(h.w().active, UNIT_CONFIG, "cut after phase {k}");
             assert!(!h.w().committed_new());
-            h.e().request_apply("update-new").await.unwrap();
+            h.e().request_apply("update-new", "").await.unwrap();
             h.run(|_, _| {}).await;
             let e = h.e().record.history[0].clone();
             assert_eq!(
@@ -941,7 +1002,7 @@ async fn a_new_os_that_does_not_stay_up_stops_the_update() {
     let mut h = Harness::new();
     h.w().trial_fails = true;
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Failed);
+    assert_eq!(e.outcome, Outcome::RolledBack);
     assert!(e.detail.contains("did not stay up"), "{}", e.detail);
     assert!(
         e.detail
@@ -972,7 +1033,7 @@ async fn cut_after_saving_keeps_unit_config() {
             w.cut_on_crash = true;
         }
         let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-        assert_eq!(e.outcome, Outcome::Failed, "cut after change {n}");
+        assert_eq!(e.outcome, Outcome::RolledBack, "cut after change {n}");
         assert!(
             e.detail.contains("is back"),
             "cut after change {n}: {}",
@@ -997,7 +1058,7 @@ async fn crash_in_restore_restores_again() {
             w.cut_on_crash = cut;
         }
         let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-        assert_eq!(e.outcome, Outcome::Failed);
+        assert_eq!(e.outcome, Outcome::RolledBack);
         assert!(e.detail.contains("is back"), "{}", e.detail);
         assert!(!h.saved().exists());
         let w = h.w();
@@ -1028,6 +1089,20 @@ async fn commit_deletes_saved_config() {
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
     assert!(seen);
     assert!(!h.saved().exists(), "the saved config outlived the update");
+}
+
+#[tokio::test]
+async fn a_stack_the_judge_rolls_back_fails_the_update() {
+    let mut h = Harness::new();
+    h.w().verdict = Verdict::Bad;
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::RolledBack);
+    assert!(e.detail.contains("rolled the stack back"), "{}", e.detail);
+    assert_eq!(h.w().tag, OLD_TAG);
+    assert!(
+        h.e().record.release.is_some(),
+        "a failed update stays applicable"
+    );
 }
 
 #[tokio::test]
@@ -1118,7 +1193,7 @@ async fn a_partial_bundle_keeps_what_a_failed_release_left_it() {
     let mut h = Harness::new();
     h.w().verdict = Verdict::Bad;
     let e = h.update(&Spec::new("update-a"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert!(h.w().held.contains(BASE));
 
     h.w().verdict = Verdict::Good;
@@ -1143,9 +1218,13 @@ async fn the_format_says_whether_refs_are_listed() {
     s.format = "3";
     refused(&mut h, &s, "a format 3 bundle lists its refs").await;
 
+    // Refused by its head, as it arrives.
     let mut s = Spec::new("update-new");
     s.format = "4";
-    refused(&mut h, &s, "not 2 or 3").await;
+    let sha = h.upload(&s);
+    let up = h.e().uploads().current().unwrap();
+    assert!(up.refused.contains("not 2 or 3"), "{}", up.refused);
+    assert!(h.e().request_verify(&sha).is_err());
 }
 
 #[tokio::test]
@@ -1153,7 +1232,7 @@ async fn failed_update_keeps_its_judge_image() {
     let mut h = Harness::new();
     h.w().verdict = Verdict::Bad;
     let e = h.update(&Spec::new("update-a"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert_eq!(h.w().judge_image, "reg/judge:update-a");
 
     h.w().verdict = Verdict::Good;
@@ -1237,7 +1316,7 @@ async fn a_unit_on_trial_verifies_but_waits_to_apply() {
     }
     let s = Spec::new("update-new");
     assert_eq!(h.verify(&s).await, None, "verify was refused");
-    let e = h.e().request_apply(&s.tag).await.unwrap_err();
+    let e = h.e().request_apply(&s.tag, "").await.unwrap_err();
     assert!(e.to_string().contains("on trial"), "{e}");
     assert_eq!(h.e().record.phase, Phase::Idle);
     assert!(h.e().record.history.is_empty());
@@ -1246,7 +1325,7 @@ async fn a_unit_on_trial_verifies_but_waits_to_apply() {
     h.w().power_cycle();
     h.w().power_cycle();
     assert_eq!(h.w().selected, "talos-v1.14.1.efi");
-    h.e().request_apply(&s.tag).await.unwrap();
+    h.e().request_apply(&s.tag, "").await.unwrap();
     h.run(|_, _| {}).await;
     assert_eq!(h.e().record.history[0].outcome, Outcome::Committed);
 }
@@ -1264,7 +1343,7 @@ async fn a_bless_recorded_on_an_earlier_boot_is_not_this_ones() {
     }
     let s = Spec::new("update-new");
     assert_eq!(h.verify(&s).await, None, "verify was refused");
-    let e = h.e().request_apply(&s.tag).await.unwrap_err();
+    let e = h.e().request_apply(&s.tag, "").await.unwrap_err();
     assert!(e.to_string().contains("on trial"), "{e}");
 
     // The record names this boot: blessed, while LoaderBootCountPath stays set.
@@ -1273,7 +1352,7 @@ async fn a_bless_recorded_on_an_earlier_boot_is_not_this_ones() {
         w.blessed_boot = Some(w.boot_id);
         assert!(!w.count_path.is_empty());
     }
-    h.e().request_apply(&s.tag).await.unwrap();
+    h.e().request_apply(&s.tag, "").await.unwrap();
 }
 
 #[tokio::test]
@@ -1300,11 +1379,10 @@ async fn a_bundle_signed_by_another_key_is_refused_before_any_call() {
     let mut h = Harness::new();
     let (other, _) = testkit::keygen(h.dir.path(), "other");
     let sha = h.upload_signed(&Spec::new("update-new"), &other);
-    h.e().request_verify(&sha).unwrap();
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Refused);
-    assert!(e.detail.contains("pinned update key"), "{}", e.detail);
+    let up = h.e().uploads().current().unwrap();
+    assert!(up.refused.contains("pinned update key"), "{}", up.refused);
+    assert!(h.e().request_verify(&sha).is_err());
+    assert!(h.e().record.history.is_empty());
     assert_eq!(
         h.w().calls,
         0,
@@ -1436,7 +1514,7 @@ async fn an_install_that_never_succeeds_stops_it() {
     assert!(h.e().record.history[0].snapshot.is_some());
 
     h.w().install_fails = false;
-    h.e().request_apply("update-new").await.unwrap();
+    h.e().request_apply("update-new", "").await.unwrap();
     assert!(
         h.e().record.error.is_empty(),
         "a new apply kept the old error"
@@ -1510,7 +1588,8 @@ async fn nothing_else_is_taken_while_an_update_runs() {
         .update(&Spec::new("update-new"), |h, n| {
             if n == 1 {
                 let sha = h.e().record.release.clone().unwrap().sha256;
-                refused = futures::executor::block_on(h.e().request_apply("update-new")).is_err()
+                refused = futures::executor::block_on(h.e().request_apply("update-new", ""))
+                    .is_err()
                     && h.e().request_verify(&sha).is_err();
             }
         })
@@ -1571,7 +1650,7 @@ async fn revert_while_away_restores_config() {
             }
         })
         .await;
-    assert_eq!(e.outcome, Outcome::Failed);
+    assert_eq!(e.outcome, Outcome::RolledBack);
     assert!(
         e.detail.contains("went back to its previous OS"),
         "{}",
@@ -1586,11 +1665,11 @@ async fn a_stack_rolled_back_once_can_be_applied_again() {
     let mut h = Harness::new();
     h.w().verdict = Verdict::Bad;
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Failed);
+    assert_eq!(e.outcome, Outcome::RolledBack);
     assert!(e.detail.contains("rolled the stack back"), "{}", e.detail);
     assert_eq!(h.w().tag, OLD_TAG);
     h.w().verdict = Verdict::Good;
-    h.e().request_apply("update-new").await.unwrap();
+    h.e().request_apply("update-new", "").await.unwrap();
     h.run(|_, _| {}).await;
     let e = h.e().record.history[0].clone();
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
@@ -1621,7 +1700,7 @@ async fn step_until(h: &mut Harness, at: impl Fn(&Phase) -> bool) {
 
 async fn applied(h: &mut Harness, s: &Spec) {
     assert!(h.verify(s).await.is_none());
-    h.e().request_apply(&s.tag).await.unwrap();
+    h.e().request_apply(&s.tag, "").await.unwrap();
 }
 
 #[tokio::test]
@@ -1645,8 +1724,18 @@ async fn the_unit_is_read_whatever_the_engine_does() {
         trial: "update-next".into(),
         rolled_back: "update-bad 2026-09-01T00:00:00Z".into(),
         os_trial: false,
+        ..h.e().unit.clone()
     };
     assert_eq!(h.e().unit, read);
+    let u = &h.e().unit;
+    assert_eq!(
+        (
+            u.flux_version.as_str(),
+            u.judge.trial.as_str(),
+            u.components.len()
+        ),
+        ("v2.6.4", "update-next", 0)
+    );
     assert!(!h.e().refresh_unit().await, "nothing changed");
 
     {
@@ -1733,4 +1822,266 @@ async fn power_when_idle_says_what_boots_next() {
         "{said}"
     );
     assert!(h.e().record.before.is_none());
+}
+
+fn judge_takes_requests(h: &Harness) {
+    let mut w = h.w();
+    w.judge_idle = true;
+    w.judge.insert("requests".into(), "commit rollback".into());
+}
+
+fn newer() -> Spec {
+    let mut s = Spec::new("update-newer");
+    s.epoch = 3000;
+    s
+}
+
+fn steps_of(e: &Entry) -> Vec<(Step, State)> {
+    e.steps.iter().map(|t| (t.step, t.state)).collect()
+}
+
+#[tokio::test]
+async fn steps_and_a_log_are_kept_as_the_update_goes() {
+    let (h, _, _) = happy().await;
+    let e = &h.engine.as_ref().unwrap().record.history[0];
+    use State::Done;
+    assert_eq!(
+        steps_of(e),
+        [
+            (Step::Upload, Done),
+            (Step::Verify, Done),
+            (Step::Stage, Done),
+            (Step::Install, Done),
+            (Step::Reboot, Done),
+            (Step::OsTrial, Done),
+            (Step::Stack, Done),
+            (Step::Trial, Done),
+            (Step::Commit, Done),
+        ]
+    );
+    assert!(
+        e.steps
+            .iter()
+            .all(|t| t.started > 0 && t.finished >= t.started)
+    );
+    assert!(e.steps.windows(2).all(|w| w[0].finished <= w[1].started));
+    let log: Vec<&str> = e.log.iter().map(|l| l.text.as_str()).collect();
+    assert!(log.contains(&"installing the OS"), "{log:?}");
+    assert_eq!(log.last(), Some(&"update-new committed"));
+}
+
+#[tokio::test]
+async fn an_update_without_a_new_os_skips_its_steps() {
+    let mut h = Harness::new();
+    running_installer(&h, &format!("reg/installer:provisioned@{DIGEST}"));
+    assert!(h.verify(&Spec::new("update-new")).await.is_none());
+    let d = h.e().record.release.clone().unwrap().diff.unwrap();
+    assert!(!d.reboot && d.downtime_secs == 0);
+    h.e().request_apply("update-new", "ann").await.unwrap();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert_eq!(e.by, "ann");
+    use State::{Done, Skipped};
+    assert_eq!(
+        steps_of(&e),
+        [
+            (Step::Upload, Done),
+            (Step::Verify, Done),
+            (Step::Stage, Done),
+            (Step::Install, Skipped),
+            (Step::Stack, Done),
+            (Step::Trial, Done),
+            (Step::Commit, Done),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn verification_says_what_applying_changes() {
+    let (mut h, _, _) = happy().await;
+    assert!(h.verify(&newer()).await.is_none());
+    let r = h.e().record.release.clone().unwrap();
+    let checks: Vec<(&str, CheckState)> = r
+        .checks
+        .iter()
+        .map(|c| (c.name.as_str(), c.state))
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            ("signature", CheckState::Pass),
+            ("compatible", CheckState::Pass),
+            ("space", CheckState::Pass),
+            ("reboot", CheckState::Note),
+            ("downtime", CheckState::Note),
+        ]
+    );
+    assert!(r.signer.starts_with("SHA256:"));
+    let d = r.diff.unwrap();
+    assert_eq!(
+        d.stack,
+        ("update-new".to_string(), "update-newer".to_string())
+    );
+    assert!(d.removals_known && d.reboot && d.config_changes);
+    // The last reboot through an update, as the clock saw it.
+    assert!(
+        d.downtime_secs > 0 && d.downtime_secs != REBOOT,
+        "{}",
+        d.downtime_secs
+    );
+    let changes: Vec<(&str, diff::Change)> = d
+        .components
+        .iter()
+        .map(|c| (c.name.as_str(), c.change))
+        .collect();
+    assert_eq!(
+        changes,
+        [
+            ("reg/app", diff::Change::Changed),
+            ("reg/base", diff::Change::Unchanged),
+            ("reg/judge", diff::Change::Changed),
+        ]
+    );
+    assert_eq!(
+        h.e().unit.components.len(),
+        3,
+        "the running release names what runs"
+    );
+}
+
+#[tokio::test]
+async fn images_that_will_not_fit_are_refused() {
+    let mut h = Harness::new();
+    h.w().registry_free = 150;
+    refused(
+        &mut h,
+        &Spec::new("update-new"),
+        "the image store has 150 free",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stack_on_trial_commits_when_asked() {
+    let mut h = Harness::new();
+    judge_takes_requests(&h);
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
+    assert!(h.e().request_commit("update-other", "ann").await.is_err());
+    h.e().request_commit("update-new", "ann").await.unwrap();
+    assert_eq!(h.w().judge["request"], "commit update-new");
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert!(
+        e.log
+            .iter()
+            .any(|l| l.text == "ann asked to commit update-new")
+    );
+}
+
+#[tokio::test]
+async fn a_judge_that_takes_no_requests_is_not_asked() {
+    let mut h = Harness::new();
+    h.w().judge_idle = true;
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
+    let e = h.e().request_commit("update-new", "ann").await.unwrap_err();
+    assert!(e.to_string().contains("takes no commit"), "{e}");
+    assert!(h.w().judge.get("request").is_none_or(String::is_empty));
+}
+
+#[tokio::test]
+async fn a_stack_on_trial_rolls_back_when_asked() {
+    let mut h = Harness::new();
+    judge_takes_requests(&h);
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
+    h.e().request_rollback("update-new", "ann").await.unwrap();
+    assert_eq!(h.w().judge["request"], "rollback update-new");
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
+    assert_eq!(e.rollback_reason, "ann asked");
+    assert_eq!(h.w().tag, OLD_TAG);
+    assert!(h.e().record.release.is_some(), "it can be applied again");
+}
+
+#[tokio::test]
+async fn without_the_judge_a_rollback_moves_the_stack_itself() {
+    let mut h = Harness::new();
+    h.w().judge_idle = true;
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
+    h.e().request_rollback("update-new", "ann").await.unwrap();
+    assert_eq!(h.w().tag, OLD_TAG);
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
+    assert_eq!(e.rollback_reason, "ann asked");
+}
+
+#[tokio::test]
+async fn the_new_os_rolls_back_when_asked() {
+    let mut h = Harness::new();
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| *p == Phase::Trial).await;
+    assert!(h.e().request_rollback("update-other", "ann").await.is_err());
+    let said = h.e().request_rollback("update-new", "ann").await.unwrap();
+    assert_eq!(
+        said,
+        "rolling the new OS, talos-v1.14.1~1.efi, back: the unit boots Talos-v1.14.1.efi again"
+    );
+    assert!(h.w().log.contains(&"rollback".to_string()));
+    h.reopen();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
+    assert!(e.detail.contains("an operator rolled"), "{}", e.detail);
+    assert_eq!(e.rollback_reason, "ann asked");
+    let w = h.w();
+    assert_eq!(w.active, UNIT_CONFIG);
+    assert_eq!(
+        (w.tag.as_str(), w.selected.as_str()),
+        (OLD_TAG, "talos-v1.14.1.efi")
+    );
+}
+
+#[tokio::test]
+async fn after_a_commit_the_previous_good_release_is_a_rollback_away() {
+    let (mut h, _, _) = happy().await;
+    assert!(h.e().request_rollback("update-older", "ann").await.is_err());
+    let said = h.e().request_rollback(OLD_TAG, "ann").await.unwrap();
+    assert_eq!(said, format!("update-new rolled back to {OLD_TAG}"));
+    assert_eq!(h.w().tag, OLD_TAG);
+    assert_eq!(h.w().url, "oci://127.0.0.1:5000/stack");
+    let e = h.e().record.history[0].clone();
+    assert_eq!((e.outcome, e.by.as_str()), (Outcome::RolledBack, "ann"));
+    // Now on trial of the judge's, not its good release: no further back.
+    assert!(h.e().request_rollback(OLD_TAG, "ann").await.is_err());
+}
+
+#[tokio::test]
+async fn storage_counts_what_a_collection_frees() {
+    let (mut h, _, _) = happy().await;
+    let e = h.update(&newer(), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.w().held.insert("reg/app:stale".into());
+    h.e().refresh_unit().await;
+    let s = h.e().storage().await.unwrap();
+    // The fake holds 100 bytes an image: the previous release's app and judge.
+    assert_eq!((s.reclaimable, s.previous), (100, 200));
+    assert_eq!(h.e().collect(false).await.unwrap(), 100);
+    assert!(h.w().held.contains("reg/app:update-new"));
+    assert_eq!(h.e().collect(true).await.unwrap(), 200);
+    assert!(!h.w().held.contains("reg/app:update-new"));
+    assert!(h.w().held.contains("reg/app:update-newer"));
+    let e = h
+        .e()
+        .request_rollback("update-new", "ann")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("were collected"), "{e}");
 }

@@ -29,12 +29,18 @@ pub trait Talos: Send + Sync {
     async fn install(&self, image: &str) -> anyhow::Result<()>;
     /// A power cycle: sd-boot counts the new OS's boots, and a kexec would bypass it.
     async fn reboot(&self) -> anyhow::Result<()>;
+    /// Points sd-boot back at the previous OS and reboots into it.
+    async fn rollback(&self) -> anyhow::Result<()>;
     async fn shutdown(&self) -> anyhow::Result<()>;
 }
 
 #[async_trait]
 pub trait Cluster: Send + Sync {
     async fn config_map(&self, at: &Ref) -> anyhow::Result<Option<BTreeMap<String, String>>>;
+    /// Merges one key into a ConfigMap's data.
+    async fn set_key(&self, at: &Ref, key: &str, value: &str) -> anyhow::Result<()>;
+    /// The Flux version the FluxInstance runs.
+    async fn flux_version(&self, instance: &Ref) -> anyhow::Result<String>;
     /// The FluxInstance's `spec.sync` url and ref.
     async fn sync(&self, instance: &Ref) -> anyhow::Result<(String, String)>;
     async fn repoint(
@@ -63,10 +69,17 @@ pub trait Cluster: Send + Sync {
 pub trait Registry: Send + Sync {
     /// Imports every image an OCI image layout holds, under the names its index gives.
     fn import(&self, layout: &Path) -> anyhow::Result<()>;
-    /// Drops every image `keep` does not name, and whatever only they held.
-    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<()>;
-    /// Whether the store holds the image a ref names.
-    fn holds(&self, image: &str) -> bool;
+    /// Drops every image `keep` does not name, and whatever only they held;
+    /// returns the bytes freed.
+    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64>;
+    /// The bytes [`Registry::retain`] would free.
+    fn reclaimable(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64>;
+    /// Bytes held, and free on its volume.
+    fn usage(&self) -> anyhow::Result<(u64, u64)>;
+    /// Bytes of a layout's blobs the store does not hold yet.
+    fn missing(&self, layout: &Path) -> anyhow::Result<u64>;
+    /// The digest the store holds a reference at.
+    fn digest(&self, image: &str) -> Option<String>;
 }
 
 /// `namespace/name`.
@@ -129,6 +142,7 @@ pub struct Stack {
     pub source: Ref,
     /// The stack's own record: `built_epoch`, and what `LOCK_*` lines check.
     pub lock: Ref,
-    /// The judge's record: `good`, `previous`, `trial` and `rolled_back`.
+    /// The judge's record: `good`, `previous`, `trial`, `rolled_back`, and
+    /// what it says of a trial (README).
     pub judge: Ref,
 }

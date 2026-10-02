@@ -38,6 +38,7 @@ service MachineService {
     rpc List(ListRequest) returns (stream FileInfo);
     rpc Read(ReadRequest) returns (stream Data);
     rpc Reboot(RebootRequest) returns (RebootResponse);
+    rpc Rollback(RollbackRequest) returns (RollbackResponse);
     rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
     rpc Version(Empty) returns (VersionResponse);
 }
@@ -95,6 +96,16 @@ message Reboot {
 
 message RebootResponse {
     repeated Reboot messages = 1;
+}
+
+message RollbackRequest {}
+
+message Rollback {
+    Metadata metadata = 1;
+}
+
+message RollbackResponse {
+    repeated Rollback messages = 1;
 }
 
 message ShutdownRequest {

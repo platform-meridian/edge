@@ -8,8 +8,11 @@
 
 mod api;
 mod cluster;
+mod diff;
 mod engine;
+mod judge;
 mod registry;
+mod steps;
 mod talos;
 mod unit;
 mod upload;
@@ -117,11 +120,7 @@ async fn serve() -> anyhow::Result<()> {
         "127.0.0.1:50000",
     ));
     let kube = Arc::new(cluster::Kube::new(kube::Client::try_default().await?));
-    let now: engine::Clock = Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64)
-    });
+    let now: engine::Clock = Arc::new(engine::unix_now);
     let mut engine = Engine::open(
         &state,
         settings,
@@ -182,6 +181,8 @@ async fn serve_health(listen: String, router: connectrpc::Router) {
 
 /// How often the unit is reread while nothing else happens.
 const UNIT_EVERY: Duration = Duration::from_secs(30);
+/// How often a counted step's progress is sent.
+const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 
 async fn run(
     engine: &mut Engine,
@@ -193,7 +194,9 @@ async fn run(
         record: e.record.clone(),
         detail: e.detail.clone(),
         unit: e.unit.clone(),
+        progress: e.progress.now(),
     };
+    let progress = engine.progress.clone();
     let mut unit = tokio::time::interval(UNIT_EVERY);
     unit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut phase = engine.record.phase.clone();
@@ -201,7 +204,22 @@ async fn run(
     tokio::pin!(stop);
     loop {
         publish.send_replace(snap(engine));
-        let wait = match engine.step().await {
+        // Long steps count their work: sent as it goes.
+        let stepped = {
+            let step = engine.step();
+            tokio::pin!(step);
+            let mut tick = tokio::time::interval(PROGRESS_EVERY);
+            loop {
+                tokio::select! {
+                    r = &mut step => break r,
+                    _ = tick.tick() => {
+                        let now = progress.now();
+                        publish.send_if_modified(|s| std::mem::replace(&mut s.progress, now) != now);
+                    }
+                }
+            }
+        };
+        let wait = match stepped {
             Ok(Tick::Moved) => {
                 backoff = Duration::from_secs(5);
                 continue;
@@ -210,7 +228,7 @@ async fn run(
             Ok(Tick::Idle) => Duration::from_secs(3600),
             Err(e) => {
                 tracing::warn!(error = format!("{e:#}"), "update step failed; retrying");
-                engine.detail = format!("retrying: {e:#}");
+                engine.retrying(&e);
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 backoff
             }
@@ -231,13 +249,32 @@ async fn run(
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
                         }
-                        Some(Command::Apply(tag, reply)) => {
-                            let r = engine.request_apply(&tag).await;
+                        Some(Command::Apply(tag, by, reply)) => {
+                            let r = engine.request_apply(&tag, &by).await;
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
                         }
                         Some(Command::Power(p, reply)) => {
                             let _ = reply.send(engine.power(p).await);
+                        }
+                        Some(Command::Commit(tag, by, reply)) => {
+                            let r = engine.request_commit(&tag, &by).await;
+                            publish.send_replace(snap(engine));
+                            let _ = reply.send(r);
+                        }
+                        Some(Command::RollBack(tag, by, reply)) => {
+                            let r = engine.request_rollback(&tag, &by).await;
+                            unit.reset_immediately();
+                            publish.send_replace(snap(engine));
+                            let _ = reply.send(r);
+                        }
+                        Some(Command::Storage(reply)) => {
+                            let _ = reply.send(engine.storage().await);
+                            continue;
+                        }
+                        Some(Command::Collect(previous, reply)) => {
+                            let _ = reply.send(engine.collect(previous).await);
+                            continue;
                         }
                         None => return,
                     }
@@ -343,7 +380,7 @@ mod tests {
         status.wait_for(|s| s.unit.good == OLD_TAG).await.unwrap();
 
         let (reply, applied) = tokio::sync::oneshot::channel();
-        tx.send(Command::Apply("update-new".into(), reply))
+        tx.send(Command::Apply("update-new".into(), String::new(), reply))
             .await
             .unwrap();
         applied.await.unwrap().unwrap();

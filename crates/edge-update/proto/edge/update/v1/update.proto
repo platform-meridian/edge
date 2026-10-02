@@ -24,12 +24,26 @@ service UpdateService {
   rpc Reboot(RebootRequest) returns (RebootResponse);
   // Powers the unit off, on the same terms as Reboot.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  // Asks the stack's judge to commit the release on trial now.
+  rpc CommitTrial(CommitTrialRequest) returns (CommitTrialResponse);
+  // Rolls back: the release on trial now, or, with none, the stack to the
+  // judge's previous good release.
+  rpc RollBack(RollBackRequest) returns (RollBackResponse);
+  // One update's log: the current or last one, or one from the history.
+  rpc GetLog(GetLogRequest) returns (GetLogResponse);
+  // What the image store holds, and what a collection would free.
+  rpc GetStorage(GetStorageRequest) returns (GetStorageResponse);
+  // Drops the images no kept release names.
+  rpc CollectGarbage(CollectGarbageRequest) returns (CollectGarbageResponse);
 }
 
 message BeginUploadRequest {
   uint64 size = 1;
   // SHA-256 of the whole bundle.
   bytes sha256 = 2;
+  // Who uploads, as other clients see it. Another's live upload of another
+  // bundle is not replaced.
+  string by = 3;
 }
 
 message BeginUploadResponse {
@@ -44,6 +58,25 @@ message Upload {
   bytes received = 4;
   // Every chunk is held and the whole matches sha256.
   bool complete = 5;
+  int64 started_unix = 6;
+  // When the whole was held, 0 until then.
+  int64 finished_unix = 7;
+  string by = 8;
+  // The last chunk taken.
+  int64 active_unix = 9;
+  // The bundle's signed head, read as soon as its start has arrived.
+  Head head = 10;
+  // Why the start that arrived is refused: the rest is refused too.
+  string refused = 11;
+}
+
+// What a bundle says of itself, signed by the pinned key.
+message Head {
+  map<string, string> manifest = 1;
+  // Release notes, Markdown, if the bundle carries any.
+  string notes = 2;
+  // The key it verified against: "SHA256:<fingerprint> <comment>".
+  string signer = 3;
 }
 
 message PutChunkRequest {
@@ -69,6 +102,8 @@ message VerifyResponse {
 message ApplyRequest {
   // The stack tag of the verified release, so a client applies what it saw.
   string stack_tag = 1;
+  // Who applies, as other clients see it.
+  string by = 2;
 }
 
 message ApplyResponse {
@@ -107,6 +142,61 @@ message ShutdownResponse {
   string detail = 1;
 }
 
+message CommitTrialRequest {
+  // The release on trial, so a client commits what it saw.
+  string stack_tag = 1;
+  string by = 2;
+}
+
+message CommitTrialResponse {
+  Status status = 1;
+}
+
+message RollBackRequest {
+  // The release on trial, or with none on trial, the previous good one to go back to.
+  string stack_tag = 1;
+  string by = 2;
+}
+
+message RollBackResponse {
+  Status status = 1;
+}
+
+message GetLogRequest {
+  // HistoryEntry.started_unix; 0 for the current or last update.
+  int64 started_unix = 1;
+}
+
+message GetLogResponse {
+  repeated LogLine lines = 1;
+}
+
+message LogLine {
+  int64 unix = 1;
+  string text = 2;
+}
+
+message GetStorageRequest {}
+
+message GetStorageResponse {
+  // Everything the image store holds.
+  uint64 held_bytes = 1;
+  // Held for the previous release alone, so a rollback can return to it.
+  uint64 previous_bytes = 2;
+  // Held for nothing a kept release or a workload names.
+  uint64 reclaimable_bytes = 3;
+  uint64 free_bytes = 4;
+}
+
+message CollectGarbageRequest {
+  // Also drop the previous release's images: a rollback to it is then refused.
+  bool previous = 1;
+}
+
+message CollectGarbageResponse {
+  uint64 freed_bytes = 1;
+}
+
 enum Phase {
   PHASE_UNSPECIFIED = 0;
   PHASE_IDLE = 1;
@@ -136,6 +226,156 @@ message Status {
   Upload upload = 5;
   int64 updated_unix = 6;
   Unit unit = 7;
+  // The update's steps in order, those it has yet to take included: only
+  // those this release needs.
+  repeated Step steps = 8;
+  // The work of the step running, when it can be counted.
+  Progress progress = 9;
+  // The trial running, if any.
+  Trial trial = 10;
+  // Who holds the unit's update: an upload in progress or an update.
+  Lock lock = 11;
+}
+
+enum StepKind {
+  STEP_KIND_UNSPECIFIED = 0;
+  STEP_KIND_UPLOAD = 1;
+  STEP_KIND_VERIFY = 2;
+  // Import the images, copy the store off, stage the config.
+  STEP_KIND_STAGE = 3;
+  STEP_KIND_INSTALL = 4;
+  STEP_KIND_REBOOT = 5;
+  // The new OS on trial until the unit commits it.
+  STEP_KIND_OS_TRIAL = 6;
+  // Update the judge and move the stack.
+  STEP_KIND_STACK = 7;
+  // The new stack on trial until its judge commits or rolls it back.
+  STEP_KIND_TRIAL = 8;
+  STEP_KIND_COMMIT = 9;
+}
+
+enum StepState {
+  STEP_STATE_UNSPECIFIED = 0;
+  STEP_STATE_PENDING = 1;
+  STEP_STATE_RUNNING = 2;
+  STEP_STATE_DONE = 3;
+  STEP_STATE_FAILED = 4;
+  // Taken, but with nothing to do: the OS already runs, say.
+  STEP_STATE_SKIPPED = 5;
+}
+
+message Step {
+  StepKind kind = 1;
+  StepState state = 2;
+  int64 started_unix = 3;
+  int64 finished_unix = 4;
+}
+
+message Progress {
+  uint64 done = 1;
+  uint64 total = 2;
+  int64 started_unix = 3;
+}
+
+enum TrialKind {
+  TRIAL_KIND_UNSPECIFIED = 0;
+  // The unit commits the OS once it has stayed up.
+  TRIAL_KIND_OS = 1;
+  // The stack's judge commits the release once it has stayed healthy.
+  TRIAL_KIND_STACK = 2;
+}
+
+message Trial {
+  TrialKind kind = 1;
+  // The release on trial.
+  string stack_tag = 2;
+  int64 started_unix = 3;
+  // Continuous health the judge wants before it commits; 0 if it does not say.
+  int64 window_secs = 4;
+  // When the current healthy streak began; 0 while unhealthy or unknown.
+  int64 healthy_since_unix = 5;
+  // Unhealthy time the judge allows before it rolls back, and the time spent so far.
+  int64 fail_after_secs = 6;
+  int64 unhealthy_secs = 7;
+  // What the judge checks, as it last found them.
+  repeated Check checks = 8;
+  bool can_commit = 9;
+  bool can_roll_back = 10;
+}
+
+message Lock {
+  string by = 1;
+  int64 since_unix = 2;
+  // An upload, not yet an update.
+  bool uploading = 3;
+}
+
+enum CheckState {
+  CHECK_STATE_UNSPECIFIED = 0;
+  CHECK_STATE_PASS = 1;
+  CHECK_STATE_FAIL = 2;
+  // Neither: what applying will do, for a person to weigh.
+  CHECK_STATE_NOTE = 3;
+}
+
+message Check {
+  string name = 1;
+  CheckState state = 2;
+  string detail = 3;
+}
+
+enum ComponentKind {
+  COMPONENT_KIND_UNSPECIFIED = 0;
+  COMPONENT_KIND_IMAGE = 1;
+  // An optional part a unit installs or removes on its own.
+  COMPONENT_KIND_MODULE = 2;
+}
+
+// A part of the system a person tracks by version.
+message Component {
+  string name = 1;
+  ComponentKind kind = 2;
+  // The image reference, without its digest.
+  string image = 3;
+  // What its build calls it, else its tag.
+  string version = 4;
+  string digest = 5;
+  // Built from a tree with uncommitted changes.
+  bool dirty = 6;
+}
+
+enum Change {
+  CHANGE_UNSPECIFIED = 0;
+  CHANGE_UNCHANGED = 1;
+  CHANGE_CHANGED = 2;
+  CHANGE_ADDED = 3;
+  CHANGE_REMOVED = 4;
+}
+
+message ComponentChange {
+  string name = 1;
+  Change change = 2;
+  Component from = 3;
+  Component to = 4;
+}
+
+// What applying a release changes, against the unit as it ran when it was verified.
+message Diff {
+  repeated ComponentChange components = 1;
+  string talos_from = 2;
+  string talos_to = 3;
+  string installer_from = 4;
+  string installer_to = 5;
+  string stack_from = 6;
+  string stack_to = 7;
+  // A new OS is installed, so the unit reboots.
+  bool reboot = 8;
+  // The unit's machine config changes.
+  bool config_changes = 9;
+  // How long the unit is expected to be unreachable.
+  int64 downtime_secs = 10;
+  // Removals are known: what ran was itself a release.
+  bool removals_known = 11;
 }
 
 // The unit as it runs, reread every half-minute; an unreadable part keeps its last value.
@@ -152,6 +392,13 @@ message Unit {
   string rolled_back = 6;
   // The running OS is on trial: a boot-counted UKI not yet blessed.
   bool os_trial = 7;
+  // The installer the unit's config names.
+  string installer = 8;
+  string flux_version = 9;
+  // What runs, from the release the unit runs, else from its workloads.
+  repeated Component components = 10;
+  // The MANIFEST of the release the unit runs, if this engine applied it.
+  map<string, string> manifest = 11;
 }
 
 message Release {
@@ -161,6 +408,13 @@ message Release {
   // Every MANIFEST line, as signed.
   map<string, string> manifest = 4;
   bytes sha256 = 5;
+  string notes = 6;
+  // Head.signer.
+  string signer = 7;
+  // What verification found, passed or not.
+  repeated Check checks = 8;
+  Diff diff = 9;
+  repeated Component components = 10;
 }
 
 enum Outcome {
@@ -168,6 +422,8 @@ enum Outcome {
   OUTCOME_COMMITTED = 1;
   OUTCOME_FAILED = 2;
   OUTCOME_REFUSED = 3;
+  // The unit went back to what it ran before: by itself or as asked.
+  OUTCOME_ROLLED_BACK = 4;
 }
 
 message HistoryEntry {
@@ -178,4 +434,8 @@ message HistoryEntry {
   int64 finished_unix = 5;
   // SHA-256 of the store copy taken before the update, if it got that far.
   string snapshot_sha256 = 6;
+  repeated Step steps = 7;
+  string by = 8;
+  // Why the unit went back, for OUTCOME_ROLLED_BACK.
+  string rollback_reason = 9;
 }

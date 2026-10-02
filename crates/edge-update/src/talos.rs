@@ -305,6 +305,18 @@ impl crate::unit::Talos for Node {
         Ok(())
     }
 
+    async fn rollback(&self) -> anyhow::Result<()> {
+        let r = self
+            .machine()?
+            .rollback(req(pb::RollbackRequest {}))
+            .await?
+            .into_inner();
+        for m in &r.messages {
+            upstream(m.metadata.as_ref())?;
+        }
+        Ok(())
+    }
+
     async fn shutdown(&self) -> anyhow::Result<()> {
         let r = self
             .machine()?
@@ -381,6 +393,13 @@ mod tests {
             let mode = r.into_inner().mode();
             self.0.lock().unwrap().push(format!("reboot {mode:?}"));
             Ok(Response::new(pb::RebootResponse { messages: vec![] }))
+        }
+        async fn rollback(
+            &self,
+            _: Request<pb::RollbackRequest>,
+        ) -> Result<Response<pb::RollbackResponse>, Status> {
+            self.0.lock().unwrap().push("rollback".into());
+            Ok(Response::new(pb::RollbackResponse { messages: vec![] }))
         }
         async fn shutdown(
             &self,
@@ -530,15 +549,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn power_calls_power_cycle_and_shut_down_gracefully() {
+    async fn power_calls_power_cycle_roll_back_and_shut_down_gracefully() {
         let apid = Apid::default();
         let (node, _d) = node(apid.clone()).await;
         node.reboot().await.unwrap();
+        node.rollback().await.unwrap();
         let e = node.shutdown().await.unwrap_err();
         assert_eq!(e.to_string(), "already shutting down");
         assert_eq!(
             *apid.0.lock().unwrap(),
-            ["reboot Powercycle", "shutdown force=false"]
+            ["reboot Powercycle", "rollback", "shutdown force=false"]
         );
     }
 

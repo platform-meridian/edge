@@ -55,6 +55,17 @@ fn objects(manifests: &str) -> anyhow::Result<Vec<DynamicObject>> {
     Ok(out)
 }
 
+/// What a FluxInstance applied, `v2.6.4@sha256:…`, else the version it asks for.
+fn flux_version(fi: &serde_json::Value) -> String {
+    fi["status"]["lastAppliedRevision"]
+        .as_str()
+        .and_then(|r| r.split('@').next())
+        .filter(|v| !v.is_empty())
+        .or_else(|| fi["spec"]["distribution"]["version"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub fn workload(kind: &str, namespace: &str, name: &str) -> String {
     format!("{} {namespace}/{name}", kind.to_ascii_lowercase())
 }
@@ -85,6 +96,18 @@ impl crate::unit::Cluster for Kube {
         Ok(timed(api.get_opt(&at.name))
             .await?
             .map(|c| c.data.unwrap_or_default()))
+    }
+
+    async fn set_key(&self, at: &Ref, key: &str, value: &str) -> anyhow::Result<()> {
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &at.namespace);
+        let patch = serde_json::json!({ "data": { key: value } });
+        timed(api.patch(&at.name, &PatchParams::default(), &Patch::Merge(&patch))).await?;
+        Ok(())
+    }
+
+    async fn flux_version(&self, instance: &Ref) -> anyhow::Result<String> {
+        let fi = timed(self.dynamic(FLUX_INSTANCE, instance).get(&instance.name)).await?;
+        Ok(flux_version(&fi.data))
     }
 
     async fn sync(&self, instance: &Ref) -> anyhow::Result<(String, String)> {
@@ -250,6 +273,18 @@ fn named(kind: &str, m: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flux_is_what_it_applied_else_what_it_asks_for() {
+        let fi = serde_json::json!({
+            "spec": {"distribution": {"version": "2.x"}},
+            "status": {"lastAppliedRevision": "v2.6.4@sha256:aa"},
+        });
+        assert_eq!(flux_version(&fi), "v2.6.4");
+        let fi = serde_json::json!({"spec": {"distribution": {"version": "2.x"}}});
+        assert_eq!(flux_version(&fi), "2.x");
+        assert_eq!(flux_version(&serde_json::json!({})), "");
+    }
 
     #[test]
     fn seed_objects_parse_and_empty_documents_are_skipped() {

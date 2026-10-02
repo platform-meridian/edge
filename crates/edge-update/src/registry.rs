@@ -20,31 +20,56 @@ impl crate::unit::Registry for Registry {
         Ok(())
     }
 
-    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<()> {
-        let mut refs = Vec::new();
-        for r in keep {
-            // The import left a name it could not parse untagged: nothing to keep by it.
-            match r.parse::<ImageRef>() {
-                Ok(i) => refs.push(i),
-                Err(e) => tracing::warn!(%r, error = %e, "not an image reference; not kept"),
-            }
-        }
-        let swept = self.0.retain(&refs)?;
+    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
+        let swept = self.0.retain(&refs(keep))?;
         tracing::info!(?swept, "collected what no kept release names");
-        Ok(())
+        Ok(swept.bytes)
     }
 
-    fn holds(&self, image: &str) -> bool {
-        let Ok(i) = image.parse::<ImageRef>() else {
-            return false;
-        };
-        let reference = match (&i.digest, &i.tag) {
-            (Some(d), _) => d.to_string(),
-            (None, Some(t)) => t.clone(),
-            (None, None) => return false,
-        };
-        self.0.resolve(&i.repo, &reference).is_some()
+    fn reclaimable(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
+        Ok(self.0.reclaimable(&refs(keep))?.bytes)
     }
+
+    fn usage(&self) -> anyhow::Result<(u64, u64)> {
+        let held = self.0.list()?.bytes;
+        let s = nix::sys::statvfs::statvfs(self.0.root())?;
+        Ok((held, s.blocks_available() * s.fragment_size()))
+    }
+
+    fn missing(&self, layout: &Path) -> anyhow::Result<u64> {
+        let mut bytes = 0;
+        for e in std::fs::read_dir(layout.join("blobs/sha256"))? {
+            let e = e?;
+            // A manifest the store keeps apart from its blobs.
+            let held = edge_registry::Digest::from_hex(&e.file_name().to_string_lossy())
+                .is_some_and(|d| {
+                    self.0.blob_path(&d).is_file() || matches!(self.0.manifest(&d), Ok(Some(_)))
+                });
+            if !held {
+                bytes += e.metadata()?.len();
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn digest(&self, image: &str) -> Option<String> {
+        let r = image.parse::<ImageRef>().ok()?;
+        let reference = r.digest.map(|d| d.to_string()).or(r.tag)?;
+        self.0.resolve(&r.repo, &reference).map(|d| d.to_string())
+    }
+}
+
+/// The import left a name it could not parse untagged: nothing to keep by it.
+fn refs(keep: &BTreeSet<String>) -> Vec<ImageRef> {
+    keep.iter()
+        .filter_map(|r| match r.parse::<ImageRef>() {
+            Ok(i) => Some(i),
+            Err(e) => {
+                tracing::warn!(%r, error = %e, "not an image reference; not kept");
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -105,6 +130,26 @@ mod tests {
             r.import(&l).unwrap();
         }
         assert_eq!(held(&root).len(), 3);
+        let (bytes, free) = r.usage().unwrap();
+        assert!(bytes > 0 && free > 0);
+        assert_eq!(
+            r.digest("127.0.0.1:5999/app:t2")
+                .as_deref()
+                .map(|d| d.starts_with("sha256:")),
+            Some(true)
+        );
+        assert_eq!(r.digest("127.0.0.1:5999/app:gone"), None);
+        let again = d.path().join("t2");
+        assert_eq!(r.missing(&again).unwrap(), 0);
+        let fresh = d.path().join("t4");
+        layout(&fresh, "127.0.0.1:5999/app:t4", b"four");
+        let blobs: Vec<_> = std::fs::read_dir(fresh.join("blobs/sha256"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap().len())
+            .collect();
+        // Its empty config the store holds already.
+        assert_eq!(r.missing(&fresh).unwrap(), blobs.iter().sum::<u64>() - 2);
         let keep = [
             "127.0.0.1:5999/app:t2",
             "127.0.0.1:5999/app:t3",
@@ -112,14 +157,16 @@ mod tests {
         ]
         .map(String::from)
         .into();
-        r.retain(&keep).unwrap();
+        let would = r.reclaimable(&keep).unwrap();
+        assert!(would > 0);
+        assert_eq!(r.retain(&keep).unwrap(), would);
         let held = held(&root);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held.iter().all(|h| !h.contains(":t1")), "{held:?}");
-        assert!(r.holds("127.0.0.1:5999/app:t2"));
-        assert!(!r.holds("127.0.0.1:5999/app:t1"));
-        assert!(!r.holds("127.0.0.1:5999/other:t2"));
-        assert!(!r.holds("not a ref!"));
+        assert!(r.digest("127.0.0.1:5999/app:t2").is_some());
+        assert!(r.digest("127.0.0.1:5999/app:t1").is_none());
+        assert!(r.digest("127.0.0.1:5999/other:t2").is_none());
+        assert!(r.digest("not a ref!").is_none());
         let blob = |b: &[u8]| {
             Store::open(&root)
                 .unwrap()

@@ -8,14 +8,25 @@ use connectrpc::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::engine::{Entry, Outcome, Phase, Power, Record, Release, Unit};
+use crate::diff::{Change, Component, Diff};
+use crate::engine::{self, Entry, Outcome, Phase, Power, Record, Release, Storage, Unit};
+use crate::judge::{Check, CheckState};
 use crate::pb::edge::update::v1 as pb;
+use crate::steps::{self, State, Step, Taken};
 use crate::upload::{Upload, Uploads};
 
+type Reply<T> = oneshot::Sender<anyhow::Result<T>>;
+
 pub enum Command {
-    Verify(String, oneshot::Sender<anyhow::Result<()>>),
-    Apply(String, oneshot::Sender<anyhow::Result<()>>),
-    Power(Power, oneshot::Sender<anyhow::Result<String>>),
+    Verify(String, Reply<()>),
+    /// The tag, and who applies it.
+    Apply(String, String, Reply<()>),
+    Power(Power, Reply<String>),
+    Commit(String, String, Reply<()>),
+    RollBack(String, String, Reply<String>),
+    Storage(Reply<Storage>),
+    /// Drop the previous release's images too.
+    Collect(bool, Reply<u64>),
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -23,6 +34,8 @@ pub struct Snapshot {
     pub record: Record,
     pub detail: String,
     pub unit: Unit,
+    /// Done, total and since when, of the step running.
+    pub progress: Option<(u64, u64, i64)>,
 }
 
 pub struct Service {
@@ -45,11 +58,16 @@ impl Service {
     }
 
     fn idle(&self) -> Result<(), ConnectError> {
-        match self.status.borrow().record.phase {
+        let s = self.status.borrow();
+        match s.record.phase {
             Phase::Idle => Ok(()),
-            _ => Err(ConnectError::failed_precondition(
+            _ if s.record.by.is_empty() => Err(ConnectError::failed_precondition(
                 "an update is in progress",
             )),
+            _ => Err(ConnectError::failed_precondition(format!(
+                "an update by {} is in progress",
+                s.record.by
+            ))),
         }
     }
 
@@ -65,13 +83,10 @@ impl Service {
         })
         .await
         .map_err(|e| ConnectError::internal(e.to_string()))?
-        .map_err(|e| ConnectError::invalid_argument(format!("{e:#}")))
+        .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))
     }
 
-    async fn ask<T>(
-        &self,
-        make: impl FnOnce(oneshot::Sender<anyhow::Result<T>>) -> Command,
-    ) -> Result<T, ConnectError> {
+    async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> Result<T, ConnectError> {
         let (tx, rx) = oneshot::channel();
         fn stopped<E>(_: E) -> ConnectError {
             ConnectError::unavailable("the engine has stopped")
@@ -82,9 +97,9 @@ impl Service {
             .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))
     }
 
-    async fn command(
+    async fn command<T>(
         &self,
-        make: impl FnOnce(oneshot::Sender<anyhow::Result<()>>) -> Command,
+        make: impl FnOnce(Reply<T>) -> Command,
     ) -> Result<pb::Status, ConnectError> {
         self.ask(make).await?;
         // The engine publishes before it replies.
@@ -102,7 +117,7 @@ impl Service {
 
     fn convert(&self, s: &Snapshot) -> pb::Status {
         let upload = self.uploads.lock().ok().and_then(|u| u.current());
-        status(s, upload.as_ref())
+        status(s, upload.as_ref(), engine::unix_now())
     }
 }
 
@@ -120,6 +135,84 @@ fn upload(u: &Upload) -> pb::Upload {
         chunk_size: u.chunk_size,
         received: u.received.clone(),
         complete: u.complete,
+        started_unix: u.started,
+        finished_unix: u.finished,
+        by: u.by.clone(),
+        active_unix: u.active,
+        head: u
+            .head
+            .as_ref()
+            .map(|h| pb::Head {
+                manifest: h
+                    .manifest
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                notes: h.notes.clone().unwrap_or_default(),
+                signer: h.signer.clone(),
+                ..Default::default()
+            })
+            .into(),
+        refused: u.refused.clone(),
+        ..Default::default()
+    }
+}
+
+fn check(c: &Check) -> pb::Check {
+    pb::Check {
+        name: c.name.clone(),
+        state: match c.state {
+            CheckState::Pass => pb::CheckState::CHECK_STATE_PASS,
+            CheckState::Fail => pb::CheckState::CHECK_STATE_FAIL,
+            CheckState::Note => pb::CheckState::CHECK_STATE_NOTE,
+        }
+        .into(),
+        detail: c.detail.clone(),
+        ..Default::default()
+    }
+}
+
+fn component(c: &Component) -> pb::Component {
+    pb::Component {
+        name: c.name.clone(),
+        kind: pb::ComponentKind::COMPONENT_KIND_IMAGE.into(),
+        image: c.image.clone(),
+        version: c.version.clone(),
+        digest: c.digest.clone(),
+        dirty: c.dirty,
+        ..Default::default()
+    }
+}
+
+fn diff(d: &Diff) -> pb::Diff {
+    pb::Diff {
+        components: d
+            .components
+            .iter()
+            .map(|c| pb::ComponentChange {
+                name: c.name.clone(),
+                change: match c.change {
+                    Change::Unchanged => pb::Change::CHANGE_UNCHANGED,
+                    Change::Changed => pb::Change::CHANGE_CHANGED,
+                    Change::Added => pb::Change::CHANGE_ADDED,
+                    Change::Removed => pb::Change::CHANGE_REMOVED,
+                }
+                .into(),
+                from: c.from.as_ref().map(component).into(),
+                to: c.to.as_ref().map(component).into(),
+                ..Default::default()
+            })
+            .collect(),
+        talos_from: d.talos.0.clone(),
+        talos_to: d.talos.1.clone(),
+        installer_from: d.installer.0.clone(),
+        installer_to: d.installer.1.clone(),
+        stack_from: d.stack.0.clone(),
+        stack_to: d.stack.1.clone(),
+        reboot: d.reboot,
+        config_changes: d.config_changes,
+        downtime_secs: d.downtime_secs,
+        removals_known: d.removals_known,
         ..Default::default()
     }
 }
@@ -135,6 +228,11 @@ fn release(r: &Release) -> pb::Release {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         sha256: hex::decode(&r.sha256).unwrap_or_default(),
+        notes: r.notes.clone().unwrap_or_default(),
+        signer: r.signer.clone(),
+        checks: r.checks.iter().map(check).collect(),
+        diff: r.diff.as_ref().map(diff).into(),
+        components: r.components().iter().map(component).collect(),
         ..Default::default()
     }
 }
@@ -167,11 +265,154 @@ fn unit(u: &Unit) -> pb::Unit {
         trial: u.trial.clone(),
         rolled_back: u.rolled_back.clone(),
         os_trial: u.os_trial,
+        installer: u.installer.clone(),
+        flux_version: u.flux_version.clone(),
+        components: u.components.iter().map(component).collect(),
+        manifest: u
+            .manifest
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         ..Default::default()
     }
 }
 
-fn status(s: &Snapshot, up: Option<&Upload>) -> pb::Status {
+fn step(t: &Taken) -> pb::Step {
+    pb::Step {
+        kind: match t.step {
+            Step::Upload => pb::StepKind::STEP_KIND_UPLOAD,
+            Step::Verify => pb::StepKind::STEP_KIND_VERIFY,
+            Step::Stage => pb::StepKind::STEP_KIND_STAGE,
+            Step::Install => pb::StepKind::STEP_KIND_INSTALL,
+            Step::Reboot => pb::StepKind::STEP_KIND_REBOOT,
+            Step::OsTrial => pb::StepKind::STEP_KIND_OS_TRIAL,
+            Step::Stack => pb::StepKind::STEP_KIND_STACK,
+            Step::Trial => pb::StepKind::STEP_KIND_TRIAL,
+            Step::Commit => pb::StepKind::STEP_KIND_COMMIT,
+        }
+        .into(),
+        state: match t.state {
+            State::Pending => pb::StepState::STEP_STATE_PENDING,
+            State::Running => pb::StepState::STEP_STATE_RUNNING,
+            State::Done => pb::StepState::STEP_STATE_DONE,
+            State::Failed => pb::StepState::STEP_STATE_FAILED,
+            State::Skipped => pb::StepState::STEP_STATE_SKIPPED,
+        }
+        .into(),
+        started_unix: t.started,
+        finished_unix: t.finished,
+        ..Default::default()
+    }
+}
+
+/// The update's steps: an upload's, with the plan its head implies; else the
+/// record's, the plan filled in while the update is still to come or under way.
+fn steps(s: &Snapshot, up: Option<&Upload>) -> Vec<Taken> {
+    let r = &s.record;
+    let u = &s.unit;
+    if let (Phase::Idle, None, Some(up)) = (&r.phase, &r.release, up) {
+        let state = match (up.complete, up.refused.is_empty()) {
+            (_, false) => State::Failed,
+            (true, true) => State::Done,
+            (false, true) => State::Running,
+        };
+        let taken = [Taken {
+            step: Step::Upload,
+            state,
+            started: up.started,
+            finished: up.finished,
+        }];
+        let os = up
+            .head
+            .as_ref()
+            .is_none_or(|h| engine::os_changes(&h.manifest, &u.talos_version, &u.installer));
+        return steps::merged(&taken, &steps::plan(os));
+    }
+    let ended = r.steps.iter().any(|t| t.state == State::Failed)
+        || (r.phase == Phase::Idle && r.steps.iter().any(|t| t.step > Step::Verify));
+    if ended || r.steps.is_empty() {
+        return r.steps.clone();
+    }
+    let os = r
+        .release
+        .as_ref()
+        .and_then(|r| r.diff.as_ref())
+        .is_none_or(|d| d.reboot);
+    steps::merged(&r.steps, &steps::plan(os))
+}
+
+/// The trial running: the OS's, which the unit commits by itself, or the
+/// stack's, which its judge holds.
+fn trial(s: &Snapshot) -> Option<pb::Trial> {
+    let (r, u) = (&s.record, &s.unit);
+    let tag = r
+        .release
+        .as_ref()
+        .map(|r| r.tag().to_string())
+        .unwrap_or_default();
+    let started = |k: Step| {
+        r.steps
+            .iter()
+            .rev()
+            .find(|t| t.step == k)
+            .map_or(0, |t| t.started)
+    };
+    let j = &u.judge;
+    let stack = |tag: String, started: i64| pb::Trial {
+        kind: pb::TrialKind::TRIAL_KIND_STACK.into(),
+        stack_tag: tag,
+        started_unix: started,
+        window_secs: j.window_secs,
+        healthy_since_unix: j.healthy_since,
+        fail_after_secs: j.fail_after_secs,
+        unhealthy_secs: j.unhealthy_secs,
+        checks: j.checks.iter().map(check).collect(),
+        can_commit: j.takes("commit"),
+        can_roll_back: true,
+        ..Default::default()
+    };
+    Some(match r.phase {
+        Phase::Trial | Phase::Settling => pb::Trial {
+            kind: pb::TrialKind::TRIAL_KIND_OS.into(),
+            stack_tag: tag,
+            started_unix: started(Step::OsTrial),
+            can_roll_back: r.phase == Phase::Trial,
+            ..Default::default()
+        },
+        Phase::Judging { .. } => stack(tag, started(Step::Trial)),
+        Phase::Idle if !u.trial.is_empty() && u.trial == u.stack_tag => pb::Trial {
+            can_roll_back: j.takes("rollback"),
+            ..stack(u.trial.clone(), 0)
+        },
+        _ => return None,
+    })
+}
+
+/// Who holds the unit's update: the one applying, or a live upload's sender.
+fn lock(s: &Snapshot, up: Option<&Upload>, now: i64) -> Option<pb::Lock> {
+    let r = &s.record;
+    if !matches!(r.phase, Phase::Idle) {
+        return Some(pb::Lock {
+            by: r.by.clone(),
+            since_unix: r
+                .steps
+                .iter()
+                .find(|t| t.step > Step::Upload)
+                .map_or(r.since, |t| t.started),
+            ..Default::default()
+        });
+    }
+    let up = up
+        .filter(|u| !u.complete && u.refused.is_empty() && now - u.active < crate::upload::LEASE)?;
+    Some(pb::Lock {
+        by: up.by.clone(),
+        since_unix: up.started,
+        uploading: true,
+        ..Default::default()
+    })
+}
+
+fn status(s: &Snapshot, up: Option<&Upload>, now: i64) -> pb::Status {
     let r = &s.record;
     pb::Status {
         phase: phase(r).into(),
@@ -181,6 +422,18 @@ fn status(s: &Snapshot, up: Option<&Upload>) -> pb::Status {
         upload: up.map(upload).into(),
         updated_unix: r.since,
         unit: Some(unit(&s.unit)).into(),
+        steps: steps(s, up).iter().map(step).collect(),
+        progress: s
+            .progress
+            .map(|(done, total, started)| pb::Progress {
+                done,
+                total,
+                started_unix: started,
+                ..Default::default()
+            })
+            .into(),
+        trial: trial(s).into(),
+        lock: lock(s, up, now).into(),
         ..Default::default()
     }
 }
@@ -192,14 +445,37 @@ fn entry(e: &Entry) -> pb::HistoryEntry {
             Outcome::Committed => pb::Outcome::OUTCOME_COMMITTED,
             Outcome::Failed => pb::Outcome::OUTCOME_FAILED,
             Outcome::Refused => pb::Outcome::OUTCOME_REFUSED,
+            Outcome::RolledBack => pb::Outcome::OUTCOME_ROLLED_BACK,
         }
         .into(),
         detail: e.detail.clone(),
         started_unix: e.started,
         finished_unix: e.finished,
         snapshot_sha256: e.snapshot.clone().unwrap_or_default(),
+        steps: e.steps.iter().map(step).collect(),
+        by: e.by.clone(),
+        rollback_reason: e.rollback_reason.clone(),
         ..Default::default()
     }
+}
+
+/// The current or last update's log, or the one that started at `started`.
+fn log(r: &Record, started: i64) -> Option<Vec<pb::LogLine>> {
+    let lines = if started == 0 {
+        &r.log
+    } else {
+        &r.history.iter().find(|e| e.started == started)?.log
+    };
+    Some(
+        lines
+            .iter()
+            .map(|l| pb::LogLine {
+                unix: l.unix,
+                text: l.text.clone(),
+                ..Default::default()
+            })
+            .collect(),
+    )
 }
 
 // Concrete bodies, where the trait allows any encodable one.
@@ -210,8 +486,8 @@ impl pb::UpdateService for Service {
         _: RequestContext,
         request: ServiceRequest<'_, pb::BeginUploadRequest>,
     ) -> ServiceResult<pb::BeginUploadResponse> {
-        let (size, sha) = (request.size, hex32(request.sha256)?);
-        let u = self.uploading(move |up| up.begin(size, &sha)).await?;
+        let (size, sha, by) = (request.size, hex32(request.sha256)?, request.by.to_string());
+        let u = self.uploading(move |up| up.begin(size, &sha, &by)).await?;
         Response::ok(pb::BeginUploadResponse {
             upload: upload(&u).into(),
             ..Default::default()
@@ -255,9 +531,9 @@ impl pb::UpdateService for Service {
         _: RequestContext,
         request: ServiceRequest<'_, pb::ApplyRequest>,
     ) -> ServiceResult<pb::ApplyResponse> {
-        let tag = request.stack_tag.to_string();
+        let (tag, by) = (request.stack_tag.to_string(), request.by.to_string());
         Response::ok(pb::ApplyResponse {
-            status: self.command(|tx| Command::Apply(tag, tx)).await?.into(),
+            status: self.command(|tx| Command::Apply(tag, by, tx)).await?.into(),
             ..Default::default()
         })
     }
@@ -288,7 +564,7 @@ impl pb::UpdateService for Service {
                 rx.changed().await.ok()?;
                 let s = rx.borrow_and_update().clone();
                 let up = uploads.lock().ok().and_then(|u| u.current());
-                let status = status(&s, up.as_ref()).into();
+                let status = status(&s, up.as_ref(), engine::unix_now()).into();
                 Some((
                     Ok(pb::WatchStatusResponse {
                         status,
@@ -340,6 +616,77 @@ impl pb::UpdateService for Service {
     ) -> ServiceResult<pb::ShutdownResponse> {
         Response::ok(pb::ShutdownResponse {
             detail: self.power(Power::Shutdown).await?,
+            ..Default::default()
+        })
+    }
+
+    async fn commit_trial(
+        &self,
+        _: RequestContext,
+        request: ServiceRequest<'_, pb::CommitTrialRequest>,
+    ) -> ServiceResult<pb::CommitTrialResponse> {
+        let (tag, by) = (request.stack_tag.to_string(), request.by.to_string());
+        Response::ok(pb::CommitTrialResponse {
+            status: self
+                .command(|tx| Command::Commit(tag, by, tx))
+                .await?
+                .into(),
+            ..Default::default()
+        })
+    }
+
+    async fn roll_back(
+        &self,
+        _: RequestContext,
+        request: ServiceRequest<'_, pb::RollBackRequest>,
+    ) -> ServiceResult<pb::RollBackResponse> {
+        let (tag, by) = (request.stack_tag.to_string(), request.by.to_string());
+        Response::ok(pb::RollBackResponse {
+            status: self
+                .command(|tx| Command::RollBack(tag, by, tx))
+                .await?
+                .into(),
+            ..Default::default()
+        })
+    }
+
+    async fn get_log(
+        &self,
+        _: RequestContext,
+        request: ServiceRequest<'_, pb::GetLogRequest>,
+    ) -> ServiceResult<pb::GetLogResponse> {
+        let lines = log(&self.status.borrow().record, request.started_unix)
+            .ok_or_else(|| ConnectError::not_found("no update started then"))?;
+        Response::ok(pb::GetLogResponse {
+            lines,
+            ..Default::default()
+        })
+    }
+
+    async fn get_storage(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, pb::GetStorageRequest>,
+    ) -> ServiceResult<pb::GetStorageResponse> {
+        let s = self.ask(Command::Storage).await?;
+        Response::ok(pb::GetStorageResponse {
+            held_bytes: s.held,
+            previous_bytes: s.previous,
+            reclaimable_bytes: s.reclaimable,
+            free_bytes: s.free,
+            ..Default::default()
+        })
+    }
+
+    async fn collect_garbage(
+        &self,
+        _: RequestContext,
+        request: ServiceRequest<'_, pb::CollectGarbageRequest>,
+    ) -> ServiceResult<pb::CollectGarbageResponse> {
+        let previous = request.previous;
+        let freed = self.ask(|tx| Command::Collect(previous, tx)).await?;
+        Response::ok(pb::CollectGarbageResponse {
+            freed_bytes: freed,
             ..Default::default()
         })
     }
@@ -491,6 +838,7 @@ mod tests {
                 trial: "s3".into(),
                 rolled_back: "s0 2026-09-01T00:00:00Z".into(),
                 os_trial: true,
+                ..Unit::default()
             },
             ..Snapshot::default()
         });
@@ -559,5 +907,194 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.message.as_deref(), Some("apid said no"));
+    }
+
+    fn kinds(s: &Snapshot, up: Option<&Upload>) -> Vec<(Step, State)> {
+        steps(s, up).iter().map(|t| (t.step, t.state)).collect()
+    }
+
+    fn uploading(head: Option<&str>) -> Upload {
+        Upload {
+            sha256: "aa".repeat(32),
+            size: 10,
+            chunk_size: 4,
+            received: vec![1],
+            complete: false,
+            started: 100,
+            finished: 0,
+            by: "ann".into(),
+            active: 990,
+            head: head.map(|installer| crate::upload::Head {
+                manifest: [
+                    ("INSTALLER_REF".to_string(), installer.to_string()),
+                    ("TALOS_VERSION".into(), "v1.14.1".into()),
+                ]
+                .into(),
+                notes: None,
+                signer: String::new(),
+            }),
+            refused: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_upload_shows_the_steps_its_head_implies() {
+        let s = Snapshot {
+            unit: Unit {
+                talos_version: "v1.14.1".into(),
+                installer: "r/i:1@sha256:aa".into(),
+                ..Unit::default()
+            },
+            ..Snapshot::default()
+        };
+        use State::{Pending, Running};
+        // Unknown until the head arrives: every step.
+        assert_eq!(kinds(&s, Some(&uploading(None))).len(), 9);
+        assert_eq!(
+            kinds(&s, Some(&uploading(Some("r/i:2@sha256:aa")))),
+            [
+                (Step::Upload, Running),
+                (Step::Verify, Pending),
+                (Step::Stage, Pending),
+                (Step::Stack, Pending),
+                (Step::Trial, Pending),
+                (Step::Commit, Pending),
+            ]
+        );
+        assert_eq!(
+            kinds(&s, Some(&uploading(Some("r/i:2@sha256:bb")))).len(),
+            9
+        );
+        let mut refused = uploading(None);
+        refused.refused = "not ours".into();
+        assert_eq!(kinds(&s, Some(&refused))[0], (Step::Upload, State::Failed));
+        assert!(kinds(&Snapshot::default(), None).is_empty());
+    }
+
+    #[test]
+    fn an_update_shows_what_is_left_and_an_ended_one_only_what_it_took() {
+        let mut s = Snapshot::default();
+        s.record.phase = Phase::Importing;
+        s.record.release = Some(Release {
+            diff: Some(Diff::default()),
+            ..Release::default()
+        });
+        for st in [Step::Upload, Step::Verify, Step::Stage] {
+            steps::enter(&mut s.record.steps, st, 1);
+        }
+        assert_eq!(
+            kinds(&s, None).last(),
+            Some(&(Step::Commit, State::Pending)),
+            "no reboot: no OS steps"
+        );
+        assert_eq!(kinds(&s, None).len(), 6);
+        steps::close(&mut s.record.steps, State::Failed, 2);
+        s.record.phase = Phase::Idle;
+        assert_eq!(kinds(&s, None).last(), Some(&(Step::Stage, State::Failed)));
+    }
+
+    #[test]
+    fn a_trial_says_its_window_streak_and_checks() {
+        let mut s = Snapshot::default();
+        s.record.phase = Phase::Judging {
+            rolled_back: String::new(),
+        };
+        s.record.release = Some(Release {
+            manifest: [("STACK_TAG".to_string(), "s2".to_string())].into(),
+            ..Release::default()
+        });
+        steps::enter(&mut s.record.steps, Step::Trial, 500);
+        s.unit.judge = crate::judge::Judge::read(
+            &[
+                ("commit_after_secs", "300"),
+                ("healthy_since", "1970-01-01T00:10:00Z"),
+                ("checks", "pass applied\nfail ready: no"),
+                ("requests", "rollback"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        );
+        let t = trial(&s).unwrap();
+        assert_eq!(
+            t.kind,
+            buffa::EnumValue::from(pb::TrialKind::TRIAL_KIND_STACK)
+        );
+        assert_eq!(
+            (
+                t.stack_tag.as_str(),
+                t.started_unix,
+                t.window_secs,
+                t.healthy_since_unix
+            ),
+            ("s2", 500, 300, 600)
+        );
+        assert_eq!(t.checks.len(), 2);
+        assert!(!t.can_commit && t.can_roll_back);
+
+        s.record.phase = Phase::Trial;
+        let t = trial(&s).unwrap();
+        assert_eq!(t.kind, buffa::EnumValue::from(pb::TrialKind::TRIAL_KIND_OS));
+        assert!(t.can_roll_back && !t.can_commit);
+        s.record.phase = Phase::Settling;
+        assert!(!trial(&s).unwrap().can_roll_back, "the OS is committed");
+
+        s.record.phase = Phase::Idle;
+        assert!(trial(&s).is_none());
+        // A rollback to the previous release puts it on trial, engine idle.
+        (s.unit.trial, s.unit.stack_tag) = ("s1".into(), "s1".into());
+        let t = trial(&s).unwrap();
+        assert_eq!((t.stack_tag.as_str(), t.can_roll_back), ("s1", true));
+    }
+
+    #[test]
+    fn the_lock_names_who_updates_or_uploads() {
+        let mut s = Snapshot::default();
+        let up = uploading(None);
+        let l = lock(&s, Some(&up), 1000).unwrap();
+        assert_eq!(
+            (l.by.as_str(), l.since_unix, l.uploading),
+            ("ann", 100, true)
+        );
+        assert!(
+            lock(&s, Some(&up), 990 + crate::upload::LEASE).is_none(),
+            "abandoned"
+        );
+        assert!(lock(&s, None, 1000).is_none());
+        s.record.phase = Phase::Installing;
+        s.record.by = "bob".into();
+        steps::enter(&mut s.record.steps, Step::Verify, 200);
+        let l = lock(&s, None, 1000).unwrap();
+        assert_eq!(
+            (l.by.as_str(), l.since_unix, l.uploading),
+            ("bob", 200, false)
+        );
+    }
+
+    #[test]
+    fn a_log_is_the_current_or_one_from_the_history() {
+        let line = |t: &str| crate::engine::LogLine {
+            unix: 1,
+            text: t.into(),
+        };
+        let mut r = Record {
+            log: vec![line("now")],
+            ..Record::default()
+        };
+        r.history.push(Entry {
+            release: None,
+            outcome: Outcome::Committed,
+            detail: String::new(),
+            started: 7,
+            finished: 8,
+            snapshot: None,
+            steps: Vec::new(),
+            log: vec![line("then")],
+            by: String::new(),
+            rollback_reason: String::new(),
+        });
+        assert_eq!(log(&r, 0).unwrap()[0].text, "now");
+        assert_eq!(log(&r, 7).unwrap()[0].text, "then");
+        assert!(log(&r, 9).is_none());
     }
 }

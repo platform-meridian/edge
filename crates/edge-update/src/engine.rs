@@ -8,15 +8,19 @@
 //! never moves before the OS is committed, so a cut leaves the old system or
 //! the new OS under the old stack.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::{self, Manifest, Verifier, machineconfig};
+use crate::diff::{self, Component, Diff};
+use crate::judge::{self, Check, CheckState, Judge};
+use crate::steps::{self, State, Step, Taken};
 use crate::unit::{Cluster, Registry, Settings, Talos};
 use crate::upload::Uploads;
 
@@ -38,6 +42,9 @@ const ROLLOUT: i64 = 10 * 60;
 const GOOD: i64 = 20 * 60;
 const HISTORY: usize = 50;
 const SNAPSHOTS: usize = 2;
+const LOG: usize = 200;
+/// How long a reboot is expected to take, until the unit has shown one.
+const REBOOT: i64 = 180;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -68,13 +75,25 @@ pub enum Phase {
     Collecting,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Release {
     pub sha256: String,
     pub manifest: Manifest,
     pub refs: BTreeSet<String>,
     #[serde(default)]
     pub os_done: bool,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub signer: String,
+    /// Each layout ref and the digest it names.
+    #[serde(default)]
+    pub images: BTreeMap<String, String>,
+    /// What verification found.
+    #[serde(default)]
+    pub checks: Vec<Check>,
+    #[serde(default)]
+    pub diff: Option<Diff>,
 }
 
 impl Release {
@@ -83,6 +102,9 @@ impl Release {
     }
     pub fn tag(&self) -> &str {
         self.get("STACK_TAG")
+    }
+    pub fn components(&self) -> Vec<Component> {
+        diff::of_release(&self.manifest, &self.images)
     }
 }
 
@@ -97,6 +119,12 @@ pub struct Before {
     /// The installer the unit's config names.
     #[serde(default)]
     pub installer: String,
+    /// Who asked to roll the trial back.
+    #[serde(default)]
+    pub rollback_by: String,
+    /// An operator rolled the new OS back on its trial.
+    #[serde(default)]
+    pub backed_out: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +133,8 @@ pub enum Outcome {
     Committed,
     Failed,
     Refused,
+    /// The unit went back to what it ran before.
+    RolledBack,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,6 +145,20 @@ pub struct Entry {
     pub started: i64,
     pub finished: i64,
     pub snapshot: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<Taken>,
+    #[serde(default)]
+    pub log: Vec<LogLine>,
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub rollback_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogLine {
+    pub unix: i64,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -126,11 +170,19 @@ pub struct Record {
     pub error: String,
     /// When the current phase began.
     pub since: i64,
+    /// The last update's steps, the upload's and verification's first.
+    #[serde(default)]
+    pub steps: Vec<Taken>,
+    #[serde(default)]
+    pub log: Vec<LogLine>,
+    /// Who started the update.
+    #[serde(default)]
+    pub by: String,
 }
 
 impl Record {
     /// Why the unit must not be powered down now: an update is under way. Its
-    /// OS trial is the exception, since a reboot then backs the update out.
+    /// OS trial is the exception: a reboot spends one of the new OS's boot tries.
     pub fn power_refusal(&self) -> Option<String> {
         match self.phase {
             Phase::Idle | Phase::Verifying { .. } | Phase::Trial => None,
@@ -139,6 +191,17 @@ impl Record {
                 self.release.as_ref().map_or("", |r| r.tag())
             )),
         }
+    }
+}
+
+impl Record {
+    /// The release the unit runs, if this engine committed it.
+    pub fn running(&self, tag: &str) -> Option<&Release> {
+        self.history
+            .iter()
+            .filter(|e| e.outcome == Outcome::Committed)
+            .filter_map(|e| e.release.as_ref())
+            .find(|r| !tag.is_empty() && r.tag() == tag)
     }
 }
 
@@ -165,6 +228,53 @@ pub struct Unit {
     pub trial: String,
     pub rolled_back: String,
     pub os_trial: bool,
+    pub installer: String,
+    pub flux_version: String,
+    pub components: Vec<Component>,
+    /// The running release's MANIFEST, if this engine applied it.
+    pub manifest: Manifest,
+    pub judge: Judge,
+}
+
+/// The work of the step running, as it goes.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: AtomicU64,
+    pub total: AtomicU64,
+    pub started: AtomicI64,
+}
+
+impl Progress {
+    fn start(&self, total: u64, now: i64) {
+        self.done.store(0, Ordering::Relaxed);
+        self.started.store(now, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    fn stop(&self) {
+        self.total.store(0, Ordering::Relaxed);
+    }
+
+    /// Done, total and when it started; none when nothing is counted.
+    pub fn now(&self) -> Option<(u64, u64, i64)> {
+        let total = self.total.load(Ordering::Relaxed);
+        (total > 0).then(|| {
+            (
+                self.done.load(Ordering::Relaxed),
+                total,
+                self.started.load(Ordering::Relaxed),
+            )
+        })
+    }
+}
+
+/// What the image store holds, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Storage {
+    pub held: u64,
+    pub previous: u64,
+    pub reclaimable: u64,
+    pub free: u64,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -200,6 +310,53 @@ impl Boot {
 
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// What a MANIFEST must say, whatever the unit: a bundle without it is
+/// refused as soon as its head has arrived.
+pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    let get = |k: &str| m.get(k).map(String::as_str).unwrap_or_default();
+    for k in [
+        "FORMAT",
+        "STACK_TAG",
+        "STACK_DIGEST",
+        "INSTALLER_REF",
+        "TALOS_VERSION",
+        "BUILT_EPOCH",
+        "SECUREBOOT",
+    ] {
+        ensure!(!get(k).is_empty(), "the MANIFEST lacks {k}");
+    }
+    ensure!(
+        matches!(get("FORMAT"), "2" | "3"),
+        "the bundle is format {}, not 2 or 3",
+        get("FORMAT")
+    );
+    ensure!(
+        get("INSTALLER_REF").contains("@sha256:"),
+        "the MANIFEST names the installer by tag, not digest"
+    );
+    ensure!(
+        get("STACK_DIGEST").starts_with("sha256:"),
+        "the MANIFEST's STACK_DIGEST is not a sha256"
+    );
+    get("BUILT_EPOCH")
+        .parse::<i64>()
+        .context("BUILT_EPOCH is not a number")?;
+    Ok(())
+}
+
+/// The bundle installs an OS other than the one the unit runs.
+pub fn os_changes(m: &Manifest, talos: &str, installer: &str) -> bool {
+    let get = |k: &str| m.get(k).map(String::as_str).unwrap_or_default();
+    installer_pin(get("INSTALLER_REF")) != installer_pin(installer) || get("TALOS_VERSION") != talos
+}
+
 pub struct Engine {
     dir: PathBuf,
     settings: Settings,
@@ -212,6 +369,7 @@ pub struct Engine {
     /// What the current phase is waiting for, for a person.
     pub detail: String,
     pub unit: Unit,
+    pub progress: Arc<Progress>,
 }
 
 enum Next {
@@ -219,10 +377,12 @@ enum Next {
     Wait(Duration, String),
     Fail(String),
     Refuse(String),
+    /// The unit went back: what happened, and why, in short.
+    Back(String, String),
     Done,
 }
 
-use Next::{Done, Fail, Go, Refuse, Wait};
+use Next::{Back, Done, Fail, Go, Refuse, Wait};
 
 fn poll(secs: u64, why: impl Into<String>) -> anyhow::Result<Next> {
     Ok(Wait(Duration::from_secs(secs), why.into()))
@@ -262,11 +422,30 @@ impl Engine {
             record,
             detail: String::new(),
             unit: Unit::default(),
+            progress: Arc::default(),
         })
     }
 
     pub fn uploads(&self) -> Uploads {
-        Uploads::new(&self.dir.join("upload"))
+        Uploads::with(
+            &self.dir.join("upload"),
+            Some(self.verifier.clone()),
+            self.now.clone(),
+        )
+    }
+
+    /// A line for this update's log, kept with the record at its next save.
+    pub fn note(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if self.record.log.last().is_some_and(|l| l.text == text) {
+            return;
+        }
+        self.record.log.push(LogLine {
+            unix: (self.now)(),
+            text,
+        });
+        let over = self.record.log.len().saturating_sub(LOG);
+        self.record.log.drain(..over);
     }
 
     fn release_dir(&self, sha: &str) -> PathBuf {
@@ -287,17 +466,39 @@ impl Engine {
 
     pub fn request_verify(&mut self, sha256: &str) -> anyhow::Result<()> {
         anyhow::ensure!(self.idle(), "an update is in progress");
-        let up = self.uploads().current();
+        let up = self
+            .uploads()
+            .current()
+            .filter(|u| u.complete && u.sha256 == sha256)
+            .context("no complete upload of that bundle")?;
         anyhow::ensure!(
-            up.is_some_and(|u| u.complete && u.sha256 == sha256),
-            "no complete upload of that bundle"
+            up.refused.is_empty(),
+            "the bundle is refused: {}",
+            up.refused
         );
+        self.record.steps = vec![Taken {
+            step: Step::Upload,
+            state: State::Done,
+            started: up.started,
+            finished: up.finished,
+        }];
+        self.record.log.clear();
+        self.record.by = up.by.clone();
+        let by = if up.by.is_empty() {
+            String::new()
+        } else {
+            format!(" from {}", up.by)
+        };
+        self.note(format!(
+            "verifying bundle {}{by}",
+            &sha256[..12.min(sha256.len())]
+        ));
         self.go(Phase::Verifying {
             sha256: sha256.into(),
         })
     }
 
-    pub async fn request_apply(&mut self, tag: &str) -> anyhow::Result<()> {
+    pub async fn request_apply(&mut self, tag: &str, by: &str) -> anyhow::Result<()> {
         anyhow::ensure!(self.idle(), "an update is in progress");
         let rel = self
             .record
@@ -317,6 +518,14 @@ impl Engine {
             boot.selected
         );
         self.record.error.clear();
+        self.record.by = by.into();
+        self.record.steps.retain(|t| t.step <= Step::Verify);
+        let who = if by.is_empty() {
+            String::new()
+        } else {
+            format!(" by {by}")
+        };
+        self.note(format!("applying {tag}{who}"));
         self.go(Phase::Starting)
     }
 
@@ -324,30 +533,58 @@ impl Engine {
     /// true if anything changed.
     pub async fn refresh_unit(&mut self) -> bool {
         let was = self.unit.clone();
-        match async { anyhow::Ok((self.talos.version().await?, self.boot().await?)) }.await {
-            Ok((v, b)) => (self.unit.talos_version, self.unit.os_trial) = (v, b.trial()),
+        match async {
+            let (v, b) = (self.talos.version().await?, self.boot().await?);
+            anyhow::Ok((v, b, installer_of(&self.talos.running_config().await?)))
+        }
+        .await
+        {
+            Ok((v, b, i)) => {
+                (
+                    self.unit.talos_version,
+                    self.unit.os_trial,
+                    self.unit.installer,
+                ) = (v, b.trial(), i)
+            }
             Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's OS"),
         }
         let st = &self.settings.stack;
         match async {
             let (_, tag) = self.cluster.sync(&st.flux_instance).await?;
-            anyhow::Ok((tag, self.cluster.config_map(&st.judge).await?))
+            let flux = self.cluster.flux_version(&st.flux_instance).await?;
+            anyhow::Ok((tag, flux, self.cluster.config_map(&st.judge).await?))
         }
         .await
         {
-            Ok((tag, judge)) => {
-                let judge = judge.unwrap_or_default();
-                let get = |k: &str| judge.get(k).cloned().unwrap_or_default();
+            Ok((tag, flux, judge)) => {
+                let j = Judge::read(&judge.unwrap_or_default());
                 let u = &mut self.unit;
-                u.stack_tag = tag;
+                (u.stack_tag, u.flux_version) = (tag, flux);
                 (u.good, u.previous, u.trial, u.rolled_back) = (
-                    get("good"),
-                    get("previous"),
-                    get("trial"),
-                    get("rolled_back"),
+                    j.good.clone(),
+                    j.previous.clone(),
+                    j.trial.clone(),
+                    j.rolled_back.clone(),
                 );
+                u.judge = j;
             }
             Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's stack"),
+        }
+        match self.record.running(&self.unit.stack_tag) {
+            Some(r) => {
+                (self.unit.components, self.unit.manifest) = (r.components(), r.manifest.clone())
+            }
+            None => match self.cluster.images_in_use().await {
+                Ok(refs) => {
+                    let registry = &self.registry;
+                    self.unit.components = diff::of_refs(&refs, |r| registry.digest(r));
+                    self.unit.manifest.clear();
+                }
+                Err(e) => tracing::debug!(
+                    error = format!("{e:#}"),
+                    "could not read what the unit runs"
+                ),
+            },
         }
         self.unit != was
     }
@@ -378,10 +615,23 @@ impl Engine {
     }
 
     fn go(&mut self, p: Phase) -> anyhow::Result<()> {
+        let now = (self.now)();
+        if let Some(s) = steps::of(&p) {
+            steps::enter(&mut self.record.steps, s, now);
+        }
+        if p != Phase::Idle {
+            self.note(phase_word(&p));
+        }
         self.record.phase = p;
-        self.record.since = (self.now)();
+        self.record.since = now;
         self.detail.clear();
         self.save()
+    }
+
+    /// A step failed and is retried: in the log, not the record.
+    pub fn retrying(&mut self, e: &anyhow::Error) {
+        self.detail = format!("retrying: {e:#}");
+        self.note(self.detail.clone());
     }
 
     /// Advances by at most one phase.
@@ -412,6 +662,7 @@ impl Engine {
                 Ok(Tick::Moved)
             }
             Wait(d, why) => {
+                self.note(why.clone());
                 self.detail = why;
                 Ok(Tick::Wait(d))
             }
@@ -421,6 +672,10 @@ impl Engine {
             }
             Refuse(why) => {
                 self.finish(Outcome::Refused, why)?;
+                Ok(Tick::Moved)
+            }
+            Back(why, reason) => {
+                self.finish_back(why, reason)?;
                 Ok(Tick::Moved)
             }
             Done => {
@@ -446,28 +701,58 @@ impl Engine {
     }
 
     fn finish(&mut self, outcome: Outcome, detail: String) -> anyhow::Result<()> {
+        self.finish_as(outcome, detail, String::new())
+    }
+
+    fn finish_back(&mut self, detail: String, reason: String) -> anyhow::Result<()> {
+        self.finish_as(Outcome::RolledBack, detail, reason)
+    }
+
+    fn finish_as(
+        &mut self,
+        outcome: Outcome,
+        detail: String,
+        reason: String,
+    ) -> anyhow::Result<()> {
         let now = (self.now)();
+        let ok = outcome == Outcome::Committed;
+        steps::close(
+            &mut self.record.steps,
+            if ok { State::Done } else { State::Failed },
+            now,
+        );
+        self.note(detail.clone());
+        self.progress.stop();
         let b = self.record.before.take();
+        let first = self.record.steps.iter().find(|t| t.step > Step::Verify);
         self.record.history.insert(
             0,
             Entry {
                 release: self.record.release.clone(),
                 outcome,
-                started: b.as_ref().map(|b| b.started).unwrap_or(now),
+                started: b
+                    .as_ref()
+                    .map(|b| b.started)
+                    .or(first.map(|t| t.started))
+                    .unwrap_or(now),
                 finished: now,
                 snapshot: b.and_then(|b| b.snapshot),
                 detail: detail.clone(),
+                steps: self.record.steps.clone(),
+                log: self.record.log.clone(),
+                by: self.record.by.clone(),
+                rollback_reason: reason,
             },
         );
         self.record.history.truncate(HISTORY);
-        if outcome == Outcome::Committed {
+        if ok {
             self.record.error.clear();
         } else {
             tracing::error!(%detail, "update stopped");
             self.record.error = detail;
         }
-        // A failed update stays verified, so it can be applied again.
-        if outcome != Outcome::Failed {
+        // A failed or rolled back update stays verified, so it can be applied again.
+        if !matches!(outcome, Outcome::Failed | Outcome::RolledBack) {
             self.record.release = None;
         }
         self.go(Phase::Idle)?;
@@ -493,16 +778,25 @@ impl Engine {
         let _ = std::fs::remove_dir_all(&dir);
         self.detail = "checking the signature and unpacking".into();
         let bundle = self.uploads().bundle();
-        let (d, verifier) = (dir.clone(), self.verifier.clone());
-        let unpacked =
-            tokio::task::spawn_blocking(move || bundle::unpack(&bundle, &d, &verifier)).await?;
+        let size = std::fs::metadata(&bundle).map_or(0, |m| m.len());
+        self.progress.start(size.max(1), (self.now)());
+        let (d, verifier, progress) = (dir.clone(), self.verifier.clone(), self.progress.clone());
+        let unpacked = tokio::task::spawn_blocking(move || {
+            bundle::unpack_counting(&bundle, &d, &verifier, &progress.done)
+        })
+        .await?;
+        self.progress.stop();
         let release = match unpacked.and_then(|manifest| {
             let refs = bundle::release_refs(&dir)?;
+            let images = bundle::layout_images(&dir.join(bundle::IMAGES))?;
             Ok(Release {
                 sha256: sha.into(),
                 manifest,
                 refs,
-                os_done: false,
+                notes: bundle::notes(&dir),
+                signer: self.verifier.signer(),
+                images,
+                ..Release::default()
             })
         }) {
             Ok(r) => r,
@@ -513,16 +807,112 @@ impl Engine {
                 return Ok(Tick::Moved);
             }
         };
-        self.record.release = Some(release.clone());
-        if let Some(why) = self.refusal(&release).await {
+        self.refresh_unit().await;
+        let mut release = release;
+        let refusal = self.refusal(&release).await;
+        let (checks, diff, short) = self.assess(&release, refusal.as_deref()).await;
+        (release.checks, release.diff) = (checks, Some(diff));
+        self.record.release = Some(release);
+        if let Some(why) = refusal.or(short) {
             let _ = std::fs::remove_dir_all(&dir);
             self.finish(Outcome::Refused, why)?;
             return Ok(Tick::Moved);
         }
         self.uploads().discard();
         self.record.error.clear();
+        steps::close(&mut self.record.steps, State::Done, (self.now)());
+        self.note("verified");
         self.go(Phase::Idle)?;
         Ok(Tick::Moved)
+    }
+
+    /// What verification found, for a person: each check passed or not, and
+    /// what applying changes. Also why the images would not fit, if they
+    /// would not.
+    async fn assess(
+        &self,
+        rel: &Release,
+        refusal: Option<&str>,
+    ) -> (Vec<Check>, Diff, Option<String>) {
+        let u = &self.unit;
+        let mut checks = vec![Check::new(
+            "signature",
+            CheckState::Pass,
+            rel.signer.clone(),
+        )];
+        checks.push(match refusal {
+            None => Check::new("compatible", CheckState::Pass, ""),
+            Some(why) => Check::new("compatible", CheckState::Fail, why),
+        });
+        let layout = self.release_dir(&rel.sha256).join(bundle::IMAGES);
+        let mut short = None;
+        match (self.registry.missing(&layout), self.registry.usage()) {
+            (Ok(need), Ok((_, free))) => {
+                let detail = format!("{need} bytes to store, {free} free");
+                if need <= free {
+                    checks.push(Check::new("space", CheckState::Pass, detail));
+                } else {
+                    short = Some(format!(
+                        "the images need {need} bytes and the image store has {free} free"
+                    ));
+                    checks.push(Check::new("space", CheckState::Fail, detail));
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => checks.push(Check::new(
+                "space",
+                CheckState::Note,
+                format!("unknown: {e:#}"),
+            )),
+        }
+        let reboot = os_changes(&rel.manifest, &u.talos_version, &u.installer);
+        let config_changes = match async {
+            let next = self.merged(rel).await?;
+            anyhow::Ok(!same_config(&next, &self.talos.machine_config().await?))
+        }
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    error = format!("{e:#}"),
+                    "could not compare the machine config"
+                );
+                true
+            }
+        };
+        let downtime = if reboot { self.reboot_secs() } else { 0 };
+        checks.push(Check::new(
+            "reboot",
+            CheckState::Note,
+            if reboot { "needed" } else { "none" },
+        ));
+        checks.push(Check::new(
+            "downtime",
+            CheckState::Note,
+            format!("{downtime}"),
+        ));
+        let before = self.record.running(&u.stack_tag);
+        let diff = Diff {
+            components: diff::components(&u.components, &rel.components(), before.is_some()),
+            talos: (u.talos_version.clone(), rel.get("TALOS_VERSION").into()),
+            installer: (u.installer.clone(), rel.get("INSTALLER_REF").into()),
+            stack: (u.stack_tag.clone(), rel.tag().into()),
+            reboot,
+            config_changes,
+            downtime_secs: downtime,
+            removals_known: before.is_some(),
+        };
+        (checks, diff, short)
+    }
+
+    /// The unit's last reboot through an update, else a guess.
+    fn reboot_secs(&self) -> i64 {
+        self.record
+            .history
+            .iter()
+            .flat_map(|e| &e.steps)
+            .find(|t| t.step == Step::Reboot && t.state == State::Done && t.finished > t.started)
+            .map_or(REBOOT, |t| t.finished - t.started)
     }
 
     /// Why this unit must not take `rel`, checked with reads alone.
@@ -532,17 +922,7 @@ impl Engine {
 
     async fn check(&self, rel: &Release) -> anyhow::Result<()> {
         use anyhow::ensure;
-        for k in [
-            "FORMAT",
-            "STACK_TAG",
-            "STACK_DIGEST",
-            "INSTALLER_REF",
-            "TALOS_VERSION",
-            "BUILT_EPOCH",
-            "SECUREBOOT",
-        ] {
-            ensure!(!rel.get(k).is_empty(), "the MANIFEST lacks {k}");
-        }
+        manifest_check(&rel.manifest)?;
         let dir = self.release_dir(&rel.sha256);
         let listed = bundle::listed_refs(&dir)?.is_some();
         match rel.get("FORMAT") {
@@ -560,7 +940,7 @@ impl Engine {
         let lacking: Vec<&str> = rel
             .refs
             .iter()
-            .filter(|r| !carried.contains(*r) && !self.registry.holds(r))
+            .filter(|r| !carried.contains(*r) && self.registry.digest(r).is_none())
             .map(String::as_str)
             .collect();
         ensure!(
@@ -568,18 +948,7 @@ impl Engine {
             "the bundle relies on images the unit does not hold: {}",
             lacking.join(", ")
         );
-        ensure!(
-            rel.get("INSTALLER_REF").contains("@sha256:"),
-            "the MANIFEST names the installer by tag, not digest"
-        );
-        ensure!(
-            rel.get("STACK_DIGEST").starts_with("sha256:"),
-            "the MANIFEST's STACK_DIGEST is not a sha256"
-        );
-        let epoch: i64 = rel
-            .get("BUILT_EPOCH")
-            .parse()
-            .context("BUILT_EPOCH is not a number")?;
+        let epoch: i64 = rel.get("BUILT_EPOCH").parse()?;
 
         let running = self
             .talos
@@ -735,6 +1104,8 @@ impl Engine {
             started: (self.now)(),
             snapshot: None,
             installer: installer_of(&running),
+            rollback_by: String::new(),
+            backed_out: false,
         });
         Ok(Go(Phase::Importing))
     }
@@ -831,8 +1202,21 @@ impl Engine {
         Ok(Go(Phase::Installing))
     }
 
+    fn skip_step(&mut self) {
+        if let Some(t) = self
+            .record
+            .steps
+            .last_mut()
+            .filter(|t| t.state == State::Running)
+        {
+            t.state = State::Skipped;
+            t.finished = (self.now)();
+        }
+    }
+
     async fn installing(&mut self) -> anyhow::Result<Next> {
         if self.release()?.os_done {
+            self.skip_step();
             return Ok(Go(Phase::Seeding));
         }
         let b = self.boot().await?;
@@ -859,6 +1243,7 @@ impl Engine {
                     if let Some(r) = self.record.release.as_mut() {
                         r.os_done = true;
                     }
+                    self.skip_step();
                     return Ok(Go(Phase::Seeding));
                 }
                 Err(e) => {
@@ -891,11 +1276,14 @@ impl Engine {
         if self.left_old_os().await? {
             return Ok(Go(Phase::Trial));
         }
-        Ok(Fail(format!(
-            "the unit rebooted on its previous OS, as the install did not take or the new OS did not stay up; \
-             {}. The stack did not move; applying again repeats the upgrade",
-            self.restore().await?
-        )))
+        Ok(Back(
+            format!(
+                "the unit rebooted on its previous OS, as the install did not take or the new OS did not stay up; \
+                 {}. The stack did not move; applying again repeats the upgrade",
+                self.restore().await?
+            ),
+            "the new OS did not boot".into(),
+        ))
     }
 
     /// Puts the saved config back, now and for every boot after. Without a
@@ -931,11 +1319,24 @@ impl Engine {
         if !b.running().eq_ignore_ascii_case(&b.default)
             || b.default.eq_ignore_ascii_case(&before.default_entry)
         {
-            return Ok(Fail(format!(
-                "the new OS did not stay up, and the unit went back to its previous OS by itself; {}. \
-                 The stack did not move; applying again repeats the upgrade",
-                self.restore().await?
-            )));
+            let (why, reason) = if before.backed_out {
+                (
+                    "an operator rolled the new OS back on its trial",
+                    asked(&before.rollback_by),
+                )
+            } else {
+                (
+                    "the new OS did not stay up, and the unit went back to its previous OS by itself",
+                    "the new OS did not stay up".into(),
+                )
+            };
+            return Ok(Back(
+                format!(
+                    "{why}; {}. The stack did not move; applying again repeats the upgrade",
+                    self.restore().await?
+                ),
+                reason,
+            ));
         }
         let want = self.release()?.get("TALOS_VERSION").to_string();
         let running = self.talos.version().await?;
@@ -1064,10 +1465,20 @@ impl Engine {
             )));
         }
         let (good, rolled_back) = self.judge().await?;
+        let asked_by = self.before()?.rollback_by.clone();
         if rolled_back != rolled_back_before && rolled_back.starts_with(&format!("{tag} ")) {
-            return Ok(Fail(format!(
-                "the unit found {tag} unhealthy and rolled the stack back to {good} ({rolled_back})"
-            )));
+            if !asked_by.is_empty() {
+                return Ok(Back(
+                    format!("{tag} was rolled back to {good} as {asked_by} asked ({rolled_back})"),
+                    asked(&asked_by),
+                ));
+            }
+            return Ok(Back(
+                format!(
+                    "the unit found {tag} unhealthy and rolled the stack back to {good} ({rolled_back})"
+                ),
+                format!("{tag} stayed unhealthy"),
+            ));
         }
         if good == tag {
             return Ok(Go(Phase::Collecting));
@@ -1077,6 +1488,12 @@ impl Engine {
             .sync(&self.settings.stack.flux_instance)
             .await?;
         if now != tag {
+            if !asked_by.is_empty() {
+                return Ok(Back(
+                    format!("{tag} was rolled back to {now} as {asked_by} asked"),
+                    asked(&asked_by),
+                ));
+            }
             return Ok(Fail(format!(
                 "an operator moved the stack to {now} while {tag} was on trial; the update ends here"
             )));
@@ -1093,6 +1510,282 @@ impl Engine {
         self.registry.retain(&self.keep(keep).await?)?;
         Ok(Done)
     }
+
+    /// The trial running, if any: the stack's, which the judge holds.
+    fn stack_trial(&self) -> Option<String> {
+        match &self.record.phase {
+            Phase::Judging { .. } => self.record.release.as_ref().map(|r| r.tag().to_string()),
+            Phase::Idle
+                if !self.unit.trial.is_empty() && self.unit.trial == self.unit.stack_tag =>
+            {
+                Some(self.unit.trial.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Asks the judge to commit the stack on trial now.
+    pub async fn request_commit(&mut self, tag: &str, by: &str) -> anyhow::Result<()> {
+        let trial = self.stack_trial().context("no stack is on trial")?;
+        anyhow::ensure!(trial == tag, "{trial} is on trial, not {tag}");
+        let j = self.judge_now().await?;
+        anyhow::ensure!(
+            j.takes("commit"),
+            "the unit's judge takes no commit requests"
+        );
+        self.cluster
+            .set_key(
+                &self.settings.stack.judge,
+                judge::REQUEST,
+                &judge::request("commit", tag),
+            )
+            .await?;
+        self.note(format!("{} asked to commit {tag}", who(by)));
+        Ok(())
+    }
+
+    /// Rolls back: the OS on trial through Talos, the stack on trial through its
+    /// judge, or with nothing on trial, the stack to the judge's previous good.
+    pub async fn request_rollback(&mut self, tag: &str, by: &str) -> anyhow::Result<String> {
+        match self.record.phase.clone() {
+            Phase::Trial => {
+                let rel = self.release()?.tag().to_string();
+                anyhow::ensure!(rel == tag, "{rel} is on trial, not {tag}");
+                let b = self.boot().await?;
+                anyhow::ensure!(b.trial(), "the new OS is not on trial");
+                if let Some(b) = self.record.before.as_mut() {
+                    b.rollback_by = by.into();
+                    b.backed_out = true;
+                }
+                self.note(format!("{} asked to roll the new OS back", who(by)));
+                self.save()?;
+                if let Err(e) = self.talos.rollback().await {
+                    if let Some(b) = self.record.before.as_mut() {
+                        b.backed_out = false;
+                    }
+                    self.save()?;
+                    return Err(e);
+                }
+                Ok(format!(
+                    "rolling the new OS, {}, back: the unit boots {} again",
+                    b.selected,
+                    self.before()?.default_entry
+                ))
+            }
+            Phase::Judging { .. } => {
+                let rel = self.release()?.tag().to_string();
+                anyhow::ensure!(rel == tag, "{rel} is on trial, not {tag}");
+                if let Some(b) = self.record.before.as_mut() {
+                    b.rollback_by = by.into();
+                }
+                self.note(format!("{} asked to roll {tag} back", who(by)));
+                self.save()?;
+                let st = self.settings.stack.clone();
+                if self.judge_now().await?.takes("rollback") {
+                    self.cluster
+                        .set_key(&st.judge, judge::REQUEST, &judge::request("rollback", tag))
+                        .await?;
+                } else {
+                    let b = self.before()?.clone();
+                    self.cluster
+                        .repoint(&st.flux_instance, &b.url, &b.tag, None)
+                        .await?;
+                }
+                Ok(format!("rolling {tag} back"))
+            }
+            Phase::Idle if self.stack_trial().as_deref() == Some(tag) => {
+                anyhow::ensure!(
+                    self.judge_now().await?.takes("rollback"),
+                    "the unit's judge takes no rollback requests"
+                );
+                self.cluster
+                    .set_key(
+                        &self.settings.stack.judge,
+                        judge::REQUEST,
+                        &judge::request("rollback", tag),
+                    )
+                    .await?;
+                Ok(format!("rolling {tag} back"))
+            }
+            Phase::Idle => self.revert(tag, by).await,
+            _ => anyhow::bail!("the update is under way: nothing is on trial to roll back"),
+        }
+    }
+
+    /// Points the stack at the judge's previous good release, which the judge
+    /// then takes on trial like any other.
+    async fn revert(&mut self, tag: &str, by: &str) -> anyhow::Result<String> {
+        let j = self.judge_now().await?;
+        let st = self.settings.stack.clone();
+        let (_, running) = self.cluster.sync(&st.flux_instance).await?;
+        anyhow::ensure!(
+            !j.previous.is_empty(),
+            "the unit has no previous good release"
+        );
+        anyhow::ensure!(
+            j.previous == tag,
+            "the previous good release is {}, not {tag}",
+            j.previous
+        );
+        anyhow::ensure!(
+            j.trial.is_empty() && running == j.good,
+            "the unit runs {running}, not its good release {}",
+            j.good
+        );
+        let release = self
+            .record
+            .history
+            .iter()
+            .filter_map(|e| e.release.as_ref())
+            .find(|r| r.tag() == tag)
+            .cloned();
+        if let Some(r) = &release {
+            anyhow::ensure!(
+                r.refs.iter().all(|i| self.registry.digest(i).is_some()),
+                "{tag}'s images were collected: it can only be uploaded again"
+            );
+        }
+        let path = release
+            .as_ref()
+            .and_then(|r| r.manifest.get("STACK_PATH"))
+            .cloned();
+        self.cluster
+            .repoint(&st.flux_instance, &st.url, tag, path.as_deref())
+            .await?;
+        if let Err(e) = self.cluster.reconcile(&st.source).await {
+            tracing::warn!(error = %e, "could not ask Flux to fetch now; it will on its interval");
+        }
+        let now = (self.now)();
+        let detail = format!("{running} rolled back to {tag}");
+        self.record.history.insert(
+            0,
+            Entry {
+                release,
+                outcome: Outcome::RolledBack,
+                detail: detail.clone(),
+                started: now,
+                finished: now,
+                snapshot: None,
+                steps: Vec::new(),
+                log: vec![LogLine {
+                    unix: now,
+                    text: format!("{} asked to roll {running} back to {tag}", who(by)),
+                }],
+                by: by.into(),
+                rollback_reason: asked(by),
+            },
+        );
+        self.record.history.truncate(HISTORY);
+        self.save()?;
+        Ok(detail)
+    }
+
+    async fn judge_now(&self) -> anyhow::Result<Judge> {
+        Ok(Judge::read(
+            &self
+                .cluster
+                .config_map(&self.settings.stack.judge)
+                .await?
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// The refs a collection keeps: what runs, the release verified or being
+    /// applied, and the release running; and the previous good release's.
+    async fn kept(&self) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+        let mut now = self
+            .keep(
+                self.record
+                    .release
+                    .as_ref()
+                    .map(|r| r.refs.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
+        if let Some(r) = self.record.running(&self.unit.stack_tag) {
+            now.extend(r.refs.iter().cloned());
+        }
+        let previous = self
+            .record
+            .history
+            .iter()
+            .filter_map(|e| e.release.as_ref())
+            .find(|r| !self.unit.previous.is_empty() && r.tag() == self.unit.previous)
+            .map(|r| r.refs.clone())
+            .unwrap_or_default();
+        Ok((now, previous))
+    }
+
+    pub async fn storage(&self) -> anyhow::Result<Storage> {
+        let (now, previous) = self.kept().await?;
+        let both: BTreeSet<String> = now.union(&previous).cloned().collect();
+        let registry = self.registry.clone();
+        tokio::task::spawn_blocking(move || {
+            let (held, free) = registry.usage()?;
+            let beyond_now = registry.reclaimable(&now)?;
+            let reclaimable = registry.reclaimable(&both)?;
+            anyhow::Ok(Storage {
+                held,
+                previous: beyond_now.saturating_sub(reclaimable),
+                reclaimable,
+                free,
+            })
+        })
+        .await?
+    }
+
+    /// Drops what no kept release names; the previous one's too if asked.
+    pub async fn collect(&mut self, previous: bool) -> anyhow::Result<u64> {
+        anyhow::ensure!(self.idle(), "an update is in progress");
+        let (mut keep, prev) = self.kept().await?;
+        if !previous {
+            keep.extend(prev);
+        }
+        let registry = self.registry.clone();
+        tokio::task::spawn_blocking(move || registry.retain(&keep)).await?
+    }
+}
+
+fn who(by: &str) -> &str {
+    if by.is_empty() { "an operator" } else { by }
+}
+
+fn asked(by: &str) -> String {
+    format!("{} asked", who(by))
+}
+
+fn phase_word(p: &Phase) -> &'static str {
+    match p {
+        Phase::Idle => "idle",
+        Phase::Verifying { .. } => "verifying",
+        Phase::Starting => "starting",
+        Phase::Importing => "importing the images",
+        Phase::Snapshotting => "copying the store",
+        Phase::Staging => "staging the machine config",
+        Phase::Installing => "installing the OS",
+        Phase::Rebooting { .. } => "rebooting",
+        Phase::Trial => "the new OS is on trial",
+        Phase::Settling => "the new OS is committed; waiting for the system to settle",
+        Phase::Seeding => "updating the judge",
+        Phase::AwaitingGood => "waiting for the judge",
+        Phase::Repointing { .. } => "moving the stack",
+        Phase::Judging { .. } => "the new stack is on trial",
+        Phase::Collecting => "collecting old images",
+    }
+}
+
+/// The same documents, whatever their order or formatting.
+fn same_config(a: &str, b: &str) -> bool {
+    let docs = |y: &str| -> Option<Vec<serde_yaml::Value>> {
+        let mut d: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(y)
+            .map(serde_yaml::Value::deserialize)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        d.retain(|v| !v.is_null());
+        d.sort_by_key(|v| serde_yaml::to_string(v).unwrap_or_default());
+        Some(d)
+    };
+    docs(a).is_some_and(|a| Some(a) == docs(b))
 }
 
 /// The installer a machine config names: its unattended install's, else `machine.install`'s.
