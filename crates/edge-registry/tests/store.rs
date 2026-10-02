@@ -221,17 +221,18 @@ fn retain_keeps_exactly_the_keep_set() {
     let t = three_releases();
     let before = t.store.list().unwrap();
     assert_eq!((before.manifests, before.blobs), (4, 9));
+    let keep = [
+        r("ghcr.io/o/app:3"),
+        r(&format!(
+            "ghcr.io/o/helper@{}",
+            t.store.resolve("ghcr.io/o/helper", "1").unwrap()
+        )),
+    ];
 
-    let swept = t
-        .store
-        .retain(&[
-            r("ghcr.io/o/app:3"),
-            r(&format!(
-                "ghcr.io/o/helper@{}",
-                t.store.resolve("ghcr.io/o/helper", "1").unwrap()
-            )),
-        ])
-        .unwrap();
+    let would = t.store.reclaimable(&keep).unwrap();
+    assert_eq!(t.store.list().unwrap(), before, "a dry run deleted");
+    let swept = t.store.retain(&keep).unwrap();
+    assert_eq!(would, swept);
 
     assert_eq!(tags(&t.store), ["ghcr.io/o/app:3", "ghcr.io/o/helper:1"]);
     let after = t.store.list().unwrap();
