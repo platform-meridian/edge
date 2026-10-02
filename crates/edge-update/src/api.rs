@@ -1097,4 +1097,301 @@ mod tests {
         assert_eq!(log(&r, 7).unwrap()[0].text, "then");
         assert!(log(&r, 9).is_none());
     }
+
+    #[test]
+    fn an_upload_says_everything_it_holds() {
+        let mut u = uploading(Some("r/i:1@sha256:aa"));
+        u.complete = true;
+        u.finished = 200;
+        u.refused = "not ours".into();
+        u.head.as_mut().unwrap().notes = Some("# 2".into());
+        u.head.as_mut().unwrap().signer = "SHA256:x k".into();
+        let p = upload(&u);
+        assert_eq!(
+            (
+                p.sha256.clone(),
+                p.size,
+                p.chunk_size,
+                p.received.clone(),
+                p.complete
+            ),
+            (vec![0xaa; 32], 10, 4, vec![1], true)
+        );
+        assert_eq!(
+            (
+                p.started_unix,
+                p.finished_unix,
+                p.by.as_str(),
+                p.active_unix,
+                p.refused.as_str()
+            ),
+            (100, 200, "ann", 990, "not ours")
+        );
+        let h = p.head.as_option().unwrap();
+        assert_eq!(
+            (
+                h.manifest["TALOS_VERSION"].as_str(),
+                h.notes.as_str(),
+                h.signer.as_str()
+            ),
+            ("v1.14.1", "# 2", "SHA256:x k")
+        );
+    }
+
+    #[test]
+    fn a_release_carries_its_checks_diff_and_components() {
+        use crate::diff::{ComponentChange, Diff};
+        let comp = |v: &str| Component {
+            name: "app".into(),
+            image: format!("r.io/app:{v}"),
+            version: v.into(),
+            digest: format!("sha256:{v}"),
+            dirty: v == "2",
+        };
+        let r = Release {
+            sha256: "bb".repeat(32),
+            manifest: [
+                ("STACK_TAG", "s2"),
+                ("TALOS_VERSION", "v1.15.0"),
+                ("BUILT_EPOCH", "77"),
+                ("COMPONENT_APP", "r.io/app:2 sha256:2 2 dirty=true"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            notes: Some("notes".into()),
+            signer: "SHA256:k s".into(),
+            images: [("r.io/app:2".to_string(), "sha256:2".to_string())].into(),
+            checks: vec![
+                Check::new("space", CheckState::Fail, "full"),
+                Check::new("reboot", CheckState::Note, "needed"),
+                Check::new("signature", CheckState::Pass, "k"),
+            ],
+            diff: Some(Diff {
+                components: vec![ComponentChange {
+                    name: "app".into(),
+                    change: Change::Changed,
+                    from: Some(comp("1")),
+                    to: Some(comp("2")),
+                }],
+                talos: ("v1.14.1".into(), "v1.15.0".into()),
+                installer: ("i@sha256:1".into(), "i@sha256:2".into()),
+                stack: ("s1".into(), "s2".into()),
+                reboot: true,
+                config_changes: true,
+                downtime_secs: 120,
+                removals_known: true,
+            }),
+            ..Release::default()
+        };
+        let p = release(&r);
+        assert_eq!(
+            (
+                p.stack_tag.as_str(),
+                p.talos_version.as_str(),
+                p.built_epoch,
+                p.sha256.clone()
+            ),
+            ("s2", "v1.15.0", 77, vec![0xbb; 32])
+        );
+        assert_eq!(
+            (p.notes.as_str(), p.signer.as_str()),
+            ("notes", "SHA256:k s")
+        );
+        assert_eq!(p.manifest.len(), 4);
+        let checks: Vec<_> = p
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.state, c.detail.as_str()))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ("space", pb::CheckState::CHECK_STATE_FAIL.into(), "full"),
+                ("reboot", pb::CheckState::CHECK_STATE_NOTE.into(), "needed"),
+                ("signature", pb::CheckState::CHECK_STATE_PASS.into(), "k"),
+            ]
+        );
+        let d = p.diff.as_option().unwrap();
+        assert_eq!(
+            (
+                d.talos_from.as_str(),
+                d.talos_to.as_str(),
+                d.installer_from.as_str(),
+                d.installer_to.as_str(),
+                d.stack_from.as_str(),
+                d.stack_to.as_str()
+            ),
+            ("v1.14.1", "v1.15.0", "i@sha256:1", "i@sha256:2", "s1", "s2")
+        );
+        assert_eq!(
+            (
+                d.reboot,
+                d.config_changes,
+                d.downtime_secs,
+                d.removals_known
+            ),
+            (true, true, 120, true)
+        );
+        let c = &d.components[0];
+        assert_eq!(
+            (c.name.as_str(), c.change),
+            ("app", pb::Change::CHANGE_CHANGED.into())
+        );
+        let (from, to) = (c.from.as_option().unwrap(), c.to.as_option().unwrap());
+        assert_eq!(
+            (
+                from.version.as_str(),
+                to.version.as_str(),
+                to.digest.as_str(),
+                to.image.as_str(),
+                to.dirty,
+                from.dirty
+            ),
+            ("1", "2", "sha256:2", "r.io/app:2", true, false)
+        );
+        assert_eq!(to.kind, pb::ComponentKind::COMPONENT_KIND_IMAGE);
+        let comps: Vec<_> = p
+            .components
+            .iter()
+            .map(|c| (c.name.as_str(), c.version.as_str(), c.dirty))
+            .collect();
+        assert_eq!(comps, [("app", "2", true)]);
+        for (ch, want) in [
+            (Change::Unchanged, pb::Change::CHANGE_UNCHANGED),
+            (Change::Added, pb::Change::CHANGE_ADDED),
+            (Change::Removed, pb::Change::CHANGE_REMOVED),
+        ] {
+            let d = diff(&Diff {
+                components: vec![ComponentChange {
+                    name: "x".into(),
+                    change: ch,
+                    from: None,
+                    to: None,
+                }],
+                ..Diff::default()
+            });
+            assert_eq!(d.components[0].change, want);
+        }
+    }
+
+    #[test]
+    fn the_unit_and_an_entry_say_everything_they_hold() {
+        let u = unit(&Unit {
+            installer: "i@sha256:1".into(),
+            flux_version: "v2.6.4".into(),
+            components: vec![Component {
+                name: "app".into(),
+                ..Component::default()
+            }],
+            manifest: [("GIT_REV".to_string(), "abc".to_string())].into(),
+            ..Unit::default()
+        });
+        assert_eq!(
+            (
+                u.installer.as_str(),
+                u.flux_version.as_str(),
+                u.components[0].name.as_str(),
+                u.manifest["GIT_REV"].as_str()
+            ),
+            ("i@sha256:1", "v2.6.4", "app", "abc")
+        );
+        let mut steps = Vec::new();
+        steps::enter(&mut steps, Step::Trial, 5);
+        steps::close(&mut steps, State::Failed, 9);
+        let e = entry(&Entry {
+            release: None,
+            outcome: Outcome::RolledBack,
+            detail: "d".into(),
+            started: 5,
+            finished: 9,
+            snapshot: Some("ff".into()),
+            steps,
+            log: Vec::new(),
+            by: "ann".into(),
+            rollback_reason: "s2 stayed unhealthy".into(),
+        });
+        assert_eq!(e.outcome, pb::Outcome::OUTCOME_ROLLED_BACK);
+        assert_eq!(
+            (
+                e.detail.as_str(),
+                e.started_unix,
+                e.finished_unix,
+                e.snapshot_sha256.as_str(),
+                e.by.as_str(),
+                e.rollback_reason.as_str()
+            ),
+            ("d", 5, 9, "ff", "ann", "s2 stayed unhealthy")
+        );
+        let s = &e.steps[0];
+        assert_eq!(
+            (s.kind, s.state, s.started_unix, s.finished_unix),
+            (
+                pb::StepKind::STEP_KIND_TRIAL.into(),
+                pb::StepState::STEP_STATE_FAILED.into(),
+                5,
+                9
+            )
+        );
+        let kinds: Vec<_> = [
+            Step::Upload,
+            Step::Verify,
+            Step::Stage,
+            Step::Install,
+            Step::Reboot,
+            Step::OsTrial,
+            Step::Stack,
+            Step::Trial,
+            Step::Commit,
+        ]
+        .into_iter()
+        .map(|k| {
+            step(&Taken {
+                step: k,
+                state: State::Pending,
+                started: 0,
+                finished: 0,
+            })
+            .kind
+            .to_i32()
+        })
+        .collect();
+        assert_eq!(kinds, (1..=9).collect::<Vec<_>>());
+        let states: Vec<_> = [
+            State::Pending,
+            State::Running,
+            State::Done,
+            State::Failed,
+            State::Skipped,
+        ]
+        .into_iter()
+        .map(|st| {
+            step(&Taken {
+                step: Step::Upload,
+                state: st,
+                started: 0,
+                finished: 0,
+            })
+            .state
+            .to_i32()
+        })
+        .collect();
+        assert_eq!(states, (1..=5).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn progress_reaches_the_status() {
+        let s = Snapshot {
+            progress: Some((5, 10, 99)),
+            ..Snapshot::default()
+        };
+        let p = status(&s, None, 0).progress.into_option().unwrap();
+        assert_eq!((p.done, p.total, p.started_unix), (5, 10, 99));
+        assert!(
+            status(&Snapshot::default(), None, 0)
+                .progress
+                .as_option()
+                .is_none()
+        );
+    }
 }
