@@ -5,7 +5,6 @@ description = "Meridian Edge: hardware watchdog tied to workload liveness"
 publish.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "net", "time", "io-util"] }

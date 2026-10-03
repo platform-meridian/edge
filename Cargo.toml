@@ -25,7 +25,6 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MPL-2.0"
-rust-version = "1.98"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util"] }

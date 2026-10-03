@@ -5,7 +5,6 @@ description = "Meridian Edge: fail-closed Gateway API ingress"
 publish.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 edge-common = { path = "../edge-common" }

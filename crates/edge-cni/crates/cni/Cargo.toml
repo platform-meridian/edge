@@ -5,7 +5,6 @@ description = "Meridian Edge: CNI plugin and daemon, with services and NetworkPo
 publish.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 edge-common = { path = "../../../edge-common" }

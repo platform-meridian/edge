@@ -5,7 +5,6 @@ description = "Meridian Edge: shared daemon runtime (shutdown, logging, durable 
 publish.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 landlock = "0.4.7"
