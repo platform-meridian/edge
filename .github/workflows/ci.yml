@@ -88,6 +88,7 @@ jobs:
         working-directory: ${{ matrix.dir }}/fuzz
 
   build:
+    needs: [check, deny, conformance, fuzz]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     steps:
@@ -108,7 +109,7 @@ jobs:
             !target/x86_64-unknown-linux-musl/release/*.d
 
   image:
-    needs: [check, deny, conformance, fuzz, build]
+    needs: build
     runs-on: ubuntu-26.04
     permissions:
       contents: read
