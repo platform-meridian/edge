@@ -1,14 +1,11 @@
-# Verifies signed update bundles and applies them to this node through its own
-# Talos API. The consumer supplies ConfigMap edge-update (config.yaml, see
-# crates/edge-update), Talos API access with os:admin for namespace edge, and
-# the edge-update and edge-registry user volumes.
+# Applies signed update bundles through the node's Talos API. The consumer supplies
+# ConfigMap edge-update, Talos os:admin for namespace edge, and both user volumes.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: edge-update
   namespace: edge
 ---
-# Talos answers this with Secret edge-update: a talosconfig holding the role.
 apiVersion: talos.dev/v1alpha1
 kind: ServiceAccount
 metadata:
@@ -17,9 +14,6 @@ metadata:
 spec:
   roles: ["os:admin"]
 ---
-# The stack's pointer and records, what a bundle's seed applies, and the
-# workloads whose images the store keeps. Holding the seed's own grants is what
-# lets it create a Role carrying them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -69,7 +63,6 @@ metadata:
   labels: { app: edge-update }
 spec:
   replicas: 1
-  # One engine per record: the old pod must be gone before the new one starts.
   strategy: { type: Recreate }
   selector: { matchLabels: { app: edge-update } }
   template:
@@ -77,8 +70,7 @@ spec:
       labels: { app: edge-update }
     spec:
       serviceAccountName: edge-update
-      # Talos's API and the apiserver on loopback, so an update or rollback
-      # never waits on the pod network or cluster DNS it may be replacing.
+      # Loopback only, so an update never waits on the network it replaces.
       hostNetwork: true
       dnsPolicy: Default
       priorityClassName: system-cluster-critical
@@ -90,12 +82,10 @@ spec:
           env:
             - { name: KUBERNETES_SERVICE_HOST, value: "@APISERVER_HOST@" }
             - { name: KUBERNETES_SERVICE_PORT, value: "@APISERVER_PORT@" }
-            # Loopback only: whatever runs on the host reaches it, the network does not.
             - { name: EDGE_UPDATE_LISTEN, value: "127.0.0.1:7443" }
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { memory: 256Mi }
-          # Root owns the volumes; no capability is needed to write them.
           securityContext:
             runAsUser: 0
             allowPrivilegeEscalation: false
@@ -112,8 +102,7 @@ spec:
           configMap: { name: edge-update }
         - name: talos
           secret: { secretName: edge-update }
-        # Directory, not DirectoryOrCreate: until the volume mounts, a created
-        # directory would put the record on EPHEMERAL, which a repair wipes.
+        # Directory: a created one would put the record on EPHEMERAL.
         - name: state
           hostPath: { path: /var/mnt/edge-update, type: Directory }
         - name: registry
