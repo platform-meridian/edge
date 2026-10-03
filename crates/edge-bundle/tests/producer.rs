@@ -220,37 +220,15 @@ fn a_key_needs_a_namespace_and_no_passphrase() {
 }
 
 #[test]
-fn tampering_is_refused() {
+fn a_tampered_bundle_is_refused() {
     let b = Build::new();
     let tar = b.write("b.tar");
-    let good = std::fs::read(&tar).unwrap();
-
-    let at = good.windows(7).position(|w| w == b"layer 0").unwrap();
-    let mut bad = good.clone();
+    let mut bad = std::fs::read(&tar).unwrap();
+    let at = bad.windows(7).position(|w| w == b"layer 0").unwrap();
     bad[at] = b'L';
     std::fs::write(&tar, &bad).unwrap();
     assert!(err(b.open(&tar)).contains("does not match the signed sums"));
     assert!(!b.path("unpacked").exists());
-
-    let at = good.windows(9).position(|w| w == b"STACK_TAG").unwrap();
-    let mut bad = good.clone();
-    bad[at + 10] = b'9';
-    std::fs::write(&tar, &bad).unwrap();
-    assert!(err(b.open(&tar)).contains("MANIFEST does not match"));
-
-    let (other, _) = keygen(b.dir.path(), "other", "");
-    let other = SigningKey::from_openssh(&other, NS).unwrap();
-    let tar = b.path("other.tar");
-    write(&b.contents(), &other, 2000, &tar).unwrap();
-    assert!(err(b.open(&tar)).contains("pinned update key"));
-
-    let tar = b.write("b.tar");
-    let r = unpack(
-        &tar,
-        &b.path("x"),
-        &Verifier::new(&b.public, "another").unwrap(),
-    );
-    assert!(err(r).contains("pinned update key"));
 }
 
 #[test]

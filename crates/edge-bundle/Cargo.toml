@@ -1,13 +1,13 @@
 [package]
 name = "edge-bundle"
 version.workspace = true
-description = "Meridian Edge: the update bundle and machine-config patch formats, for the unit that reads them and the tools that write them"
+description = "Meridian Edge: the update bundle and machine-config patch formats"
 publish.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [features]
-# Bundles sealed with ssh-keygen, as a build shell does: a reference producer for tests.
+# A reference bundle producer for tests, sealing with ssh-keygen.
 testkit = []
 
 [dependencies]

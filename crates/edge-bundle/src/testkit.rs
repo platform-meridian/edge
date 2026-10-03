@@ -29,7 +29,7 @@ pub fn sign(key: &Path, file: &Path, namespace: &str) {
     assert!(st.success());
 }
 
-pub const LAYOUT_INDEX: &str = r#"{"schemaVersion":2,"manifests":[
+const LAYOUT_INDEX: &str = r#"{"schemaVersion":2,"manifests":[
 {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aa","size":1,
  "annotations":{"io.containerd.image.name":"registry.example/app:v2","org.opencontainers.image.ref.name":"v2"}},
 {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bb","size":1,
@@ -50,7 +50,7 @@ pub fn tree(dir: &Path, manifest: &str) {
     std::fs::write(dir.join("images/blobs/sha256/aa"), "layer").unwrap();
 }
 
-pub fn files(dir: &Path) -> Vec<String> {
+fn files(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for e in walk(dir) {
         let rel = e.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
@@ -86,7 +86,7 @@ pub fn seal(dir: &Path, key: &Path, namespace: &str) {
     sign(key, &dir.join("SHA256SUMS"), namespace);
 }
 
-/// The tar, in the order a build writes it; `order` overrides the head.
+/// The tar, `head` first, then every other file.
 pub fn pack(dir: &Path, out: &Path, head: &[&str]) {
     let mut b = tar::Builder::new(std::fs::File::create(out).unwrap());
     let mut names: Vec<String> = head.iter().map(|s| s.to_string()).collect();

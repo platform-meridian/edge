@@ -269,7 +269,7 @@ fn unpack_into(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<M
 }
 
 /// One syncfs for the whole unpack rather than an fsync per blob.
-pub fn sync_fs(dir: &Path) -> anyhow::Result<()> {
+fn sync_fs(dir: &Path) -> anyhow::Result<()> {
     let d = File::open(dir)?;
     nix::unistd::syncfs(&d).context("syncfs")?;
     Ok(())
@@ -320,7 +320,11 @@ impl Source {
 /// root's and dated `mtime` so the same inputs make the same tar. Refuses
 /// what a unit would refuse.
 pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> anyhow::Result<()> {
-    check_contents(contents)?;
+    machineconfig::check_patch(contents.patch)?;
+    ensure!(
+        !layout_refs(contents.images)?.is_empty(),
+        "the image layout names no image"
+    );
     let mut files = BTreeMap::new();
     files.insert(
         MANIFEST.to_string(),
@@ -369,15 +373,6 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
         let _ = std::fs::remove_file(out);
     }
     r.with_context(|| format!("writing {}", out.display()))
-}
-
-fn check_contents(c: &Contents) -> anyhow::Result<()> {
-    machineconfig::check_patch(c.patch)?;
-    ensure!(
-        !layout_refs(c.images)?.is_empty(),
-        "the image layout names no image"
-    );
-    Ok(())
 }
 
 /// Every regular file under `dir`, refusing anything a unit would.

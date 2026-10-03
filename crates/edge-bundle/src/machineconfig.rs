@@ -1,7 +1,6 @@
 //! A bundle carries the build's machine config without the unit's secrets and
 //! identity (a patch). The unit's next config is the patch with the unit's own
-//! held material put back: the build owns everything else, as a full config
-//! rendered on the build host did before, and the unit's secrets never travel.
+//! material put back, so the unit's secrets never travel.
 
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
@@ -304,8 +303,7 @@ pub fn merge(unit: &str, patch: &str) -> anyhow::Result<String> {
         out.push((k.clone(), Value::Mapping(kept)));
     }
 
-    // Defence in depth: whatever the rules above say, the unit's own material
-    // leaves this function exactly as it came in.
+    // Whatever the rules above say, the unit's own material leaves unchanged.
     expected.sort_by(|a, b| a.0.cmp(&b.0));
     if expected != held(&out) {
         bail!("merging would change what the unit keeps");
@@ -604,22 +602,8 @@ image: kubelet:new
         let back = parse(&merge(UNIT, &patch).unwrap()).unwrap();
         let unit = parse(UNIT).unwrap();
         assert_eq!(back.len(), unit.len());
-        for (k, v) in &unit {
-            assert_eq!(doc(&back, &describe_kind(k), &name(k)), Some(v), "{k:?}");
-        }
-    }
-
-    fn describe_kind(k: &Key) -> String {
-        match k {
-            Key::V1alpha1 => "v1alpha1".into(),
-            Key::Typed(kind, _) => kind.clone(),
-        }
-    }
-
-    fn name(k: &Key) -> String {
-        match k {
-            Key::V1alpha1 => String::new(),
-            Key::Typed(_, n) => n.clone(),
+        for kv in &unit {
+            assert!(back.contains(kv), "{:?}", kv.0);
         }
     }
 
