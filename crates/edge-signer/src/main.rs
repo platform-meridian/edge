@@ -814,7 +814,7 @@ mod tests {
         });
         let (url, writes, _watch) = fake_apiserver(pcr).await;
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
-        let path = scratch("serve");
+        let (_tmp, path) = scratch();
         let r = root("r", now() - 60, now() + 86_400 * 365);
         std::fs::write(&path, file(&r, &[&r])).unwrap();
         let source = Source::open(&path, now()).unwrap();
@@ -898,7 +898,7 @@ mod tests {
         .unwrap();
         let (url, writes, watch) = fake_apiserver(pcr("gw-a-1", "gw-a", "old", ahead)).await;
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
-        let path = scratch("recreate");
+        let (_tmp, path) = scratch();
         let r = root("r", now() - 60, year + 86_400);
         std::fs::write(&path, file(&r, &[&r])).unwrap();
         let source = Source::open(&path, now()).unwrap();
@@ -945,13 +945,13 @@ mod tests {
         assert_eq!(body["preconditions"], serde_json::json!({ "uid": "old" }));
     }
 
-    fn signer_at(url: &str, name: &str) -> (Client, Source, PathBuf) {
+    fn signer_at(url: &str) -> (Client, Source, tempfile::TempDir) {
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
-        let path = scratch(name);
+        let (dir, path) = scratch();
         let r = root("r", now() - 60, now() + 86_400 * 365);
         std::fs::write(&path, file(&r, &[&r])).unwrap();
         let source = Source::open(&path, now()).unwrap();
-        (client, source, path.parent().unwrap().to_path_buf())
+        (client, source, dir)
     }
 
     fn stamp(dir: &Path) -> Option<u128> {
@@ -987,10 +987,11 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let (client, source, dir) = signer_at(&format!("http://127.0.0.1:{port}"), "down");
-        let heartbeat = Heartbeat::new(&dir);
+        let (client, source, tmp) = signer_at(&format!("http://127.0.0.1:{port}"));
+        let dir = tmp.path();
+        let heartbeat = Heartbeat::new(dir);
         let task = tokio::spawn(async move { serve(client, &unit(), source, &heartbeat).await });
-        let oldest = max_heartbeat_age(&dir, RETRY_INTERVAL).await;
+        let oldest = max_heartbeat_age(dir, RETRY_INTERVAL).await;
         task.abort();
         assert!(
             oldest <= RETRY_INTERVAL + Duration::from_secs(1),
@@ -1009,34 +1010,36 @@ mod tests {
                 unanswered.push(listener.accept().await.unwrap().0);
             }
         });
-        let (client, source, dir) = signer_at(&url, "hung");
-        let heartbeat = Heartbeat::new(&dir);
+        let (client, source, tmp) = signer_at(&url);
+        let dir = tmp.path();
+        let heartbeat = Heartbeat::new(dir);
         let task = tokio::spawn(async move { serve(client, &unit(), source, &heartbeat).await });
-        let oldest = max_heartbeat_age(&dir, CALL_TIMEOUT).await;
+        let oldest = max_heartbeat_age(dir, CALL_TIMEOUT).await;
         task.abort();
         assert!(
             oldest <= CALL_TIMEOUT + Duration::from_secs(1),
             "{oldest:?}"
         );
-        assert!(heartbeat::check(&dir, heartbeat::monotonic()).is_ok());
+        assert!(heartbeat::check(dir, heartbeat::monotonic()).is_ok());
     }
 
     #[tokio::test]
     async fn stalled_loop_stops_beating() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (url, _writes, _watch) = fake_apiserver(serde_json::json!({})).await;
-        let (client, source, dir) = signer_at(&url, "stalled");
-        let heartbeat = Heartbeat::new(&dir);
+        let (client, source, tmp) = signer_at(&url);
+        let dir = tmp.path();
+        let heartbeat = Heartbeat::new(dir);
         let unit = unit();
         let mut serving = std::pin::pin!(serve(client, &unit, source, &heartbeat));
         let poll = Duration::from_millis(500);
 
         assert!(tokio::time::timeout(poll, serving.as_mut()).await.is_err());
-        let before = stamp(&dir).expect("first pass beat");
+        let before = stamp(dir).expect("first pass beat");
         tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
-        assert_eq!(stamp(&dir), Some(before), "beat while stalled");
+        assert_eq!(stamp(dir), Some(before), "beat while stalled");
 
         assert!(tokio::time::timeout(poll, serving.as_mut()).await.is_err());
-        assert!(stamp(&dir).unwrap() > before, "no beat once running again");
+        assert!(stamp(dir).unwrap() > before, "no beat once running again");
     }
 }

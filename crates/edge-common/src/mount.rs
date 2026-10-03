@@ -53,31 +53,25 @@ pub fn await_evidence_volume() {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-mount-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     #[test]
     fn mount_points_detected() {
-        let d = scratch("detect");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         assert!(is_mount_point(Path::new("/proc")));
         assert!(is_mount_point(Path::new("/")));
-        assert!(!is_mount_point(&d));
+        assert!(!is_mount_point(d));
         assert!(!is_mount_point(&d.join("absent")));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn plain_dir_waits_out_patience() {
-        let d = scratch("patience");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let t = Instant::now();
-        assert!(!await_mount(&d, Duration::from_millis(600)));
+        assert!(!await_mount(d, Duration::from_millis(600)));
         assert!(t.elapsed() >= Duration::from_millis(600));
         let t = Instant::now();
         assert!(await_mount(Path::new("/proc"), Duration::from_secs(30)));
         assert!(t.elapsed() < Duration::from_secs(1));
-        std::fs::remove_dir_all(&d).ok();
     }
 }

@@ -21,3 +21,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 nix.workspace = true
+tempfile = "3"

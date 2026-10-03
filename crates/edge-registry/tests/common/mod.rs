@@ -13,12 +13,16 @@ use edge_registry::Digest;
 pub const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
+/// On disk rather than a RAM /tmp, and removed with the guard: nothing is
+/// left behind, not even a parent.
 pub fn tempdir() -> tempfile::TempDir {
     let base = std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".cache/meridian-edge-test-tmp"))
+        .map(|h| Path::new(&h).join(".cache"))
         .unwrap_or_else(std::env::temp_dir);
-    std::fs::create_dir_all(&base).unwrap();
-    tempfile::tempdir_in(base).unwrap()
+    tempfile::Builder::new()
+        .prefix("edge-registry-test-")
+        .tempdir_in(base)
+        .unwrap()
 }
 
 pub struct Blob {

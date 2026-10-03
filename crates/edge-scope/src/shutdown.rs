@@ -312,14 +312,6 @@ mod tests {
         }
     }
 
-    fn socket_dir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("edge-scope-machined-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     async fn serve(sock: &Path, events: Vec<pb::Event>) -> Machined {
         let m = Machined {
             events,
@@ -340,7 +332,8 @@ mod tests {
 
     #[tokio::test]
     async fn waits_past_boot_for_reboot() {
-        let d = socket_dir("reboot");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("machine.sock");
         let m = serve(
             &sock,
@@ -351,17 +344,17 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(wait(&sock, &mut store(&d)).await.unwrap(), "reboot");
+        assert_eq!(wait(&sock, &mut store(d)).await.unwrap(), "reboot");
         assert_eq!(
             *m.requests.lock().unwrap(),
             vec![(Some("os:reader".into()), -1)]
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[tokio::test]
     async fn service_states_recorded_once_from_replays() {
-        let d = socket_dir("services");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("machine.sock");
         let backlog = vec![
             svc("1", "etcd", State::Preparing, None, "Running pre state"),
@@ -377,12 +370,12 @@ mod tests {
             ),
         ];
         serve(&sock, backlog).await;
-        let mut s = store(&d);
+        let mut s = store(d);
         for _ in 0..2 {
             assert!(wait(&sock, &mut s).await.is_err(), "the stream ends");
         }
         drop(s);
-        assert!(wait(&sock, &mut store(&d)).await.is_err());
+        assert!(wait(&sock, &mut store(d)).await.is_err());
         let all = services::read(&d.join(services::FILE)).unwrap();
         let got: Vec<_> = all
             .iter()
@@ -405,12 +398,12 @@ mod tests {
         let now = services::latest(&all, "b");
         assert_eq!(now["etcd"].msg, "Health check successful");
         assert_eq!(now["kubelet"].state, "Waiting");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn ending_releases_services_ring() {
-        let d = socket_dir("release");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("machine.sock");
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
@@ -422,7 +415,7 @@ mod tests {
             ],
         ));
         let (tx, rx) = std::sync::mpsc::channel();
-        spawn(sock, store(&d), tx).unwrap();
+        spawn(sock, store(d), tx).unwrap();
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(20)).unwrap(),
             "shutdown"
@@ -431,23 +424,22 @@ mod tests {
         let mut writer = edge_scope::ring::Ring::open_with(&ring, 4, services::RECORD_SIZE)
             .expect("the ring is no longer held");
         writer.append(b"{}").unwrap();
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[tokio::test]
     async fn stream_end_and_absence_are_errors() {
-        let d = socket_dir("end");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("machine.sock");
         serve(&sock, vec![seq("boot", Action::Start)]).await;
-        let e = format!("{:#}", wait(&sock, &mut store(&d)).await.unwrap_err());
+        let e = format!("{:#}", wait(&sock, &mut store(d)).await.unwrap_err());
         assert!(e.contains("closed the event stream"), "{e}");
         let e = format!(
             "{:#}",
-            wait(&d.join("absent.sock"), &mut store(&d))
+            wait(&d.join("absent.sock"), &mut store(d))
                 .await
                 .unwrap_err()
         );
         assert!(e.contains("no machined socket"), "{e}");
-        std::fs::remove_dir_all(&d).ok();
     }
 }

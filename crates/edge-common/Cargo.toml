@@ -19,3 +19,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+tempfile = "3"

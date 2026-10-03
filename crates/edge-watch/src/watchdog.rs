@@ -149,19 +149,20 @@ mod tests {
     #[test]
     fn pet_and_disarm_bytes() {
         // A plain file fails the ioctls, like a fixed-timeout driver.
-        let p = std::env::temp_dir().join(format!("edge-watch-fakedev-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("watchdog");
         std::fs::write(&p, b"").unwrap();
         let mut wd = Watchdog::open(&p, 30).unwrap();
         assert_eq!(wd.timeout_secs, 30);
         wd.pet().unwrap();
         wd.disarm().unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"\0V");
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn sys_dir_follows_links() {
-        let d = std::env::temp_dir().join(format!("edge-watch-class-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let (dev, class, real) = (d.join("dev"), d.join("class"), d.join("devices/wd1"));
         for p in [&dev, &class, &real] {
             std::fs::create_dir_all(p).unwrap();
@@ -176,17 +177,15 @@ mod tests {
         );
         assert_eq!(sys_dir_in(&class, &dev.join("watchdog-board")), Some(want));
         assert_eq!(sys_dir_in(&class, &dev.join("absent")), None);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn boot_status_reads_flags() {
-        let d = std::env::temp_dir().join(format!("edge-watch-sys-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        assert_eq!(boot_status(&d), None);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert_eq!(boot_status(d), None);
         std::fs::write(d.join("bootstatus"), "32\n").unwrap();
-        assert_eq!(boot_status(&d), Some(32));
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(boot_status(d), Some(32));
     }
 
     #[test]

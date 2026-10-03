@@ -310,18 +310,11 @@ fn fnv1a(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-cni-pins-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
 
     #[test]
     fn purge_removes_malformed_version_dir() {
-        let d = scratch("purge").join("abcdef");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("abcdef");
         std::fs::create_dir_all(d.join("links")).unwrap();
         std::fs::create_dir_all(d.join("np")).unwrap();
         std::fs::create_dir_all(d.join(SYNCED)).unwrap();
@@ -343,34 +336,34 @@ mod tests {
         ] {
             assert!(!d.join(f).exists(), "{f}");
         }
-        std::fs::remove_dir_all(d.parent().unwrap()).ok();
     }
 
     #[test]
     fn dataplane_wait_is_bounded() {
-        let d = scratch("dp");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let t = Instant::now();
-        let e = wait_for_dataplane_in(&d, Duration::from_millis(120)).unwrap_err();
+        let e = wait_for_dataplane_in(d, Duration::from_millis(120)).unwrap_err();
         assert!(t.elapsed() < Duration::from_secs(2));
         assert!(format!("{e:#}").contains("not ready"), "{e:#}");
         std::fs::create_dir_all(d.join("v1").join(SYNCED)).unwrap();
-        wait_for_dataplane_in(&d, Duration::from_millis(120)).unwrap();
-        std::fs::remove_dir_all(&d).ok();
+        wait_for_dataplane_in(d, Duration::from_millis(120)).unwrap();
     }
 
     #[test]
     fn hooks_wait_for_own_veth() {
-        let d = scratch("hooks");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let limit = Duration::from_secs(3);
 
         let t = Instant::now();
         assert_eq!(
-            wait_for_hooks_in(&d, "edgeaaaa", limit),
+            wait_for_hooks_in(d, "edgeaaaa", limit),
             HooksWait::NotEnforced
         );
         std::fs::create_dir_all(d.join("v0/np")).unwrap();
         assert_eq!(
-            wait_for_hooks_in(&d, "edgeaaaa", limit),
+            wait_for_hooks_in(d, "edgeaaaa", limit),
             HooksWait::NotEnforced,
             "a version without the sync marker is not trusted"
         );
@@ -387,10 +380,7 @@ mod tests {
             std::fs::write(np.join(format!("edgeaaaa-{b}")), b"").unwrap();
         });
         let t = Instant::now();
-        assert_eq!(
-            wait_for_hooks_in(&d, "edgeaaaa", limit),
-            HooksWait::Attached
-        );
+        assert_eq!(wait_for_hooks_in(d, "edgeaaaa", limit), HooksWait::Attached);
         assert!(
             t.elapsed() >= Duration::from_millis(350),
             "returned before both hooks: {:?}",
@@ -401,16 +391,16 @@ mod tests {
 
         let t = Instant::now();
         assert_eq!(
-            wait_for_hooks_in(&d, "edgebbbb", Duration::from_millis(200)),
+            wait_for_hooks_in(d, "edgebbbb", Duration::from_millis(200)),
             HooksWait::TimedOut
         );
         assert!(t.elapsed() < Duration::from_secs(2));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn inherited_only_from_other_versions() {
-        let base = scratch("inherit");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         for pin in [
             "old/links/connect4",
             "new/links/connect4",
@@ -426,12 +416,12 @@ mod tests {
         );
         assert!(is_inherited(&new, "links/sendmsg4"));
         assert!(!is_inherited(&new, "links/recvmsg4"));
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn failed_attach_keeps_old_pin() {
-        let base = scratch("keep");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         std::fs::create_dir_all(base.join("old/links")).unwrap();
         std::fs::create_dir_all(base.join("new/links")).unwrap();
         std::fs::write(base.join("old/links/connect4"), b"").unwrap();
@@ -443,12 +433,12 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(calls, [false]);
         assert!(base.join("old/links/connect4").exists());
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn held_hook_drops_old_pins() {
-        let base = scratch("held");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         for pin in ["old/np/edgea-in", "new/np/edgea-in"] {
             std::fs::create_dir_all(base.join(pin).parent().unwrap()).unwrap();
             std::fs::write(base.join(pin), b"").unwrap();
@@ -459,12 +449,12 @@ mod tests {
         .unwrap();
         assert!(!base.join("old/np/edgea-in").exists());
         assert!(base.join("new/np/edgea-in").exists());
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn old_version_retired_when_idle() {
-        let base = scratch("retire");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         for pin in [
             "new/links/connect4",
             "old/links/connect4",
@@ -488,12 +478,12 @@ mod tests {
         assert_eq!(retire_old_versions(&new, &live), 1);
         assert!(!base.join("old").exists());
         assert!(base.join("new/links/connect4").exists());
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn hooks_under_unsynced_version_count() {
-        let d = scratch("upgrade");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::create_dir_all(d.join("old/np")).unwrap();
         std::fs::create_dir_all(d.join("old").join(SYNCED)).unwrap();
         std::fs::create_dir_all(d.join("new/np")).unwrap();
@@ -502,10 +492,9 @@ mod tests {
         }
         let t = Instant::now();
         assert_eq!(
-            wait_for_hooks_in(&d, "edgeaaaa", Duration::from_secs(3)),
+            wait_for_hooks_in(d, "edgeaaaa", Duration::from_secs(3)),
             HooksWait::Attached
         );
         assert!(t.elapsed() < Duration::from_secs(1));
-        std::fs::remove_dir_all(&d).ok();
     }
 }

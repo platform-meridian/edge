@@ -213,9 +213,8 @@ mod tests {
 
     #[test]
     fn lists_only_controllers() {
-        let d = std::env::temp_dir().join(format!("edge-scope-dev-{}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for n in [
             "nvme1",
             "nvme0",
@@ -227,9 +226,8 @@ mod tests {
         ] {
             std::fs::write(d.join(n), b"").unwrap();
         }
-        assert_eq!(controllers(&d), [d.join("nvme0"), d.join("nvme1")]);
+        assert_eq!(controllers(d), [d.join("nvme0"), d.join("nvme1")]);
         assert!(controllers(&d.join("missing")).is_empty());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

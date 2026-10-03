@@ -296,12 +296,10 @@ mod tests {
         );
     }
 
-    fn config_dir(name: &str, fragments: &[(&str, &str)]) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-watch-cfg-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
+    fn config_dir(fragments: &[(&str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
         for (f, text) in fragments {
-            std::fs::write(d.join(f), text).unwrap();
+            std::fs::write(d.path().join(f), text).unwrap();
         }
         d
     }
@@ -312,23 +310,21 @@ mod tests {
 
     #[test]
     fn fragments_merge_in_name_order() {
-        let d = config_dir(
-            "merge",
-            &[
-                (
-                    "50-payload.yaml",
-                    "checks: [ { name: meridian, kind: tcp, addr: '127.0.0.1:8444' } ]",
-                ),
-                (
-                    "10-platform.yaml",
-                    "timeout_secs: 30\ninterval_secs: 10\nchecks:\n  - { name: store, kind: tcp, addr: '127.0.0.1:2379' }\n  - { name: apiserver, kind: tcp, addr: '127.0.0.1:6443' }\n",
-                ),
-                ("20-recovery.yaml", "recovery_secs: 60\n"),
-                ("60-later.yaml", "timeout_secs: 40\n"),
-                ("notes.txt", "{{{ not a fragment"),
-            ],
-        );
-        let (c, degraded) = Config::load_or_fallback(&d);
+        let tmp = config_dir(&[
+            (
+                "50-payload.yaml",
+                "checks: [ { name: meridian, kind: tcp, addr: '127.0.0.1:8444' } ]",
+            ),
+            (
+                "10-platform.yaml",
+                "timeout_secs: 30\ninterval_secs: 10\nchecks:\n  - { name: store, kind: tcp, addr: '127.0.0.1:2379' }\n  - { name: apiserver, kind: tcp, addr: '127.0.0.1:6443' }\n",
+            ),
+            ("20-recovery.yaml", "recovery_secs: 60\n"),
+            ("60-later.yaml", "timeout_secs: 40\n"),
+            ("notes.txt", "{{{ not a fragment"),
+        ]);
+        let d = tmp.path();
+        let (c, degraded) = Config::load_or_fallback(d);
         assert!(!degraded);
         assert_eq!(names(&c), ["store", "apiserver", "meridian"]);
         assert_eq!(
@@ -340,31 +336,28 @@ mod tests {
             ),
             (40, 10, 60, 1200)
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn bad_fragment_skipped() {
-        let d = config_dir(
-            "skip",
-            &[
-                ("10-good.yaml", CHECK),
-                ("20-garbage.yaml", "{{{ not yaml"),
-                ("30-duplicate.yaml", CHECK),
-                (
-                    "40-margin.yaml",
-                    "interval_secs: 60\ntimeout_secs: 60\nchecks: [ { name: b, kind: tcp, addr: 'x:1' } ]\n",
-                ),
-                ("60-empty.yaml", ""),
-                ("65-comment.yaml", "# disarmed\n"),
-                (
-                    "70-good.yaml",
-                    "checks: [ { name: c, kind: tcp, addr: '127.0.0.1:2' } ]",
-                ),
-            ],
-        );
+        let tmp = config_dir(&[
+            ("10-good.yaml", CHECK),
+            ("20-garbage.yaml", "{{{ not yaml"),
+            ("30-duplicate.yaml", CHECK),
+            (
+                "40-margin.yaml",
+                "interval_secs: 60\ntimeout_secs: 60\nchecks: [ { name: b, kind: tcp, addr: 'x:1' } ]\n",
+            ),
+            ("60-empty.yaml", ""),
+            ("65-comment.yaml", "# disarmed\n"),
+            (
+                "70-good.yaml",
+                "checks: [ { name: c, kind: tcp, addr: '127.0.0.1:2' } ]",
+            ),
+        ]);
+        let d = tmp.path();
         std::fs::create_dir(d.join("50-dir.yaml")).unwrap();
-        let c = Config::load(&d).unwrap();
+        let c = Config::load(d).unwrap();
         assert_eq!(names(&c), ["a", "c"]);
         for blank in ["", "# disarmed\n"] {
             assert!(
@@ -373,22 +366,22 @@ mod tests {
             );
         }
         assert_eq!((c.timeout_secs, c.interval_secs), (60, 10));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn no_checks_falls_back() {
-        let empty = config_dir("empty", &[]);
-        let bad = config_dir(
-            "allbad",
-            &[("10.yaml", "{{{"), ("20.yaml", "timeout_secs: 30\n")],
+        let (empty, bad, other) = (
+            config_dir(&[]),
+            config_dir(&[("10.yaml", "{{{"), ("20.yaml", "timeout_secs: 30\n")]),
+            config_dir(&[]),
         );
-        let file = empty.with_extension("file");
+        let (empty, bad) = (empty.path(), bad.path());
+        let file = other.path().join("file");
         std::fs::write(&file, CHECK).unwrap();
         for dir in [
             empty.join("missing"),
-            empty.clone(),
-            bad.clone(),
+            empty.to_path_buf(),
+            bad.to_path_buf(),
             file.clone(),
         ] {
             let e = format!("{:#}", Config::load(&dir).unwrap_err());
@@ -397,9 +390,6 @@ mod tests {
             assert!(degraded, "{}", dir.display());
             assert!(c.checks.is_empty() && c.validate().is_ok());
         }
-        std::fs::remove_dir_all(&empty).ok();
-        std::fs::remove_dir_all(&bad).ok();
-        std::fs::remove_file(&file).ok();
     }
 
     async fn wedged() -> Check {

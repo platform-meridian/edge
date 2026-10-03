@@ -178,14 +178,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("edge-scope-services-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn tr(id: &str, svc: &str, state: &str, healthy: Option<bool>, msg: &str) -> Transition {
         Transition {
             t: 1_790_000_000,
@@ -204,7 +196,8 @@ mod tests {
 
     #[test]
     fn latest_per_service_this_boot() {
-        let d = scratch("latest");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join(FILE);
         let mut old = Store::new(p.clone(), "boot1".into());
         old.record(tr("a", "etcd", "Failed", None, "gone"));
@@ -229,12 +222,12 @@ mod tests {
             ("e", Some(true))
         );
         assert_eq!(latest(&all, "boot1")["etcd"].state, "Failed");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn replay_recorded_once_across_restarts() {
-        let d = scratch("replay");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join(FILE);
         let mut s = Store::new(p.clone(), "b".into());
         for id in ["1", "2", "1", "2", "3"] {
@@ -249,12 +242,12 @@ mod tests {
         let mut next_boot = Store::new(p.clone(), "c".into());
         next_boot.record(tr("1", "etcd", "Running", None, ""));
         assert_eq!(ids(&read(&p).unwrap()), ["1", "2", "3", "4", "1"]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn torn_record_skipped_rest_kept() {
-        let d = scratch("torn");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join(FILE);
         let mut s = Store::new(p.clone(), "b".into());
         for id in ["1", "2", "3"] {
@@ -269,12 +262,12 @@ mod tests {
         s.record(tr("4", "etcd", "Failed", None, "m"));
         assert_eq!(ids(&read(&p).unwrap()), ["1", "3", "4"]);
         assert!(!d.join(format!("{FILE}.corrupt")).exists());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn truncated_ring_keeps_whole_records() {
-        let d = scratch("truncated");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join(FILE);
         let mut s = Store::new(p.clone(), "b".into());
         for id in ["1", "2", "3"] {
@@ -297,12 +290,12 @@ mod tests {
         let mut s = Store::new(p.clone(), "b".into());
         s.record(tr("4", "etcd", "Running", None, "m"));
         assert_eq!(ids(&read(&p).unwrap()), ["4"]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn long_message_cut_names_capped() {
-        let d = scratch("long");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join(FILE);
         let mut s = Store::new(p.clone(), "b".into());
         let mut t = tr(
@@ -326,7 +319,6 @@ mod tests {
             "{}",
             got.msg
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -335,8 +327,9 @@ mod tests {
         if unsafe { nix::libc::geteuid() } == 0 {
             return;
         }
-        let d = scratch("unwritable");
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut s = Store::new(d.join("sub").join(FILE), "b".into());
         s.record(tr("1", "etcd", "Running", None, ""));
         assert_eq!(s.lost, 1);
@@ -346,10 +339,9 @@ mod tests {
         s.next_warning = Instant::now();
         assert!(s.lose(&again));
         assert_eq!(s.lost, 3);
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
         s.record(tr("2", "etcd", "Running", None, ""));
         assert_eq!(ids(&read(&d.join("sub").join(FILE)).unwrap()), ["2"]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

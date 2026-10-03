@@ -1,5 +1,4 @@
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,7 +27,7 @@ impl MachineService for Machined {
 }
 
 struct Unit {
-    dir: PathBuf,
+    dir: tempfile::TempDir,
     machined: Machined,
 }
 
@@ -38,9 +37,11 @@ impl Unit {
     }
 
     async fn with_recovery(name: &str, check_addr: &str, record: &str, recovery_secs: u64) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("edge-watch-ladder-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("edge-watch-ladder-{name}-"))
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
         for d in ["cfg", "state", "machined"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
@@ -61,7 +62,7 @@ impl Unit {
                 .add_service(MachineServiceServer::new(machined.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener)),
         );
-        Self { dir, machined }
+        Self { dir: tmp, machined }
     }
 
     fn start(&self) -> Child {
@@ -73,12 +74,12 @@ impl Unit {
                 Ok(())
             });
         }
-        cmd.env("EDGE_WATCH_CONFIG", self.dir.join("cfg"))
-            .env("EDGE_WATCH_DEVICE", self.dir.join("watchdog"))
-            .env("EDGE_WATCH_STATE", self.dir.join("state"))
+        cmd.env("EDGE_WATCH_CONFIG", self.dir.path().join("cfg"))
+            .env("EDGE_WATCH_DEVICE", self.dir.path().join("watchdog"))
+            .env("EDGE_WATCH_STATE", self.dir.path().join("state"))
             .env(
                 "EDGE_WATCH_MACHINED",
-                self.dir.join("machined/machine.sock"),
+                self.dir.path().join("machined/machine.sock"),
             )
             .env_remove("EDGE_EVIDENCE")
             .spawn()
@@ -86,22 +87,16 @@ impl Unit {
     }
 
     fn record(&self) -> serde_json::Value {
-        let text = std::fs::read_to_string(self.dir.join("state/state.json")).unwrap();
+        let text = std::fs::read_to_string(self.dir.path().join("state/state.json")).unwrap();
         serde_json::from_str(&text).unwrap()
     }
 
     fn watchdog_bytes(&self) -> Vec<u8> {
-        std::fs::read(self.dir.join("watchdog")).unwrap()
+        std::fs::read(self.dir.path().join("watchdog")).unwrap()
     }
 
     fn resets(&self) -> usize {
         self.machined.resets.lock().unwrap().len()
-    }
-}
-
-impl Drop for Unit {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
     }
 }
 

@@ -110,14 +110,6 @@ mod tests {
         }
     }
 
-    fn socket_dir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("edge-watch-machined-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     async fn serve(sock: &Path, m: Machined) {
         let listener = tokio::net::UnixListener::bind(sock).unwrap();
         tokio::spawn(
@@ -129,7 +121,8 @@ mod tests {
 
     #[tokio::test]
     async fn wipes_only_ephemeral_as_admin() {
-        let d = socket_dir("ok");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("machine.sock");
         let m = Machined::default();
         serve(&sock, m.clone()).await;
@@ -148,12 +141,12 @@ mod tests {
                 wipe: true
             }]
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[tokio::test]
     async fn refusal_and_absence_are_errors() {
-        let d = socket_dir("refused");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("machine.sock");
         serve(
             &sock,
@@ -170,6 +163,5 @@ mod tests {
             reset_ephemeral(&d.join("absent.sock")).await.unwrap_err()
         );
         assert!(e.contains("no machined socket"), "{e}");
-        std::fs::remove_dir_all(&d).ok();
     }
 }

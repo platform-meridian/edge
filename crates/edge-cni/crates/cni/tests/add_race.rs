@@ -61,7 +61,8 @@ fn race() {
         .block_on(async { Net::open().unwrap().set_up("lo").await.unwrap() });
 
     // ADD waits for a synced dataplane in bpffs; a marker directory stands in.
-    let pin_base = std::env::temp_dir().join(format!("edge-cni-add-race-{}", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let pin_base = tmp.path();
     std::fs::create_dir_all(pin_base.join("test/synced")).unwrap();
 
     for trial in 0..TRIALS {
@@ -69,7 +70,7 @@ fn race() {
         let adds: Vec<Child> = sandboxes
             .iter()
             .enumerate()
-            .map(|(i, sandbox)| start_add(&pin_base, &format!("t{trial}c{i}xxxxxxxxxxxx"), sandbox))
+            .map(|(i, sandbox)| start_add(pin_base, &format!("t{trial}c{i}xxxxxxxxxxxx"), sandbox))
             .collect();
 
         let mut addresses = HashSet::new();
@@ -95,7 +96,6 @@ fn race() {
             sandbox.wait().unwrap();
         }
     }
-    std::fs::remove_dir_all(&pin_base).ok();
 }
 
 #[test]

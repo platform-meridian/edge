@@ -582,7 +582,8 @@ mod tests {
 
     #[test]
     fn gone_veth_pins_pruned() {
-        let vdir = std::env::temp_dir().join(format!("edge-cni-netpol-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let vdir = tmp.path();
         let np = std::path::PathBuf::from(pin_dir(&vdir.to_string_lossy()));
         std::fs::create_dir_all(&np).unwrap();
         for f in ["edgea-in", "edgea-eg", "edgeb-in", "edgeb-eg"] {
@@ -593,6 +594,5 @@ mod tests {
         assert!(np.join("edgea-in").exists() && !np.join("edgeb-in").exists());
         unpin_all(&vdir.to_string_lossy());
         assert!(!np.exists());
-        std::fs::remove_dir_all(&vdir).ok();
     }
 }

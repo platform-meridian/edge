@@ -442,13 +442,6 @@ mod tests {
         (l, p)
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-sandbox-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn outside(d: &Path) -> PathBuf {
         let f = d.join("outside/secret");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
@@ -490,8 +483,9 @@ mod tests {
 
     #[test]
     fn gateway_confined() {
-        let d = scratch("gateway");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         std::fs::create_dir_all(d.join("config")).unwrap();
         let config = d.join("config/edge-gateway.yaml");
         std::fs::write(&config, "listen: x\n").unwrap();
@@ -532,13 +526,13 @@ mod tests {
             },
         );
         rotator.join().unwrap();
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn dns_confined() {
-        let d = scratch("dns");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         let (listen, other) = (free_port(), free_port());
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
@@ -558,13 +552,13 @@ mod tests {
                 denied("dial another port", dial(unlisted))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn state_confined() {
-        let d = scratch("state");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         // Missing: the Write grant creates it.
         let log = d.join("data/state.log");
         std::fs::create_dir_all(d.join("pki")).unwrap();
@@ -584,13 +578,13 @@ mod tests {
                 denied("dial anything", dial(peer))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn watch_confined() {
-        let d = scratch("watch");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         std::fs::create_dir_all(d.join("cfg")).unwrap();
         std::fs::create_dir_all(d.join("dev")).unwrap();
         let config = d.join("cfg/config.yaml");
@@ -651,13 +645,13 @@ mod tests {
                 allowed("probe a local port", dial(probe))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn scope_confined() {
-        let d = scratch("scope");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         for s in ["dev", "watch", "run", "machined", "elsewhere"] {
             std::fs::create_dir_all(d.join(s)).unwrap();
         }
@@ -708,13 +702,13 @@ mod tests {
                 denied("dial", dial(tcp))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn idle_confined() {
-        let d = scratch("idle");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         std::fs::create_dir_all(d.join("cg/pod")).unwrap();
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
@@ -734,13 +728,13 @@ mod tests {
                 denied("bind", bind(port))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn signer_confined() {
-        let d = scratch("signer");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         let ca = d.join("etc/edge-signer/ca.pem");
         std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
         std::fs::write(&ca, b"ca").unwrap();
@@ -765,13 +759,13 @@ mod tests {
                 denied("bind", bind(port))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn registry_confined() {
-        let d = scratch("registry");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         let root = d.join("store");
         std::fs::create_dir_all(root.join("blobs")).unwrap();
         let (listen, other) = (free_port(), free_port());
@@ -789,36 +783,36 @@ mod tests {
                 denied("dial another port", dial(tcp))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn dhcp_writes_only_its_lease_file() {
-        let d = scratch("dhcp-leases");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         let leases = d.join("leases/file");
         sandboxed(
             || dhcp(Some(&leases)),
             || {
                 allowed("write the lease file", crate::durable_write(&leases, b"x"))?;
                 denied("read anything else", read(&secret))?;
-                denied("write anything else", write_in(&d))
+                denied("write anything else", write_in(d))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn dhcp_udp_only() {
-        let d = scratch("dhcp");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         let (_tcp, tcp) = listening();
         let port = free_port();
         sandboxed(
             || dhcp(None),
             || {
                 denied("read anything", read(&secret))?;
-                denied("write anything", write_in(&d))?;
+                denied("write anything", write_in(d))?;
                 denied("bind TCP", bind(port))?;
                 denied("dial TCP", dial(tcp))?;
                 let udp = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -827,13 +821,13 @@ mod tests {
                 allowed("receive UDP", udp.recv(&mut [0u8; 1]))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn layers_confined_before_containerd_root() {
-        let d = scratch("layers");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         std::fs::create_dir_all(d.join("lib")).unwrap();
         std::fs::create_dir_all(d.join("imagecache/disk")).unwrap();
         std::fs::write(d.join("imagecache/disk/blob"), b"b").unwrap();
@@ -852,13 +846,13 @@ mod tests {
                 denied("dial", dial(tcp))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn cni_daemon_confined() {
-        let d = scratch("cni");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         let (bpf, bin, conf) = (d.join("bpf"), d.join("bin"), d.join("net.d"));
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
@@ -890,14 +884,14 @@ mod tests {
                 denied("bind", bind(port))
             },
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn no_landlock_runs_unrestricted() {
         // ENOSYS: not built in. EOPNOTSUPP: built in but off at boot.
-        let d = scratch("nolandlock");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
             in_child(|| {
                 deny_landlock_syscalls(errno);
@@ -909,13 +903,13 @@ mod tests {
                 Ok(true)
             });
         }
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn abi7_drops_socket_grant() {
-        let d = scratch("abi7");
-        let secret = outside(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let secret = outside(d);
         std::fs::create_dir_all(d.join("run")).unwrap();
         std::fs::create_dir_all(d.join("elsewhere")).unwrap();
         let _other = UnixListener::bind(d.join("elsewhere/x.sock")).unwrap();
@@ -936,7 +930,6 @@ mod tests {
             )?;
             Ok(true)
         });
-        std::fs::remove_dir_all(&d).ok();
     }
 
     fn deny_landlock_syscalls(errno: i32) {

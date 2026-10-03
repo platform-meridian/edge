@@ -344,13 +344,6 @@ pub fn read_all(dir: &Path) -> Vec<crate::ring::Entry> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-scope-logs-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn line(source: &str, msg: &str) -> Line {
         let d = serde_json::json!({ "talos-service": source, "msg": msg, "talos-level": "info" });
         logline::parse(d.to_string().as_bytes(), "b", PAYLOAD).unwrap()
@@ -481,15 +474,15 @@ mod tests {
 
     #[test]
     fn kernel_ring_holds_more() {
-        let d = scratch("weighted");
-        let mut store = Store::new(d.clone(), "b".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(line("kernel", "k"), Instant::now());
         p.push(line("kubelet", "k"), Instant::now());
         store.write(p.take(Instant::now()));
         assert_eq!(store.rings["kernel"].slots(), KERNEL_SLOTS);
         assert_eq!(store.rings["kubelet"].slots(), SLOTS);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -523,23 +516,24 @@ mod tests {
 
     #[test]
     fn longest_line_fits_a_slot() {
-        let d = scratch("longest");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let long = line("kubelet", &"x".repeat(5000));
         assert_eq!(long.payload.len(), RECORD_SIZE - crate::ring::HEADER);
         let want = long.payload.clone();
-        let mut store = Store::new(d.clone(), "b".into());
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(long, Instant::now());
         store.write(p);
         assert_eq!(store.lost, 0);
-        assert_eq!(read_all(&d)[0].payload, want);
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(read_all(d)[0].payload, want);
     }
 
     #[test]
     fn failed_append_loses_batch_and_reopens() {
-        let d = scratch("failed");
-        let mut store = Store::new(d.clone(), "b".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(line("kernel", "before"), Instant::now());
         p.push(
@@ -555,8 +549,7 @@ mod tests {
         let mut p = Pending::default();
         p.push(line("kernel", "after"), Instant::now());
         store.write(p);
-        assert_eq!(msgs(&d, "kernel"), ["after"]);
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(msgs(d, "kernel"), ["after"]);
     }
 
     #[test]
@@ -573,8 +566,9 @@ mod tests {
 
     #[test]
     fn losses_counted() {
-        let d = scratch("losses");
-        let mut store = Store::new(d.clone(), "b".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         for _ in 0..2 {
             let mut p = Pending::default();
             (p.refused, p.unparsed) = (2, 3);
@@ -586,13 +580,13 @@ mod tests {
             (2, 3),
             "reported once, then quiet for a minute"
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn chatty_source_evicts_only_itself() {
-        let d = scratch("chatty");
-        let mut store = Store::new(d.clone(), "b".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(line("kernel", "oops"), Instant::now());
         store.write(p);
@@ -606,65 +600,64 @@ mod tests {
             }
             store.write(p);
         }
-        assert_eq!(msgs(&d, "kernel"), ["oops"]);
-        let k = msgs(&d, "kubelet");
+        assert_eq!(msgs(d, "kernel"), ["oops"]);
+        let k = msgs(d, "kubelet");
         assert_eq!(k.len() as u64, SLOTS);
         assert_eq!(k.last().unwrap(), &format!("c-{}", nth(SLOTS - 1)));
         assert_eq!(k[0], "dropped 1", "a full round drops its oldest line");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn dropped_lines_noted_first() {
-        let d = scratch("dropped");
-        let mut store = Store::new(d.clone(), "b".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         for i in 0..SLOTS + 5 {
             p.push(line("kubelet", &nth(i)), Instant::now());
         }
         store.write(p);
-        let k = msgs(&d, "kubelet");
+        let k = msgs(d, "kubelet");
         assert_eq!(k.len() as u64, SLOTS);
         assert_eq!((k[0].as_str(), k[1].as_str()), ("dropped 6", "g"));
         assert_eq!(k[k.len() - 1], nth(SLOTS + 4));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn sources_capped_on_disk() {
-        let d = scratch("cap");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for i in 0..MAX_SOURCES - 1 {
-            let mut store = Store::new(d.clone(), "b".into());
+            let mut store = Store::new(d.to_path_buf(), "b".into());
             let mut p = Pending::default();
             p.push(line(&format!("old{i}"), "x"), Instant::now());
             store.write(p);
         }
-        let mut store = Store::new(d.clone(), "b".into());
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(line("last", "fits"), Instant::now());
         p.push(line("zzz", "refused"), Instant::now());
         p.push(line("old0", "kept"), Instant::now());
         store.write(p);
-        assert_eq!(ring_files(&d).len(), MAX_SOURCES);
-        assert!(!ring_path(&d, "zzz").exists());
-        assert_eq!(msgs(&d, "old0"), ["x", "kept"]);
-        assert_eq!(msgs(&d, "last"), ["fits"]);
+        assert_eq!(ring_files(d).len(), MAX_SOURCES);
+        assert!(!ring_path(d, "zzz").exists());
+        assert_eq!(msgs(d, "old0"), ["x", "kept"]);
+        assert_eq!(msgs(d, "last"), ["fits"]);
         assert_eq!(store.lost, 1);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn bad_ring_recreated() {
-        let d = scratch("bad");
-        std::fs::write(ring_path(&d, "kernel"), vec![0xAB; 3 * RECORD_SIZE]).unwrap();
-        let mut store = Store::new(d.clone(), "b".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::write(ring_path(d, "kernel"), vec![0xAB; 3 * RECORD_SIZE]).unwrap();
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(line("kernel", "after"), Instant::now());
         store.write(p);
-        let k = msgs(&d, "kernel");
+        let k = msgs(d, "kernel");
         assert!(k[0].contains("ring recreated"), "{k:?}");
         assert_eq!(k[1], "after");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -673,22 +666,23 @@ mod tests {
         if unsafe { nix::libc::geteuid() } == 0 {
             return;
         }
-        let d = scratch("unwritable");
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut store = Store::new(d.join("logs"), "b".into());
         let mut p = Pending::default();
         p.push(line("kernel", "x"), Instant::now());
         store.write(p);
         assert!(store.rings.is_empty());
         assert_eq!(store.lost, 1);
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&d).ok();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
     fn udp_lines_reach_rings() {
-        let d = scratch("udp");
-        let logs = spawn("127.0.0.1:0", d.clone(), "abcd1234".into()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let logs = spawn("127.0.0.1:0", d.to_path_buf(), "abcd1234".into()).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         for (svc, msg) in [
             ("kernel", "kern: info: [t]: hello"),
@@ -708,13 +702,12 @@ mod tests {
         }
         assert_eq!(logs.pending.lock().unwrap().unparsed, 1);
         logs.flush_all();
-        assert_eq!(msgs(&d, "kernel"), ["kern: info: [t]: hello"]);
-        assert_eq!(msgs(&d, "machined"), ["one", "two", "two"]);
-        let all = read_all(&d);
+        assert_eq!(msgs(d, "kernel"), ["kern: info: [t]: hello"]);
+        assert_eq!(msgs(d, "machined"), ["one", "two", "two"]);
+        let all = read_all(d);
         assert_eq!(all.len(), 4);
         assert!(String::from_utf8_lossy(&all[3].payload).contains("\"repeated\":1"));
         assert!(String::from_utf8_lossy(&all[0].payload).contains("\"boot\":\"abcd1234\""));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     fn open_in(dir: &Path) -> usize {
@@ -727,40 +720,40 @@ mod tests {
 
     #[test]
     fn close_releases_rings() {
-        let d = scratch("close");
-        let logs = spawn("127.0.0.1:0", d.clone(), "b".into()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let logs = spawn("127.0.0.1:0", d.to_path_buf(), "b".into()).unwrap();
         logs.pending
             .lock()
             .unwrap()
             .push(line("machined", "before"), Instant::now());
         logs.flush_all();
-        assert!(open_in(&d) > 0);
+        assert!(open_in(d) > 0);
         logs.pending
             .lock()
             .unwrap()
             .push(line("machined", "pending"), Instant::now());
         logs.close();
-        assert_eq!(open_in(&d), 0);
+        assert_eq!(open_in(d), 0);
         logs.pending
             .lock()
             .unwrap()
             .push(line("machined", "after"), Instant::now());
         logs.flush_all();
-        assert_eq!(open_in(&d), 0);
-        assert_eq!(msgs(&d, "machined"), ["before", "pending"]);
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(open_in(d), 0);
+        assert_eq!(msgs(d, "machined"), ["before", "pending"]);
     }
 
     #[test]
     fn unreadable_ring_skipped_in_read_all() {
-        let d = scratch("readall");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::write(d.join("a.bin"), b"short").unwrap();
-        let mut store = Store::new(d.clone(), "b".into());
+        let mut store = Store::new(d.to_path_buf(), "b".into());
         let mut p = Pending::default();
         p.push(line("b", "x"), Instant::now());
         store.write(p);
-        assert_eq!(read_all(&d).len(), 1);
+        assert_eq!(read_all(d).len(), 1);
         assert!(read_all(&d.join("missing")).is_empty());
-        std::fs::remove_dir_all(&d).ok();
     }
 }

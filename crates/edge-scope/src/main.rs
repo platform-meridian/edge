@@ -623,13 +623,6 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-scope-main-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn payloads(p: &Path) -> Vec<String> {
         ring::Ring::open_read_only(p)
             .unwrap()
@@ -646,7 +639,8 @@ mod tests {
 
     #[test]
     fn recorder_recovers_from_bad_ring() {
-        let d = scratch("recorder");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("state/ring.bin");
         std::fs::write(d.join("state"), b"a file, not a directory").unwrap();
         let mut rec = Recorder::new(p.clone(), 4, Duration::ZERO, Duration::ZERO);
@@ -671,15 +665,15 @@ mod tests {
         let got = payloads(&q);
         assert_eq!(got.len(), 2);
         assert!(got[0].contains("ring recreated"), "{}", got[0]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn failed_open_retried_on_schedule() {
         use std::os::unix::fs::PermissionsExt;
-        let d = scratch("noopen");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut rec = Recorder::new(
             p.clone(),
             4,
@@ -691,19 +685,19 @@ mod tests {
         if unsafe { nix::libc::geteuid() } != 0 {
             assert!(rec.ring.is_none());
             rec.record(t, b"{}");
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
             rec.record(t + Duration::from_secs(5), b"{}");
             assert!(rec.ring.is_none(), "retried early");
             rec.record(t + Duration::from_secs(10), b"{\"t\":3}");
             assert_eq!(payloads(&p), ["{\"t\":3}"]);
         }
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&d).ok();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
     fn append_failures_reopen_ring() {
-        let d = scratch("failing");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         let mut rec = Recorder::new(
             p.clone(),
@@ -724,7 +718,6 @@ mod tests {
         assert!(rec.ring.is_none());
         rec.record(t + Duration::from_secs(10), b"{\"t\":4}");
         assert_eq!(payloads(&p), ["{\"t\":4}"]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     struct Refuses(std::io::ErrorKind);
@@ -739,7 +732,8 @@ mod tests {
 
     #[test]
     fn dump_prints_lines_and_ignores_epipe() {
-        let d = scratch("dump");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         let logs_dir = d.join("logs");
         let svc = d.join(services::FILE);
@@ -786,12 +780,12 @@ mod tests {
         )
         .unwrap();
         assert!(dump(&p, &svc, &logs_dir, &mut Refuses(std::io::ErrorKind::Other)).is_err());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn failing_checks_from_watch_state() {
-        let d = scratch("state");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let st = edge_common::watch_state::State {
             consecutive_resets: 1,
             reset_pending: true,
@@ -802,17 +796,16 @@ mod tests {
         let mut text = serde_json::to_string_pretty(&st).unwrap();
         text.push_str(&" ".repeat(600));
         std::fs::write(d.join("state.json"), text).unwrap();
-        assert_eq!(failing_checks(&d), ["meridian", "telemetry"]);
+        assert_eq!(failing_checks(d), ["meridian", "telemetry"]);
 
         let calm = edge_common::watch_state::State {
             reset_pending: false,
             ..st
         };
         std::fs::write(d.join("state.json"), serde_json::to_string(&calm).unwrap()).unwrap();
-        assert!(failing_checks(&d).is_empty());
+        assert!(failing_checks(d).is_empty());
         std::fs::write(d.join("state.json"), "not json").unwrap();
-        assert!(failing_checks(&d).is_empty());
-        std::fs::remove_dir_all(&d).ok();
+        assert!(failing_checks(d).is_empty());
     }
 
     fn scope_in(d: &Path, boot: &str, up: u64, floor: u64, stepped_by: u64) -> Scope {
@@ -908,48 +901,49 @@ mod tests {
             // edge-watch already folded its record; the ring still says it.
             ("watchdog", false, "watchdog-reset"),
         ] {
-            let d = scratch(&format!("boot-{end}-{pending_at_boot}"));
-            previous_boot(&d, end);
-            watch(&d, pending_at_boot, &[]);
-            let before = records(&d).len();
-            let mut s = scope_in(&d, "bbbbbbbb", 5, 2_000, 0);
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path();
+            previous_boot(d, end);
+            watch(d, pending_at_boot, &[]);
+            let before = records(d).len();
+            let mut s = scope_in(d, "bbbbbbbb", 5, 2_000, 0);
             s.tick(Instant::now(), 2_000, false);
-            let all = records(&d);
+            let all = records(d);
             let first = &all[before];
             assert_eq!(first["k"], "boot", "{end}: {first}");
             assert_eq!(first["prev"], want, "{end}/{pending_at_boot}: {first}");
             assert_eq!(first["boot"], "bbbbbbbb");
-            std::fs::remove_dir_all(&d).ok();
         }
     }
 
     #[test]
     fn release_closes_ring() {
-        let d = scratch("release");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let open_in = || {
             std::fs::read_dir("/proc/self/fd")
                 .unwrap()
                 .flatten()
-                .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&d)))
+                .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(d)))
                 .count()
         };
-        let mut s = scope_in(&d, "aaaaaaaa", 20, 1_000, 0);
+        let mut s = scope_in(d, "aaaaaaaa", 20, 1_000, 0);
         s.tick(Instant::now(), 1_000, false);
         assert!(open_in() > 0);
         s.release(Instant::now(), 1_001, false);
         assert_eq!(open_in(), 0);
-        assert_eq!(records(&d).last().unwrap()["k"], "stop");
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(records(d).last().unwrap()["k"], "stop");
     }
 
     #[test]
     fn smart_and_temps_on_schedule() {
-        let d = scratch("cadence");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let hw = d.join("sys/class/hwmon/hwmon0");
         std::fs::create_dir_all(&hw).unwrap();
         std::fs::write(hw.join("name"), "coretemp").unwrap();
         std::fs::write(hw.join("temp1_input"), "40000").unwrap();
-        let mut s = scope_in(&d, "bbbbbbbb", 5, 2_000, 0);
+        let mut s = scope_in(d, "bbbbbbbb", 5, 2_000, 0);
         s.smart = vec![nvme::Smart {
             dev: "nvme0".into(),
             unsafe_shutdowns: 3,
@@ -984,23 +978,22 @@ mod tests {
 
         s.tick(at(0), 2_000, false);
         assert_eq!(
-            smart(&d),
+            smart(d),
             [Some(0)],
             "the boot reading, with the boot record"
         );
         std::fs::write(hw.join("temp1_input"), "70000").unwrap();
         s.tick(at(9), 2_009, false);
         s.tick(at(10), 2_010, false);
-        assert_eq!(temps(&d), [Some(40), Some(40), Some(70)]);
+        assert_eq!(temps(d), [Some(40), Some(40), Some(70)]);
 
         s.tick(at(599), 2_599, false);
-        assert_eq!(smart(&d).len(), 1);
+        assert_eq!(smart(d).len(), 1);
         s.tick(at(600), 2_600, false);
         s.tick(at(601), 2_601, false);
-        assert_eq!(smart(&d), [Some(0), Some(61)]);
+        assert_eq!(smart(d), [Some(0), Some(61)]);
         s.tick(at(1_200), 3_200, false);
-        assert_eq!(smart(&d).len(), 3);
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(smart(d).len(), 3);
     }
 
     #[test]
@@ -1014,48 +1007,49 @@ mod tests {
 
     #[test]
     fn restart_does_not_reclassify() {
-        let d = scratch("restart");
-        previous_boot(&d, "stop");
-        let mut s = scope_in(&d, "bbbbbbbb", 5, 2_000, 0);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        previous_boot(d, "stop");
+        let mut s = scope_in(d, "bbbbbbbb", 5, 2_000, 0);
         s.tick(Instant::now(), 2_000, false);
         s.stop(Instant::now(), 2_001, false);
         drop(s);
-        let mut again = scope_in(&d, "bbbbbbbb", 9, 2_000, 0);
+        let mut again = scope_in(d, "bbbbbbbb", 9, 2_000, 0);
         again.tick(Instant::now(), 2_004, false);
-        assert_eq!(boot_records(&d, "bbbbbbbb").len(), 1);
-        assert_eq!(boot_records(&d, "bbbbbbbb")[0]["prev"], "clean");
-        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(boot_records(d, "bbbbbbbb").len(), 1);
+        assert_eq!(boot_records(d, "bbbbbbbb")[0]["prev"], "clean");
     }
 
     #[test]
     fn writes_only_while_holding_ring() {
-        let d = scratch("held");
-        previous_boot(&d, "cut");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        previous_boot(d, "cut");
         std::fs::remove_file(d.join("time.json")).unwrap();
         let holder = ring::Ring::open(&d.join("ring.bin"), 64).unwrap();
-        let mut s = scope_in(&d, "bbbbbbbb", 5, 2_000, 0);
+        let mut s = scope_in(d, "bbbbbbbb", 5, 2_000, 0);
         s.rec.retry_every = Duration::from_secs(30);
         let t = Instant::now();
         s.tick(t, 2_000, false);
-        assert!(boot_records(&d, "bbbbbbbb").is_empty());
+        assert!(boot_records(d, "bbbbbbbb").is_empty());
         assert!(!d.join("time.json").exists(), "only the holder publishes");
         drop(holder);
         s.tick(t + Duration::from_secs(30), 2_030, false);
-        let b = boot_records(&d, "bbbbbbbb");
+        let b = boot_records(d, "bbbbbbbb");
         assert_eq!((b.len(), b[0]["prev"].as_str()), (1, Some("power-cut")));
         assert!(d.join("time.json").exists());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn time_quality_published_on_change() {
-        let d = scratch("quality");
-        let mut s = scope_in(&d, "bbbbbbbb", 5, 2_000, 700);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut s = scope_in(d, "bbbbbbbb", 5, 2_000, 700);
         let read = |d: &Path| -> clock::Quality {
             serde_json::from_slice(&std::fs::read(d.join("time.json")).unwrap()).unwrap()
         };
         s.tick(Instant::now(), 2_000, false);
-        let q = read(&d);
+        let q = read(d);
         assert_eq!(
             q,
             clock::Quality {
@@ -1066,7 +1060,7 @@ mod tests {
                 stepped_by: 700,
             }
         );
-        let b = &boot_records(&d, "bbbbbbbb")[0];
+        let b = &boot_records(d, "bbbbbbbb")[0];
         assert_eq!(
             (b["src"].as_str(), b["sy"].as_bool(), b["step"].as_u64()),
             (Some("floor"), Some(false), Some(700))
@@ -1081,9 +1075,9 @@ mod tests {
         );
 
         s.tick(Instant::now(), 2_002, true);
-        let q = read(&d);
+        let q = read(d);
         assert_eq!((q.source, q.synced), (clock::Source::Ntp, true));
-        let times: Vec<_> = records(&d)
+        let times: Vec<_> = records(d)
             .into_iter()
             .filter(|r| r["k"] == "time")
             .collect();
@@ -1092,18 +1086,18 @@ mod tests {
             (times[0]["src"].as_str(), times[0]["sy"].as_bool()),
             (Some("ntp"), Some(true))
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn samples_carry_next_floor() {
-        let d = scratch("floor");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let far = 4_000_000_000;
-        let mut s = scope_in(&d, "aaaaaaaa", 10, 2_000, 0);
+        let mut s = scope_in(d, "aaaaaaaa", 10, 2_000, 0);
         s.tick(Instant::now(), far, false);
-        set_up(&d, 70);
+        set_up(d, 70);
         s.tick(Instant::now(), far + 60, false);
-        let last = records(&d)
+        let last = records(d)
             .into_iter()
             .rev()
             .find(|r| r.get("k").is_none())
@@ -1114,13 +1108,13 @@ mod tests {
         );
         assert!(last.get("sy").is_none());
 
-        set_up(&d, 3);
+        set_up(d, 3);
         let marks = past_marks(&d.join("ring.bin"));
         assert_eq!(clock::floor(0, &marks, "bbbbbbbb", 3), 2_063);
 
-        set_up(&d, 80);
+        set_up(d, 80);
         s.tick(Instant::now(), 5_000, true);
-        let synced = records(&d)
+        let synced = records(d)
             .into_iter()
             .rev()
             .find(|r| r.get("k").is_none())
@@ -1129,27 +1123,26 @@ mod tests {
             (synced["fl"].as_u64(), synced["sy"].as_bool()),
             (Some(5_000), Some(true))
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn bad_ring_gives_no_marks() {
-        let d = scratch("nomarks");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         assert!(past_marks(&d.join("ring.bin")).is_empty());
         std::fs::write(d.join("ring.bin"), vec![0xAB; 4 * ring::RECORD_SIZE]).unwrap();
         assert!(past_marks(&d.join("ring.bin")).is_empty());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn bad_watch_record_not_pending() {
-        let d = scratch("pending");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         assert!(!watch_pending(&d.join("watch")));
-        watch(&d, true, &[]);
+        watch(d, true, &[]);
         assert!(watch_pending(&d.join("watch")));
         std::fs::write(d.join("watch/state.json"), "{\"reset_pending\":tr").unwrap();
         assert!(!watch_pending(&d.join("watch")));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     mod reach {

@@ -577,11 +577,9 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(70));
     }
 
-    fn fixture(name: &str) -> (PathBuf, PathBuf) {
-        let base =
-            std::env::temp_dir().join(format!("edge-idle-main-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&base).ok();
-        let (proc_dir, cg) = (base.join("proc"), base.join("cg"));
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let (proc_dir, cg) = (base.path().join("proc"), base.path().join("cg"));
         for (pid, comm) in [(101, "kube-scheduler"), (102, "kube-controller")] {
             let d = proc_dir.join(pid.to_string());
             std::fs::create_dir_all(&d).unwrap();
@@ -591,12 +589,12 @@ mod tests {
             std::fs::write(c.join("cgroup.procs"), format!("{pid}\n")).unwrap();
             std::fs::write(c.join("cpu.max"), "max 100000\n").unwrap();
         }
-        (proc_dir, cg)
+        (base, proc_dir, cg)
     }
 
     #[test]
     fn set_all_and_release_stale() {
-        let (proc_dir, cg) = fixture("failures");
+        let (_tmp, proc_dir, cg) = fixture();
         assert_eq!(set_all(&proc_dir, &cg, true), acted(2));
         assert_eq!(set_all(&proc_dir, &cg, true), acted(0));
 
@@ -623,12 +621,11 @@ mod tests {
             std::fs::read_to_string(cg.join("pod/kube-scheduler/cgroup.freeze")).unwrap(),
             "0"
         );
-        std::fs::remove_dir_all(proc_dir.parent().unwrap()).ok();
     }
 
     #[tokio::test]
     async fn exit_releases_throttle() {
-        let (proc_dir, cg) = fixture("exit");
+        let (_tmp, proc_dir, cg) = fixture();
         assert_eq!(set_all(&proc_dir, &cg, true), acted(2));
         release_for_exit(&proc_dir, &cg).await;
         assert_eq!(set_all(&proc_dir, &cg, false), acted(0));
@@ -637,6 +634,5 @@ mod tests {
             acted(2),
             "both unlimited again"
         );
-        std::fs::remove_dir_all(proc_dir.parent().unwrap()).ok();
     }
 }

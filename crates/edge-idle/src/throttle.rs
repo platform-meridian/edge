@@ -124,9 +124,9 @@ mod tests {
 
     /// A /proc with the two targets (the controller-manager's comm truncated
     /// as the kernel writes it), an unrelated process and a non-pid entry.
-    fn fixture(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-idle-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
+    fn fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for (pid, comm, cg) in [
             (100, "kube-scheduler", "kubepods/burstable/podAAA/sched"),
             (200, "kube-controller", "kubepods/burstable/podBBB/kcm"),
@@ -142,12 +142,13 @@ mod tests {
         }
         std::fs::create_dir_all(d.join("proc/self")).unwrap();
         std::fs::write(d.join("proc/self/comm"), "kube-scheduler\n").unwrap();
-        d
+        tmp
     }
 
     #[test]
     fn finds_pids_by_truncated_comm() {
-        let d = fixture("comm");
+        let tmp = fixture();
+        let d = tmp.path();
         let proc_dir = d.join("proc");
         assert_eq!(comm_for("kube-controller-manager"), "kube-controller");
         assert_eq!(comm_for("kube-scheduler"), "kube-scheduler");
@@ -167,12 +168,12 @@ mod tests {
             cg.join("kubepods/burstable/podBBB/kcm")
         );
         assert!(cgroup_dir_for(&proc_dir, &cg, "not-running").is_none());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn finds_cgroup_by_pid() {
-        let d = fixture("bypid");
+        let tmp = fixture();
+        let d = tmp.path();
         let proc_dir = d.join("proc");
         let cg = d.join("cg");
         let sched = cg.join("kubepods/burstable/podAAA/sched");
@@ -189,12 +190,12 @@ mod tests {
         );
         std::fs::remove_file(sched.join("cgroup.procs")).unwrap();
         assert!(cgroup_dir_for(&proc_dir, &cg, "kube-scheduler").is_none());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn set_throttled_only_touches_own() {
-        let d = fixture("owner");
+        let tmp = fixture();
+        let d = tmp.path();
         let cg = d.join("cg/kubepods/burstable/podAAA/sched");
         let cpu_max = cg.join("cpu.max");
         let read = || std::fs::read_to_string(&cpu_max).unwrap();
@@ -220,12 +221,12 @@ mod tests {
         assert!(!set_throttled(&cg, true).unwrap());
         assert!(!set_throttled(&cg, false).unwrap());
         assert_eq!(read(), "50000 100000\n");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn failed_write_errors() {
-        let d = fixture("rofail");
+        let tmp = fixture();
+        let d = tmp.path();
         let cg = d.join("cg/kubepods/burstable/podAAA/sched");
         std::fs::write(cg.join("cpu.max"), "max 100000\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -234,12 +235,12 @@ mod tests {
         if unsafe { nix::libc::geteuid() } != 0 {
             assert!(set_throttled(&cg, true).is_err());
         }
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn stale_freeze_thawed() {
-        let d = fixture("freeze");
+        let tmp = fixture();
+        let d = tmp.path();
         let cg = d.join("cg/kubepods/burstable/podAAA/sched");
         let freeze = cg.join("cgroup.freeze");
         assert!(clear_stale_freeze(&cg).is_none(), "no freezer file");
@@ -249,6 +250,5 @@ mod tests {
         std::fs::write(&freeze, "1\n").unwrap();
         assert!(clear_stale_freeze(&cg).unwrap().is_ok());
         assert_eq!(std::fs::read_to_string(&freeze).unwrap(), "0");
-        std::fs::remove_dir_all(&d).ok();
     }
 }

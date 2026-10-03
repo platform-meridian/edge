@@ -224,15 +224,9 @@ mod tests {
     use super::*;
     use crate::ring::PAYLOAD;
 
-    fn proc_dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-scope-proc-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn fixture(name: &str) -> std::path::PathBuf {
-        let d = proc_dir(name);
+    fn fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for (f, text) in [
             (
                 "pressure/cpu",
@@ -261,13 +255,14 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, text).unwrap();
         }
-        d
+        tmp
     }
 
     #[test]
     fn sample_reads_proc() {
-        let d = fixture("read");
-        let s = take(&d, 42, vec![]);
+        let tmp = fixture();
+        let d = tmp.path();
+        let s = take(d, 42, vec![]);
         assert_eq!(
             s,
             Sample {
@@ -289,13 +284,13 @@ mod tests {
         for absent in ["failing", "fl", "sy", "temp"] {
             assert!(!j.contains(absent), "{j}");
         }
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn missing_proc_files_give_zeros() {
-        let d = proc_dir("empty");
-        let s = take(&d, 1, vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let s = take(d, 1, vec![]);
         assert_eq!(
             s,
             Sample {
@@ -304,7 +299,6 @@ mod tests {
             }
         );
         assert!(!serde_json::to_string(&s).unwrap().contains("boot"));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -319,23 +313,24 @@ mod tests {
 
     #[test]
     fn fitting_sample_unchanged() {
-        let d = fixture("fits");
+        let tmp = fixture();
+        let d = tmp.path();
         let s = take(
-            &d,
+            d,
             1_800_000_000,
             vec!["meridian".into(), "telemetry".into()],
         );
         assert_eq!(to_payload(&s, PAYLOAD), serde_json::to_vec(&s).unwrap());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn excess_failures_cut_with_count() {
-        let d = fixture("many");
+        let tmp = fixture();
+        let d = tmp.path();
         let names: Vec<String> = (0..30)
             .map(|i| format!("mission-path-check-{i:02}"))
             .collect();
-        let s = take(&d, 1_800_000_000, names.clone());
+        let s = take(d, 1_800_000_000, names.clone());
         assert!(serde_json::to_vec(&s).unwrap().len() > PAYLOAD, "premise");
 
         let p = to_payload(&s, PAYLOAD);
@@ -360,14 +355,14 @@ mod tests {
                 ..s
             }
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn long_names_cut_on_char_boundary() {
-        let d = fixture("long");
+        let tmp = fixture();
+        let d = tmp.path();
         let s = take(
-            &d,
+            d,
             1,
             vec!["x".repeat(5000), "é".repeat(100), "second".into()],
         );
@@ -376,7 +371,6 @@ mod tests {
             back.failing,
             ["x".repeat(24), "é".repeat(24), "second".into()]
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -408,7 +402,8 @@ mod tests {
 
     #[test]
     fn hwmon_keeps_hottest_per_device() {
-        let d = proc_dir("hwmon");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let dev = |n: &str, name: &str, temps: &[(&str, &str)]| {
             let p = d.join("class/hwmon").join(n);
             std::fs::create_dir_all(&p).unwrap();
@@ -435,7 +430,7 @@ mod tests {
         dev("hwmon3", "fan-only", &[("fan1_input", "1200")]);
         dev("hwmon4", "", &[("temp1_input", "1000")]);
         dev("hwmon5", "coretemp", &[("temp1_input", "70000")]);
-        let got = hwmon(&d);
+        let got = hwmon(d);
         assert_eq!(
             got,
             [
@@ -446,12 +441,12 @@ mod tests {
             .into()
         );
         assert!(hwmon(&d.join("missing")).is_empty());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn hwmon_names_are_capped() {
-        let d = proc_dir("hwmon-many");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for i in 0..10 {
             let p = d.join(format!("class/hwmon/hwmon{i}"));
             std::fs::create_dir_all(&p).unwrap();
@@ -465,9 +460,8 @@ mod tests {
             std::fs::write(p.join("temp1_input"), "50000").unwrap();
         }
         assert_eq!(
-            hwmon(&d).into_keys().collect::<Vec<_>>(),
+            hwmon(d).into_keys().collect::<Vec<_>>(),
             ["coretemp", "nvme", "sensor0", "sensor1"]
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 }

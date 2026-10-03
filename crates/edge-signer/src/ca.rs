@@ -284,11 +284,11 @@ pub(crate) mod tests {
     pub const NOW: i64 = 1_790_000_000;
     const YEAR: i64 = 365 * 86_400;
 
-    pub fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-signer-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("ca.pem")
+    /// A CA path in a directory removed with the guard.
+    pub fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ca.pem");
+        (d, path)
     }
 
     pub fn csr(alg: &'static rcgen::SignatureAlgorithm) -> (KeyPair, Vec<u8>) {
@@ -462,7 +462,7 @@ pub(crate) mod tests {
     fn intermediate_leaves_verify_to_root() {
         let r = root("operator root", NOW - 60, NOW + 20 * YEAR);
         let i = intermediate(&r);
-        let path = scratch("intermediate");
+        let (_tmp, path) = scratch();
         std::fs::write(&path, file(&i, &[&i, &r])).unwrap();
         let (source, log) = logged_warnings(|| Source::open(&path, NOW).unwrap());
         assert_eq!(log, "");
@@ -489,7 +489,7 @@ pub(crate) mod tests {
     #[test]
     fn self_signed_ca_leaves_come_alone() {
         let r = root("unit CA", NOW - 60, NOW + 10 * YEAR);
-        let path = scratch("self-signed");
+        let (_tmp, path) = scratch();
         std::fs::write(&path, file(&r, &[&r])).unwrap();
         let source = Source::open(&path, NOW).unwrap();
         assert_eq!(source.ca.root(), r.pem);
@@ -622,7 +622,7 @@ pub(crate) mod tests {
             ),
         ];
         for (what, bytes, why) in shapes {
-            let path = scratch("bad");
+            let (_tmp, path) = scratch();
             if let Some(b) = &bytes {
                 std::fs::write(&path, b).unwrap();
             }
@@ -639,7 +639,7 @@ pub(crate) mod tests {
             );
         }
 
-        let path = scratch("dir");
+        let (_tmp, path) = scratch();
         std::fs::create_dir(&path).unwrap();
         let (source, log) = logged_warnings(|| Source::open(&path, NOW).unwrap());
         assert!(one_error(&log, &path, "unreadable"), "a directory: {log}");
@@ -648,7 +648,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refresh_follows_file_changes() {
-        let path = scratch("refresh");
+        let (_tmp, path) = scratch();
         let a = root("a", NOW - 60, NOW + 10 * YEAR);
         let b = root("b", NOW - 60, NOW + 10 * YEAR);
         std::fs::write(&path, file(&a, &[&a])).unwrap();
@@ -686,7 +686,7 @@ pub(crate) mod tests {
 
     #[test]
     fn not_yet_valid_ca_taken_once_valid() {
-        let path = scratch("clock");
+        let (_tmp, path) = scratch();
         let r = root("r", NOW, NOW + 10 * YEAR);
         std::fs::write(&path, file(&r, &[&r])).unwrap();
         let (mut source, log) = logged_warnings(|| Source::open(&path, NOW - 1).unwrap());

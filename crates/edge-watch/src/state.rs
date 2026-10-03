@@ -283,34 +283,25 @@ impl ResetGate {
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-watch-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn notdir_store(name: &str) -> (Store, PathBuf) {
-        let f = std::env::temp_dir().join(format!("edge-watch-{name}-{}", std::process::id()));
+    fn notdir_store() -> (tempfile::TempDir, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("file");
         std::fs::write(&f, b"x").unwrap();
-        (Store::new(&f.join("sub/deeper")), f)
+        let store = Store::new(&f.join("sub/deeper"));
+        (tmp, store)
     }
 
-    fn readonly_store(name: &str) -> Option<(Store, PathBuf)> {
+    /// A store in an empty directory it may not write.
+    fn readonly_store() -> Option<(tempfile::TempDir, Store)> {
         use std::os::unix::fs::PermissionsExt;
         if unsafe { nix::libc::geteuid() } == 0 {
             eprintln!("skipped: running as root");
             return None;
         }
-        let d = dir(name);
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
-        Some((Store::new(&d), d))
-    }
-
-    fn remove_readonly(d: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).ok();
-        std::fs::remove_dir_all(d).ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let store = Store::new(tmp.path());
+        Some((tmp, store))
     }
 
     fn record(n: u32, pending: bool) -> State {
@@ -339,13 +330,13 @@ mod tests {
 
     #[test]
     fn record_round_trips_padded() {
-        let d = dir("roundtrip");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         store.save(&record(4, true)).unwrap();
         assert_eq!(store.load(), record(4, true));
         assert!(std::fs::metadata(d.join("state.json")).unwrap().len() >= MIN_RECORD_BYTES as u64);
         assert!(!d.join("state.json.edge-tmp").exists());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -366,8 +357,9 @@ mod tests {
             ("unreadable", Rec::Dir, true),
         ];
         for (name, rec, counts) in cases {
-            let d = dir(name);
-            let store = Store::new(&d);
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path();
+            let store = Store::new(d);
             match rec {
                 Rec::Absent => {}
                 Rec::Bytes(b) => std::fs::write(d.join("state.json"), b).unwrap(),
@@ -380,14 +372,14 @@ mod tests {
                 counts as u32,
                 "{name}"
             );
-            std::fs::remove_dir_all(&d).ok();
         }
     }
 
     #[test]
     fn damaged_record_kept_as_evidence() {
-        let d = dir("evidence");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         let torn = b"{\"consecutive_resets\": 2, \"reset_p";
         std::fs::write(d.join("state.json"), torn).unwrap();
         assert!(store.load().reset_pending);
@@ -398,32 +390,30 @@ mod tests {
             !after.reset_pending && after.consecutive_resets == 1,
             "{after:?}"
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn record_writes_past_blockers() {
-        let d = dir("squat");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         std::fs::create_dir(d.join("state.json")).unwrap();
         store.save(&record(1, false)).unwrap();
         assert_eq!(store.load().consecutive_resets, 1);
 
-        let f = dir("squat-file");
-        std::fs::remove_dir_all(&f).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("state");
         std::fs::write(&f, b"not a directory").unwrap();
         let store = Store::new(&f);
         store.save(&record(2, false)).unwrap();
         assert_eq!(store.load().consecutive_resets, 2);
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::remove_dir_all(&f).ok();
-        std::fs::remove_file(f.with_extension("corrupt")).ok();
     }
 
     #[test]
     fn unrelated_restart_keeps_count() {
-        let d = dir("budget");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         let mut st = fold_boot(store.load());
         for _ in 0..2 {
             arm_reset(&store, &mut st, vec!["meridian".into()], "epoch:1".into()).unwrap();
@@ -435,13 +425,13 @@ mod tests {
         assert_eq!(st.consecutive_resets, 2);
         arm_reset(&store, &mut st, vec!["meridian".into()], "epoch:2".into()).unwrap();
         assert_eq!(fold_boot(store.load()).consecutive_resets, 3);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn recovered_persists_or_keeps() {
-        let d = dir("clear");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         let mut st = State {
             repairs: 1,
             exhausted: true,
@@ -455,9 +445,9 @@ mod tests {
         };
         assert_eq!((&st, store.load()), (&want, want.clone()));
         assert!(!on_ladder(&st));
-        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(d).ok();
 
-        let Some((store, d)) = readonly_store("noclear") else {
+        let Some((_tmp, store)) = readonly_store() else {
             return;
         };
         let mut st = State {
@@ -470,13 +460,13 @@ mod tests {
             (2, 1),
             "a ladder we could not clear is kept"
         );
-        remove_readonly(&d);
     }
 
     #[test]
     fn health_written_on_change_only() {
-        let d = dir("health");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         let mut st = State::default();
         let since = HealthySince {
             boot_id: "b1".into(),
@@ -500,9 +490,9 @@ mod tests {
             record(1, false),
             "a new process starts with no health"
         );
-        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(d).ok();
 
-        let Some((store, d)) = readonly_store("nohealth") else {
+        let Some((_tmp, store)) = readonly_store() else {
             return;
         };
         let mut st = State::default();
@@ -512,7 +502,6 @@ mod tests {
         };
         assert!(set_healthy(&store, &mut st, Some(since)).is_err());
         assert_eq!(st.healthy_since, None, "an unwritten change is retried");
-        remove_readonly(&d);
     }
 
     #[test]
@@ -558,8 +547,9 @@ mod tests {
 
     #[test]
     fn ladder_ends_disarmed() {
-        let d = dir("ladder");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         let steps: Vec<Rung> = (0..20).map(|b| failed_boot(&store, b)).collect();
         let mut want = vec![Rung::Arm; 3];
         want.push(Rung::Repair);
@@ -569,13 +559,13 @@ mod tests {
         let end = store.load();
         assert!(end.exhausted && end.repairs == MAX_REPAIRS, "{end:?}");
         assert_eq!(end.last_repair_at.as_deref(), Some("epoch:3"));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn recovery_restarts_ladder() {
-        let d = dir("reladder");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         for b in 0..8 {
             failed_boot(&store, b);
         }
@@ -583,19 +573,19 @@ mod tests {
         recovered(&store, &mut st).unwrap();
         let steps: Vec<Rung> = (0..4).map(|b| failed_boot(&store, b)).collect();
         assert_eq!(steps, [Rung::Arm, Rung::Arm, Rung::Arm, Rung::Repair]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn cut_after_repair_record_skips_rung() {
-        let d = dir("cutrepair");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         let mut st = State {
             consecutive_resets: 3,
             ..State::default()
         };
         begin_repair(&store, &mut st, vec!["store".into()], "epoch:7".into()).unwrap();
-        let next = fold_boot(Store::new(&d).load());
+        let next = fold_boot(Store::new(d).load());
         assert_eq!((next.consecutive_resets, next.repairs), (0, 1));
         assert_eq!(rung(&next, 3), Rung::Arm);
         assert_eq!(
@@ -608,12 +598,11 @@ mod tests {
             ),
             Rung::Exhausted
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn unwritable_repair_not_taken() {
-        let Some((store, d)) = readonly_store("norepair") else {
+        let Some((_tmp, store)) = readonly_store() else {
             return;
         };
         let mut st = State {
@@ -622,22 +611,19 @@ mod tests {
         };
         assert!(begin_repair(&store, &mut st, vec!["a".into()], "epoch:1".into()).is_err());
         assert_eq!((st.consecutive_resets, st.repairs), (3, 0));
-        remove_readonly(&d);
     }
 
     #[test]
     fn failed_arm_claims_nothing() {
-        let (store, f) = notdir_store("notadir");
+        let (_tmp, store) = notdir_store();
         assert!(store.load().reset_pending, "ENOTDIR is not a first boot");
-        std::fs::remove_file(&f).ok();
 
-        let Some((store, d)) = readonly_store("readonly") else {
+        let Some((_tmp, store)) = readonly_store() else {
             return;
         };
         let mut st = State::default();
         assert!(arm_reset(&store, &mut st, vec!["a".into()], "epoch:1".into()).is_err());
         assert!(!st.reset_pending);
-        remove_readonly(&d);
     }
 
     #[test]
@@ -647,23 +633,23 @@ mod tests {
             eprintln!("skipped: running as root");
             return;
         }
-        let d = dir("inplace");
-        let store = Store::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let store = Store::new(d);
         store
             .save(&State {
                 last_failure: (0..40).map(|i| format!("check-number-{i}")).collect(),
                 ..State::default()
             })
             .unwrap();
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut st = State::default();
         let r = arm_reset(&store, &mut st, vec!["meridian".into()], "epoch:9".into());
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
         r.expect("the in-place fallback must succeed");
         let back = store.load();
         assert!(back.reset_pending);
         assert_eq!(back.last_failure, vec!["meridian".to_string()]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     const P: Duration = Duration::from_secs(900);

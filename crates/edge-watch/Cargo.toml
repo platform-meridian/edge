@@ -24,6 +24,7 @@ hyper-util.workspace = true
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
+tempfile = "3"
 
 [build-dependencies]
 protox.workspace = true

@@ -62,49 +62,42 @@ pub fn monotonic() -> Duration {
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-signer-hb-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     #[test]
     fn fresh_passes_stale_fails() {
-        let d = dir("age");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::write(d.join(FILE), "5000").unwrap();
         let stamp = Duration::from_secs(5);
-        assert!(check(&d, stamp).is_ok());
-        assert!(check(&d, stamp - Duration::from_secs(1)).is_ok(), "ahead");
-        assert!(check(&d, stamp + STALE_AFTER).is_ok());
-        let e = check(&d, stamp + STALE_AFTER + Duration::from_millis(1)).unwrap_err();
+        assert!(check(d, stamp).is_ok());
+        assert!(check(d, stamp - Duration::from_secs(1)).is_ok(), "ahead");
+        assert!(check(d, stamp + STALE_AFTER).is_ok());
+        let e = check(d, stamp + STALE_AFTER + Duration::from_millis(1)).unwrap_err();
         assert!(e.to_string().contains("stalled for 30s"), "{e}");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn missing_or_garbled_fails() {
-        let d = dir("missing");
-        assert!(check(&d, monotonic()).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert!(check(d, monotonic()).is_err());
         std::fs::write(d.join(FILE), "").unwrap();
-        assert!(check(&d, monotonic()).is_err());
+        assert!(check(d, monotonic()).is_err());
         std::fs::write(d.join(FILE), "soon").unwrap();
-        assert!(check(&d, monotonic()).is_err());
-        std::fs::remove_dir_all(&d).ok();
+        assert!(check(d, monotonic()).is_err());
     }
 
     #[test]
     fn beat_advances_stamp() {
-        let d = dir("advance");
-        let hb = Heartbeat::new(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let hb = Heartbeat::new(d);
         hb.beat().unwrap();
         let first = std::fs::read_to_string(d.join(FILE)).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         hb.beat().unwrap();
         let second = std::fs::read_to_string(d.join(FILE)).unwrap();
         assert!(second.parse::<u64>().unwrap() > first.parse::<u64>().unwrap());
-        assert!(check(&d, monotonic()).is_ok());
+        assert!(check(d, monotonic()).is_ok());
         assert!(!d.join("heartbeat.tmp").exists());
-        std::fs::remove_dir_all(&d).ok();
     }
 }

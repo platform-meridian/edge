@@ -442,9 +442,8 @@ mod tests {
 
     #[test]
     fn orderly_stop_disarms() {
-        let d = std::env::temp_dir().join(format!("edge-watch-stop-{}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let dev = d.join("watchdog");
         std::fs::write(&dev, b"").unwrap();
         let mut wd = watchdog::Watchdog::open(&dev, 30).unwrap();
@@ -459,6 +458,5 @@ mod tests {
         let saved = store.load();
         assert!(!saved.reset_pending);
         assert_eq!(saved.consecutive_resets, 1);
-        std::fs::remove_dir_all(&d).ok();
     }
 }

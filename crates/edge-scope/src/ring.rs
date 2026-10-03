@@ -343,17 +343,11 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("edge-scope-{}-{}", std::process::id(), name));
-        std::fs::remove_file(&p).ok();
-        p
-    }
-
-    fn dir_for(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-scope-{}-{}", std::process::id(), name));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// A ring path in a directory removed with the guard.
+    fn tmp() -> (tempfile::TempDir, std::path::PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("ring.bin");
+        (d, p)
     }
 
     fn edge_tmp(p: &Path) -> std::path::PathBuf {
@@ -392,7 +386,7 @@ mod tests {
 
     #[test]
     fn reopen_continues_sequence() {
-        let p = tmp("order");
+        let (_tmp, p) = tmp();
         drop(Ring::open(&p, 8).unwrap());
         {
             let mut r = Ring::open(&p, 8).unwrap();
@@ -415,12 +409,11 @@ mod tests {
             [(0, 0, 2), (1, 1, 2), (2, 2, 2), (3, 3, 2)]
         );
         assert_eq!(all[0].payload.len(), PAYLOAD);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn full_ring_wraps() {
-        let p = tmp("wrap");
+        let (_tmp, p) = tmp();
         {
             let mut r = Ring::open(&p, 4).unwrap();
             for i in 0..10u8 {
@@ -438,12 +431,12 @@ mod tests {
         let mut r = Ring::open(&p, 4).unwrap();
         r.append(b"x").unwrap();
         assert_eq!(seqs(&mut r), [7, 8, 9, 10]);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn torn_record_dropped() {
-        let d = dir_for("torn");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         {
             let mut r = Ring::open(&p, 4).unwrap();
@@ -456,12 +449,11 @@ mod tests {
         assert!(r.take_recovered().is_none());
         assert!(!d.join("ring.bin.corrupt").exists());
         assert_eq!(seqs(&mut r), [0, 2]);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn batch_appends_in_order() {
-        let p = tmp("batch");
+        let (_tmp, p) = tmp();
         let mut r = Ring::open_with(&p, 4, 64).unwrap();
         assert_eq!(r.payload_size(), 64 - HEADER);
         assert_eq!(r.append_all(&[b"a", b"b", b"c"]).unwrap(), 2);
@@ -479,12 +471,12 @@ mod tests {
         assert!(r.append_all(&[b"f".as_slice(), &over]).is_err());
         assert!(r.append_all::<&[u8]>(&[]).is_err());
         assert_eq!(seqs(&mut r), [1, 2, 3, 4], "a refused batch writes nothing");
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn wrong_record_size_replaced() {
-        let d = dir_for("resized");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         Ring::open_with(&p, 8, 512).unwrap().append(b"big").unwrap();
         let mut r = Ring::open_read_only_with(&p, 512).unwrap();
@@ -494,22 +486,20 @@ mod tests {
         assert_eq!(small.slots(), 4);
         assert!(d.join("ring.bin.corrupt").exists());
         assert!(Ring::open_with(&p, 4, HEADER).is_err());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn payload_limit() {
-        let p = tmp("big");
+        let (_tmp, p) = tmp();
         let mut r = Ring::open(&p, 2).unwrap();
         r.append(&[7u8; PAYLOAD]).unwrap();
         assert!(r.append(&[0u8; PAYLOAD + 1]).is_err());
         assert_eq!(r.read_all().unwrap()[0].payload, vec![7u8; PAYLOAD]);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn new_ring_fully_allocated() {
-        let p = tmp("alloc");
+        let (_tmp, p) = tmp();
         let r = Ring::open(&p, 64).unwrap();
         assert_eq!(r.slots(), 64);
         assert_eq!(
@@ -518,12 +508,11 @@ mod tests {
         );
         assert!(allocated(&p) >= 64 * RECORD_SIZE as u64);
         assert!(!edge_tmp(&p).exists());
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn sparse_ring_allocated_keeping_history() {
-        let p = tmp("sparse");
+        let (_tmp, p) = tmp();
         {
             let f = File::create(&p).unwrap();
             f.set_len(32 * RECORD_SIZE as u64).unwrap();
@@ -537,12 +526,11 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(&all[0].payload[..11], b"old history");
         assert_eq!(r.append(b"new").unwrap(), 8);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn existing_ring_never_resized() {
-        let p = tmp("noresize");
+        let (_tmp, p) = tmp();
         {
             let mut r = Ring::open(&p, 8).unwrap();
             for i in 0..8u8 {
@@ -555,12 +543,11 @@ mod tests {
             assert_eq!(std::fs::metadata(&p).unwrap().len(), 8 * RECORD_SIZE as u64);
             assert_eq!(r.read_all().unwrap().len(), 8, "asked for {asked}");
         }
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn read_only_changes_nothing() {
-        let p = tmp("ro");
+        let (_tmp, p) = tmp();
         {
             let mut r = Ring::open(&p, 6).unwrap();
             r.append(b"a").unwrap();
@@ -580,7 +567,7 @@ mod tests {
 
     #[test]
     fn stub_or_temp_is_not_ring() {
-        let p = tmp("stub");
+        let (_tmp, p) = tmp();
         std::fs::write(&p, b"tiny").unwrap();
         assert!(Ring::open_read_only(&p).is_err());
         assert_eq!(Ring::open(&p, 4).unwrap().slots(), 4);
@@ -589,12 +576,11 @@ mod tests {
         std::fs::write(edge_tmp(&p), vec![0u8; 3 * RECORD_SIZE]).unwrap();
         assert!(Ring::open_read_only(&p).is_err());
         assert_eq!(Ring::open(&p, 8).unwrap().slots(), 8);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn v1_ring_still_works() {
-        let p = tmp("v1");
+        let (_tmp, p) = tmp();
         let v1: Vec<u8> = (0..4u64)
             .flat_map(|i| v1_record(10 + i, format!("old{i}").as_bytes()))
             .collect();
@@ -610,7 +596,6 @@ mod tests {
         assert_eq!(&all[0].payload[..4], b"old1");
         assert_eq!(&all[3].payload[..3], b"new");
         assert_eq!(std::fs::read(&p).unwrap()[RECORD_SIZE..], v1[RECORD_SIZE..]);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -624,7 +609,8 @@ mod tests {
 
     #[test]
     fn unusable_ring_replaced() {
-        let d = dir_for("recover");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         let corrupt = d.join("ring.bin.corrupt");
 
@@ -662,13 +648,13 @@ mod tests {
             .set_len((MAX_SLOTS + 1) * RECORD_SIZE as u64)
             .unwrap();
         assert_eq!(Ring::open(&p, 4).unwrap().slots(), 4, "absurdly large");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn unwritable_ring_replaced() {
         use std::os::unix::fs::PermissionsExt;
-        let d = dir_for("readonly");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         drop(Ring::open(&p, 4).unwrap());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -678,12 +664,12 @@ mod tests {
         let mut r = Ring::open(&p, 4).unwrap();
         assert!(r.take_recovered().is_some());
         r.append(b"x").unwrap();
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn replaced_ring_noticed() {
-        let d = dir_for("replaced");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         let r = Ring::open(&p, 4).unwrap();
         assert!(r.is_current(&p));
@@ -691,12 +677,12 @@ mod tests {
         assert!(!r.is_current(&p), "deleted");
         drop(Ring::open(&p, 4).unwrap());
         assert!(!r.is_current(&p), "replaced");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn second_recorder_refused() {
-        let d = dir_for("held");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("ring.bin");
         let mut first = Ring::open(&p, 4).unwrap();
         first.append(b"one").unwrap();
@@ -708,17 +694,16 @@ mod tests {
         drop(first);
         let mut again = Ring::open(&p, 4).unwrap();
         assert_eq!(again.append(b"two").unwrap(), 1);
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn missing_dir_created_squatter_set_aside() {
-        let d = dir_for("nodir");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         assert_eq!(Ring::open(&d.join("a/b/ring.bin"), 2).unwrap().slots(), 2);
         std::fs::write(d.join("file"), b"squatter").unwrap();
         assert_eq!(Ring::open(&d.join("file/ring.bin"), 2).unwrap().slots(), 2);
         assert_eq!(std::fs::read(d.join("file.corrupt")).unwrap(), b"squatter");
         assert!(Ring::open(&d.join("zero.bin"), 0).is_err());
-        std::fs::remove_dir_all(&d).ok();
     }
 }

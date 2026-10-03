@@ -372,13 +372,6 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("edge-scope-cri-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn serve(sock: &Path, fake: Arc<Fake>) {
         let listener = tokio::net::UnixListener::bind(sock).unwrap();
         tokio::spawn(
@@ -390,7 +383,8 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_removes_future_state() {
-        let d = scratch("sweep");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("containerd.sock");
         assert!(sweep(&sock, || NOW).await.is_err(), "no socket yet");
         let fake = Arc::new(Fake::default());
@@ -433,12 +427,12 @@ mod tests {
         let again = sweep(&sock, || NOW).await.unwrap();
         assert_eq!(again.containers, ["refused"], "a failed removal is retried");
         assert!(sweep(&sock, || NOW).await.unwrap().is_empty());
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[tokio::test]
     async fn sweeper_waits_for_socket() {
-        let d = scratch("spawn");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let sock = d.join("containerd.sock");
         let (tx, rx) = std::sync::mpsc::channel();
         spawn(sock.clone(), tx).unwrap();
@@ -457,6 +451,5 @@ mod tests {
         assert_eq!(got.containers, ["old-boot"]);
         assert!(got.ahead_secs > (YEAR / S) as u64 - 60);
         assert_eq!(*fake.calls.lock().unwrap(), ["rm old-boot"]);
-        std::fs::remove_dir_all(&d).ok();
     }
 }

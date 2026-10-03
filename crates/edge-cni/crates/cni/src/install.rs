@@ -155,14 +155,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("edge-cni-install-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn me() -> PathBuf {
         std::env::current_exe().unwrap()
     }
@@ -181,7 +173,8 @@ mod tests {
 
     #[test]
     fn install_replaces_leftovers() {
-        let d = scratch("install");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let bin = d.join("opt/cni/bin/edge-cni");
         let conf = d.join("etc/cni/net.d/10-edge.conflist");
         let cidr = Some("10.244.0.0/24");
@@ -216,13 +209,13 @@ mod tests {
         std::fs::create_dir_all(bin.join("junk")).unwrap();
         install_cni_at(&me(), &bin, &conf, cidr).unwrap();
         assert!(cni_is_installed_at(&bin, &conf, cidr));
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn unwritable_dir_is_error() {
         use std::os::unix::fs::PermissionsExt;
-        let d = scratch("ro");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::create_dir_all(d.join("net.d")).unwrap();
         std::fs::set_permissions(d.join("net.d"), std::fs::Permissions::from_mode(0o555)).unwrap();
         if std::fs::write(d.join("net.d/probe"), b"x").is_ok() {
@@ -239,12 +232,12 @@ mod tests {
         assert!(install().is_err());
         std::fs::set_permissions(d.join("net.d"), std::fs::Permissions::from_mode(0o755)).unwrap();
         install().expect("and it works once the directory does");
-        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn floor_defers_to_daemon_conflist() {
-        let d = scratch("floor");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let bin = d.join("opt/cni/bin/edge-cni");
         let conf = d.join("etc/cni/net.d/10-edge.conflist");
         let node = Some("10.244.0.0/24");
@@ -275,6 +268,5 @@ mod tests {
             !cni_is_installed_at(&bin, &conf, None),
             "a conflist that is not ours is replaced"
         );
-        std::fs::remove_dir_all(&d).ok();
     }
 }

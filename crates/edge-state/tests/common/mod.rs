@@ -6,16 +6,17 @@ use edge_state::pb::etcdserverpb::{
 use edge_state::server::EtcdServer;
 use edge_state::store::Store;
 
+/// On disk rather than a RAM /tmp, and removed with the guard: nothing is
+/// left behind, not even a parent.
 pub fn tempdir() -> tempfile::TempDir {
     let base = std::env::var_os("EDGE_STATE_TEST_TMP")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::Path::new(&h).join(".cache/meridian-edge-test-tmp"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    std::fs::create_dir_all(&base).unwrap();
-    tempfile::tempdir_in(base).unwrap()
+    tempfile::Builder::new()
+        .prefix("edge-state-test-")
+        .tempdir_in(base)
+        .unwrap()
 }
 
 pub fn fill_past_a_batch(path: &std::path::Path) {
