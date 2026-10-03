@@ -65,6 +65,7 @@ pub struct Limits {
     pub authz_timeout_ms: u64,
     /// A larger response denies.
     pub authz_max_response_bytes: usize,
+    /// Only where inotify is unavailable.
     pub tls_reload_interval_ms: u64,
 }
 

@@ -28,6 +28,7 @@ kube.workspace = true
 k8s-openapi.workspace = true
 futures.workspace = true
 arc-swap.workspace = true
+notify = { version = "8", default-features = false }
 
 [dev-dependencies]
 proptest = "1"

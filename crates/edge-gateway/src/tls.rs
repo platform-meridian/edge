@@ -1,5 +1,6 @@
 //! The kubelet rotates the projected certificate in place, so it is resolved per
-//! handshake from a polled slot. `cert` and `key` may name one credential bundle.
+//! handshake from a slot reloaded when its directory changes. `cert` and `key`
+//! may name one credential bundle.
 
 use arc_swap::ArcSwapOption;
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -63,8 +64,6 @@ impl std::fmt::Debug for Reloading {
             .finish()
     }
 }
-
-const NO_CERT_POLL: Duration = Duration::from_secs(1);
 
 impl Reloading {
     pub fn new(cert_path: &str, key_path: &str) -> Arc<Self> {
@@ -130,19 +129,55 @@ impl Reloading {
         }
     }
 
-    pub fn spawn_reloader(self: &Arc<Self>, every: Duration) {
+    /// Polls every `fallback` only where inotify is unavailable.
+    pub fn spawn_reloader(self: &Arc<Self>, fallback: Duration) {
         let me = self.clone();
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let watcher = me.watch(changed.clone());
         tokio::spawn(async move {
+            // Anything changed before the watch began.
+            me.check();
+            let _watcher = match watcher {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?fallback, "tls: no inotify; polling");
+                    loop {
+                        tokio::time::sleep(fallback).await;
+                        me.check();
+                    }
+                }
+            };
             loop {
-                let wait = if me.has_certificate() {
-                    every
-                } else {
-                    every.min(NO_CERT_POLL)
-                };
-                tokio::time::sleep(wait).await;
+                changed.notified().await;
                 me.check();
             }
         });
+    }
+
+    /// The directories, not the files: the kubelet swaps a projected volume's
+    /// files by renaming its `..data` symlink.
+    fn watch(
+        &self,
+        changed: Arc<tokio::sync::Notify>,
+    ) -> notify::Result<notify::RecommendedWatcher> {
+        use notify::Watcher;
+        let mut w = notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
+            changed.notify_one();
+        })?;
+        let mut dirs: Vec<&std::path::Path> = [&self.cert_path, &self.key_path]
+            .iter()
+            .map(|p| {
+                std::path::Path::new(p.as_str())
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."))
+            })
+            .collect();
+        dirs.dedup();
+        for d in dirs {
+            w.watch(d, notify::RecursiveMode::NonRecursive)?;
+        }
+        Ok(w)
     }
 
     #[cfg(test)]
@@ -226,23 +261,54 @@ mod tests {
         assert_eq!(leaf, c.der);
     }
 
+    /// Reloaded on change: the fallback poll is an hour.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    async fn eventually(what: &str, f: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{what} not within 2 s");
+    }
+
     #[tokio::test]
-    async fn polls_fast_without_certificate() {
+    async fn first_certificate_picked_up_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let cert = dir.path().join("tls.crt").to_string_lossy().into_owned();
         let key = dir.path().join("tls.key").to_string_lossy().into_owned();
         let resolver = Reloading::new(&cert, &key);
-        resolver.spawn_reloader(Duration::from_secs(3600));
+        resolver.spawn_reloader(NEVER);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         install(dir.path(), &issue());
-        let mut waited = 0;
-        while !resolver.has_certificate() && waited < 40 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            waited += 1;
-        }
-        assert!(
-            resolver.has_certificate(),
-            "no certificate picked up within 4 s"
-        );
+        eventually("the first certificate", || resolver.has_certificate()).await;
+    }
+
+    #[tokio::test]
+    async fn change_before_the_watch_is_not_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("tls.crt").to_string_lossy().into_owned();
+        let key = dir.path().join("tls.key").to_string_lossy().into_owned();
+        let resolver = Reloading::new(&cert, &key);
+        install(dir.path(), &issue());
+        resolver.spawn_reloader(NEVER);
+        eventually("the certificate", || resolver.has_certificate()).await;
+    }
+
+    #[tokio::test]
+    async fn polls_without_inotify() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        let cert = missing.join("tls.crt").to_string_lossy().into_owned();
+        let key = missing.join("tls.key").to_string_lossy().into_owned();
+        let resolver = Reloading::new(&cert, &key);
+        resolver.spawn_reloader(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::create_dir(&missing).unwrap();
+        install(&missing, &issue());
+        eventually("the polled certificate", || resolver.has_certificate()).await;
     }
 
     #[tokio::test]
@@ -253,7 +319,7 @@ mod tests {
         let (cert, key) = install(dir.path(), &first);
 
         let resolver = Reloading::new(&cert, &key);
-        resolver.spawn_reloader(Duration::from_millis(40));
+        resolver.spawn_reloader(NEVER);
         let backend = recorder("b").await;
         let gw = start(
             tls_cfg(&cert, &key, ""),
