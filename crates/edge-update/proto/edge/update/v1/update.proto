@@ -1,8 +1,5 @@
-// Updates the unit from bundles signed by the pinned update key.
-//
-// A bundle is uploaded in chunks, verified, then applied. Every call is safe to
-// repeat: an upload resumes, and an update in progress survives a reboot or a
-// power cut and carries on by itself.
+// Updates the unit from bundles signed by the pinned update key. Every call is
+// safe to repeat; an update in progress survives a reboot or power cut.
 syntax = "proto3";
 
 package edge.update.v1;
@@ -12,8 +9,7 @@ service UpdateService {
   rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
   // Stores one chunk. A chunk already held is accepted again.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
-  // Checks a complete upload against the pinned key and this unit, changing
-  // nothing on the unit. The result is in the status.
+  // Checks a complete upload against the pinned key and this unit, changing nothing.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
   // Applies the verified bundle. Refused until the unit has committed the OS
   // it booted, since the update's own trial falls back to it.
@@ -135,16 +131,14 @@ message Status {
   string detail = 2;
   // The release verified or being applied.
   Release release = 3;
-  // Why the last verification or update stopped, empty once one succeeds or
-  // an update starts.
+  // Why the last verification or update stopped; empty once one succeeds or an update starts.
   string error = 4;
   Upload upload = 5;
   int64 updated_unix = 6;
   Unit unit = 7;
 }
 
-// The unit as it runs, read every half-minute whatever the engine is doing.
-// A part that cannot be read keeps what was last read.
+// The unit as it runs, reread every half-minute; an unreadable part keeps its last value.
 message Unit {
   string talos_version = 1;
   // The stack tag the unit follows.

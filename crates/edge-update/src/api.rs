@@ -68,37 +68,36 @@ impl Service {
         .map_err(|e| ConnectError::invalid_argument(format!("{e:#}")))
     }
 
+    async fn ask<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<anyhow::Result<T>>) -> Command,
+    ) -> Result<T, ConnectError> {
+        let (tx, rx) = oneshot::channel();
+        fn stopped<E>(_: E) -> ConnectError {
+            ConnectError::unavailable("the engine has stopped")
+        }
+        self.commands.send(make(tx)).await.map_err(stopped)?;
+        rx.await
+            .map_err(stopped)?
+            .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))
+    }
+
     async fn command(
         &self,
         make: impl FnOnce(oneshot::Sender<anyhow::Result<()>>) -> Command,
     ) -> Result<pb::Status, ConnectError> {
-        let (tx, rx) = oneshot::channel();
-        self.commands
-            .send(make(tx))
-            .await
-            .map_err(|_| ConnectError::unavailable("the engine has stopped"))?;
-        rx.await
-            .map_err(|_| ConnectError::unavailable("the engine has stopped"))?
-            .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))?;
+        self.ask(make).await?;
         // The engine publishes before it replies.
         let s = self.status.borrow().clone();
         Ok(self.convert(&s))
     }
 
-    /// Refused at once from the status while an update runs, rather than
-    /// after the engine's current step, which may take minutes.
+    /// Refused at once while an update runs, not after the engine's current step.
     async fn power(&self, p: Power) -> Result<String, ConnectError> {
         if let Some(why) = self.status.borrow().record.power_refusal() {
             return Err(ConnectError::failed_precondition(why));
         }
-        let (tx, rx) = oneshot::channel();
-        self.commands
-            .send(Command::Power(p, tx))
-            .await
-            .map_err(|_| ConnectError::unavailable("the engine has stopped"))?;
-        rx.await
-            .map_err(|_| ConnectError::unavailable("the engine has stopped"))?
-            .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))
+        self.ask(|tx| Command::Power(p, tx)).await
     }
 
     fn convert(&self, s: &Snapshot) -> pb::Status {

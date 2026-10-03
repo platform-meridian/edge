@@ -1,4 +1,3 @@
-# The update API is ours; talos/ holds upstream's names and numbers as they are.
 version: v2
 modules:
   - path: .

@@ -97,11 +97,9 @@ pub(crate) struct World {
 
 impl World {
     fn new() -> Self {
-        let mut entries = BTreeMap::new();
-        entries.insert("talos-v1.14.1.efi".to_string(), "v1.14.1".to_string());
         Self {
             version: "v1.14.1".into(),
-            entries,
+            entries: BTreeMap::from([("talos-v1.14.1.efi".into(), "v1.14.1".into())]),
             default: "Talos-v1.14.1.efi".into(),
             selected: "Talos-v1.14.1.efi".into(),
             one_shot: String::new(),
@@ -114,14 +112,11 @@ impl World {
             trial_fails: false,
             url: "oci://127.0.0.1:3172/stack".into(),
             tag: OLD_TAG.into(),
-            lock: [("built_epoch", "1000"), ("PROFILE", "edge")]
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
-            judge: [("good", OLD_TAG)]
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
+            lock: BTreeMap::from([
+                ("built_epoch".into(), "1000".into()),
+                ("PROFILE".into(), "edge".into()),
+            ]),
+            judge: BTreeMap::from([("good".into(), OLD_TAG.into())]),
             judge_ticks: 0,
             verdict: Verdict::Good,
             seeded: false,
@@ -697,31 +692,6 @@ async fn the_os_the_unit_runs_is_not_installed_again() {
     assert_eq!(w.boot_id, 1, "rebooted");
 }
 
-#[tokio::test]
-async fn a_config_that_needs_a_reboot_installs_the_os_as_usual() {
-    let mut h = Harness::new();
-    running_installer(&h, &format!("reg/installer@{DIGEST}"));
-    {
-        let mut w = h.w();
-        w.os_current = false;
-        w.apply_refused = true;
-    }
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-    assert_eq!(
-        h.w().log,
-        [
-            "import",
-            "stage",
-            "install",
-            "reboot",
-            "seed",
-            "repoint update-new"
-        ]
-    );
-}
-
 #[test]
 fn the_running_installer_is_the_unattended_installs_else_machine_installs() {
     let unattended = "version: v1alpha1\nmachine:\n  install:\n    image: old@sha256:1\n---\n\
@@ -735,44 +705,42 @@ fn the_running_installer_is_the_unattended_installs_else_machine_installs() {
 }
 
 #[tokio::test]
-async fn another_installer_is_installed() {
-    let mut h = Harness::new();
-    running_installer(
-        &h,
-        "reg/installer@sha256:2222222222222222222222222222222222222222222222222222222222222222",
-    );
-    h.w().os_current = false;
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-    assert!(h.w().log.contains(&"install".to_string()));
-}
-
-#[tokio::test]
-async fn the_same_installer_on_an_older_talos_is_installed() {
-    let mut h = Harness::new();
-    running_installer(&h, &format!("reg/installer@{DIGEST}"));
-    {
-        let mut w = h.w();
-        w.os_current = false;
-        w.version = "v1.14.0".into();
-        w.entries
-            .insert("talos-v1.14.1.efi".into(), "v1.14.0".into());
+async fn the_os_is_installed_unless_the_unit_runs_it_already() {
+    let other =
+        "reg/installer@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let same = format!("reg/installer@{DIGEST}");
+    let cases: [(&str, &str, bool); 4] = [
+        (other, "v1.14.1", false),
+        (&same, "v1.14.0", false),
+        ("reg/installer:update-new", "v1.14.1", false),
+        (&same, "v1.14.1", true),
+    ];
+    for (installer, version, apply_refused) in cases {
+        let mut h = Harness::new();
+        running_installer(&h, installer);
+        {
+            let mut w = h.w();
+            w.os_current = false;
+            w.version = version.into();
+            w.entries.insert("talos-v1.14.1.efi".into(), version.into());
+            w.apply_refused = apply_refused;
+        }
+        let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+        assert_eq!(e.outcome, Outcome::Committed, "{installer}: {}", e.detail);
+        h.committed("update-new");
+        assert_eq!(
+            h.w().log,
+            [
+                "import",
+                "stage",
+                "install",
+                "reboot",
+                "seed",
+                "repoint update-new"
+            ],
+            "{installer} {version}"
+        );
     }
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-    assert!(h.w().log.contains(&"install".to_string()));
-}
-
-#[tokio::test]
-async fn a_tag_alone_never_matches_the_bundles_installer() {
-    let mut h = Harness::new();
-    running_installer(&h, "reg/installer:update-new");
-    h.w().os_current = false;
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    assert!(h.w().log.contains(&"install".to_string()));
 }
 
 async fn happy() -> (Harness, usize, usize) {
@@ -982,20 +950,6 @@ async fn commit_deletes_saved_config() {
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
     assert!(seen);
     assert!(!h.saved().exists(), "the saved config outlived the update");
-}
-
-#[tokio::test]
-async fn a_stack_the_judge_rolls_back_fails_the_update() {
-    let mut h = Harness::new();
-    h.w().verdict = Verdict::Bad;
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Failed);
-    assert!(e.detail.contains("rolled the stack back"), "{}", e.detail);
-    assert_eq!(h.w().tag, OLD_TAG);
-    assert!(
-        h.e().record.release.is_some(),
-        "a failed update stays applicable"
-    );
 }
 
 #[tokio::test]
@@ -1297,23 +1251,15 @@ async fn an_operator_moving_the_stack_ends_the_judging() {
 
 #[tokio::test]
 async fn workloads_that_never_settle_stop_it_before_the_stack() {
-    let h = times_out(
+    let mut h = times_out(
         |w| w.never_ready = true,
         Phase::Settling,
         20 * 60,
         "not ready: deployment app/web. NOT moving the stack",
     )
     .await;
-    assert!(
-        h.engine
-            .as_ref()
-            .unwrap()
-            .record
-            .error
-            .contains("applying again carries on"),
-        "no way on: {}",
-        h.engine.as_ref().unwrap().record.error
-    );
+    let error = &h.e().record.error;
+    assert!(error.contains("applying again carries on"), "{error}");
 }
 
 #[tokio::test]
@@ -1424,6 +1370,8 @@ async fn a_stack_rolled_back_once_can_be_applied_again() {
     h.w().verdict = Verdict::Bad;
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Failed);
+    assert!(e.detail.contains("rolled the stack back"), "{}", e.detail);
+    assert_eq!(h.w().tag, OLD_TAG);
     h.w().verdict = Verdict::Good;
     h.e().request_apply("update-new").await.unwrap();
     h.run(|_, _| {}).await;

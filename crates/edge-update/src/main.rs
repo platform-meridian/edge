@@ -59,7 +59,6 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
     let r = (|| {
         let manifest = bundle::unpack(std::path::Path::new(&a[0]), &dest, &verifier)?;
         let refs = bundle::check(&dest)?;
-        // Into a scratch store, as the unit imports it.
         let store = edge_registry::Store::open(dest.join("store"))?;
         let tagged = store.import_layout(&dest.join(bundle::IMAGES))?;
         // Images named by digest alone are held untagged, found by their digest.

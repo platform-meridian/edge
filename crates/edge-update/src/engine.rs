@@ -33,23 +33,32 @@ const GOOD: i64 = 20 * 60;
 const HISTORY: usize = 50;
 const SNAPSHOTS: usize = 2;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum Phase {
+    #[default]
     Idle,
-    Verifying { sha256: String },
+    Verifying {
+        sha256: String,
+    },
     Starting,
     Importing,
     Snapshotting,
     Staging,
     Installing,
-    Rebooting { boot_id: String },
+    Rebooting {
+        boot_id: String,
+    },
     Trial,
     Settling,
     Seeding,
     AwaitingGood,
-    Repointing { rolled_back: String },
-    Judging { rolled_back: String },
+    Repointing {
+        rolled_back: String,
+    },
+    Judging {
+        rolled_back: String,
+    },
     Collecting,
 }
 
@@ -105,7 +114,7 @@ pub struct Entry {
     pub snapshot: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub phase: Phase,
     pub release: Option<Release>,
@@ -126,19 +135,6 @@ impl Record {
                 "the update to {} is under way: wait until it commits or fails",
                 self.release.as_ref().map_or("", |r| r.tag())
             )),
-        }
-    }
-}
-
-impl Default for Record {
-    fn default() -> Self {
-        Self {
-            phase: Phase::Idle,
-            release: None,
-            before: None,
-            history: Vec::new(),
-            error: String::new(),
-            since: 0,
         }
     }
 }
@@ -234,8 +230,7 @@ impl Engine {
             Ok(b) => match serde_json::from_slice(&b) {
                 Ok(r) => r,
                 Err(e) => {
-                    // A record that cannot be read is set aside, not trusted: the
-                    // unit's boot and stack judges still finish what was started.
+                    // Not trusted: the unit's boot and stack judges finish what was started.
                     tracing::error!(error = %e, "the update record is unreadable; starting afresh");
                     edge_common::set_aside(&path);
                     Record::default()
@@ -355,13 +350,15 @@ impl Engine {
             anyhow::bail!(why);
         }
         let b = self.boot().await?;
-        match p {
-            Power::Reboot => self.talos.reboot().await?,
-            Power::Shutdown => self.talos.shutdown().await?,
-        }
         let action = match p {
-            Power::Reboot => "rebooting",
-            Power::Shutdown => "shutting down",
+            Power::Reboot => {
+                self.talos.reboot().await?;
+                "rebooting"
+            }
+            Power::Shutdown => {
+                self.talos.shutdown().await?;
+                "shutting down"
+            }
         };
         if !b.trial() {
             return Ok(action.into());
@@ -449,11 +446,10 @@ impl Engine {
     fn finish(&mut self, outcome: Outcome, detail: String) -> anyhow::Result<()> {
         let now = (self.now)();
         let b = self.record.before.take();
-        let release = self.record.release.clone();
         self.record.history.insert(
             0,
             Entry {
-                release: release.clone(),
+                release: self.record.release.clone(),
                 outcome,
                 started: b.as_ref().map(|b| b.started).unwrap_or(now),
                 finished: now,
@@ -529,10 +525,7 @@ impl Engine {
 
     /// Why this unit must not take `rel`, checked with reads alone.
     async fn refusal(&self, rel: &Release) -> Option<String> {
-        match self.check(rel).await {
-            Ok(()) => None,
-            Err(e) => Some(format!("{e:#}")),
-        }
+        self.check(rel).await.err().map(|e| format!("{e:#}"))
     }
 
     async fn check(&self, rel: &Release) -> anyhow::Result<()> {
@@ -660,6 +653,15 @@ impl Engine {
                 .unwrap_or_default();
         }
         Ok(b)
+    }
+
+    /// The new OS is on trial or already committed.
+    async fn left_old_os(&self) -> anyhow::Result<bool> {
+        let b = self.boot().await?;
+        Ok(b.trial()
+            || !b
+                .default
+                .eq_ignore_ascii_case(&self.before()?.default_entry))
     }
 
     async fn boot_id(&self) -> anyhow::Result<String> {
@@ -799,12 +801,7 @@ impl Engine {
         if self.release()?.os_done {
             return Ok(Go(Phase::Seeding));
         }
-        let b = self.boot().await?;
-        if b.trial()
-            || !b
-                .default
-                .eq_ignore_ascii_case(&self.before()?.default_entry)
-        {
+        if self.left_old_os().await? {
             return Ok(Go(Phase::Trial));
         }
         let rel = self.release()?.clone();
@@ -847,12 +844,7 @@ impl Engine {
             self.talos.reboot().await?;
             return poll(30, "rebooting into the new OS");
         }
-        let b = self.boot().await?;
-        if b.trial()
-            || !b
-                .default
-                .eq_ignore_ascii_case(&self.before()?.default_entry)
-        {
+        if self.left_old_os().await? {
             return Ok(Go(Phase::Trial));
         }
         Ok(Fail(format!(
@@ -1062,7 +1054,6 @@ impl Engine {
 
 /// The installer a machine config names: its unattended install's, else `machine.install`'s.
 fn installer_of(config: &str) -> String {
-    use serde::Deserialize;
     let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(config)
         .filter_map(|d| serde_yaml::Value::deserialize(d).ok())
         .collect();

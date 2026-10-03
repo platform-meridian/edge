@@ -181,13 +181,12 @@ impl crate::unit::Cluster for Kube {
     async fn not_rolled_out(&self, manifests: &str) -> anyhow::Result<Vec<String>> {
         let mut waiting = Vec::new();
         for obj in objects(manifests)? {
-            let is_deploy = obj.types.as_ref().is_some_and(|t| t.kind == "Deployment");
+            if !obj.types.as_ref().is_some_and(|t| t.kind == "Deployment") {
+                continue;
+            }
             let (Some(name), Some(ns)) = (obj.metadata.name, obj.metadata.namespace) else {
                 continue;
             };
-            if !is_deploy {
-                continue;
-            }
             let api: Api<Deployment> = Api::namespaced(self.client.clone(), &ns);
             let d = timed(api.get(&name)).await?;
             let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
@@ -211,14 +210,14 @@ impl crate::unit::Cluster for Kube {
             let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
             let ready = d.status.and_then(|s| s.ready_replicas).unwrap_or(0);
             if ready < want {
-                waiting.push(workload("Deployment", ns(&d.metadata), name(&d.metadata)));
+                waiting.push(named("Deployment", &d.metadata));
             }
         }
         let sets: Api<DaemonSet> = Api::all(self.client.clone());
         for d in timed(sets.list(&lp)).await? {
             let st = d.status.unwrap_or_default();
             if st.number_ready < st.desired_number_scheduled {
-                waiting.push(workload("DaemonSet", ns(&d.metadata), name(&d.metadata)));
+                waiting.push(named("DaemonSet", &d.metadata));
             }
         }
         Ok(waiting)
@@ -243,14 +242,9 @@ impl crate::unit::Cluster for Kube {
     }
 }
 
-type Meta = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-
-fn ns(m: &Meta) -> &str {
-    m.namespace.as_deref().unwrap_or_default()
-}
-
-fn name(m: &Meta) -> &str {
-    m.name.as_deref().unwrap_or_default()
+fn named(kind: &str, m: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> String {
+    let s = |o: &Option<String>| o.clone().unwrap_or_default();
+    workload(kind, &s(&m.namespace), &s(&m.name))
 }
 
 #[cfg(test)]

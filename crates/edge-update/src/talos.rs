@@ -445,10 +445,6 @@ mod tests {
         }
     }
 
-    async fn apid(server: &Pki, clients: &Pki) -> std::net::SocketAddr {
-        serve(server, clients, Apid::default()).await
-    }
-
     async fn serve(server: &Pki, clients: &Pki, apid: Apid) -> std::net::SocketAddr {
         let (cert, key) = server.leaf(&["talos.default"]);
         let key = key.replace("ED25519 PRIVATE KEY", "PRIVATE KEY");
@@ -481,16 +477,22 @@ mod tests {
         p
     }
 
-    #[tokio::test]
-    async fn a_pod_talosconfig_reaches_apid() {
+    /// A node whose talosconfig apid's PKI issued.
+    async fn node(apid: Apid) -> (Node, tempfile::TempDir) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let pki = Pki::new();
-        let addr = apid(&pki, &pki).await;
+        let addr = serve(&pki, &pki, apid).await;
         let d = tempfile::tempdir().unwrap();
         let node = Node::new(
             &talosconfig(d.path(), &pki.ca, pki.leaf(&[])),
             &addr.to_string(),
         );
+        (node, d)
+    }
+
+    #[tokio::test]
+    async fn a_pod_talosconfig_reaches_apid() {
+        let (node, _d) = node(Apid::default()).await;
         assert_eq!(node.version().await.unwrap(), "v1.14.1");
         assert_eq!(
             node.read("/proc/sys/kernel/random/boot_id")
@@ -511,7 +513,7 @@ mod tests {
     async fn another_pki_is_turned_away() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (server, other) = (Pki::new(), Pki::new());
-        let addr = apid(&server, &server).await;
+        let addr = serve(&server, &server, Apid::default()).await;
         let d = tempfile::tempdir().unwrap();
         // A client from another PKI, trusting the right server.
         let node = Node::new(
@@ -529,15 +531,8 @@ mod tests {
 
     #[tokio::test]
     async fn power_calls_power_cycle_and_shut_down_gracefully() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let pki = Pki::new();
         let apid = Apid::default();
-        let addr = serve(&pki, &pki, apid.clone()).await;
-        let d = tempfile::tempdir().unwrap();
-        let node = Node::new(
-            &talosconfig(d.path(), &pki.ca, pki.leaf(&[])),
-            &addr.to_string(),
-        );
+        let (node, _d) = node(apid.clone()).await;
         node.reboot().await.unwrap();
         let e = node.shutdown().await.unwrap_err();
         assert_eq!(e.to_string(), "already shutting down");
@@ -549,15 +544,8 @@ mod tests {
 
     #[tokio::test]
     async fn configs_stage_or_apply_without_reboot() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let pki = Pki::new();
         let apid = Apid::default();
-        let addr = serve(&pki, &pki, apid.clone()).await;
-        let d = tempfile::tempdir().unwrap();
-        let node = Node::new(
-            &talosconfig(d.path(), &pki.ca, pki.leaf(&[])),
-            &addr.to_string(),
-        );
+        let (node, _d) = node(apid.clone()).await;
         node.stage_config("c", true).await.unwrap();
         node.stage_config("c", false).await.unwrap();
         node.apply_config("c").await.unwrap();

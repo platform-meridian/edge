@@ -104,9 +104,12 @@ mod tests {
         let held = held(&root);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held.iter().all(|h| !h.contains(":t1")), "{held:?}");
-        let blobs = std::fs::read_dir(root.join("blobs"))
-            .map(|d| d.count())
-            .unwrap_or(0);
-        assert!(blobs > 0);
+        let blob = |b: &[u8]| {
+            Store::open(&root)
+                .unwrap()
+                .blob_path(&edge_registry::Digest::of(b))
+                .exists()
+        };
+        assert!(!blob(b"one") && blob(b"two"));
     }
 }
