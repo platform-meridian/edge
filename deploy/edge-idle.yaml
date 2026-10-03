@@ -60,6 +60,13 @@ spec:
             - { name: EDGE_IDLE_CGROUP, value: /host/sys/fs/cgroup }
             # Longer than a normal reconcile burst.
             - { name: EDGE_IDLE_AFTER, value: "120" }
+          ports:
+            - { name: healthz, containerPort: 9751, protocol: TCP }
+          # A wedged loop could leave the control plane throttled; a restart releases it.
+          livenessProbe:
+            httpGet: { path: /healthz, port: healthz }
+            periodSeconds: 10
+            failureThreshold: 3
           # Root owns the cpu.max files and /proc is world-readable: no capability.
           securityContext:
             allowPrivilegeEscalation: false

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use edge_common::health::Heartbeat;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::Pod;
@@ -19,6 +20,8 @@ const TARGETS: [&str; 2] = ["kube-scheduler", "kube-controller-manager"];
 const TARGET_NS: &str = "kube-system";
 
 const STEP: Duration = Duration::from_secs(5);
+/// Twelve steps, and twice the longest wait for the API client.
+const STALE_AFTER: Duration = Duration::from_secs(60);
 
 /// Throttling a target slows its probes, and kubelet's resulting status update
 /// on its static pod must not count as the activity that releases it.
@@ -60,6 +63,7 @@ fn secs_or_default(name: &str, raw: Option<&str>, default: u64, min: u64) -> u64
 
 async fn retry_until<T, E, Fut>(
     term: &mut edge_common::Terminator,
+    heartbeat: &Heartbeat,
     what: &str,
     min: Duration,
     max: Duration,
@@ -71,6 +75,7 @@ where
 {
     let mut delay = min;
     loop {
+        heartbeat.beat();
         match f().await {
             Ok(v) => return Some(v),
             Err(e) => {
@@ -188,13 +193,24 @@ fn main() -> anyhow::Result<()> {
     let cgroup_root: PathBuf = std::env::var("EDGE_IDLE_CGROUP")
         .unwrap_or_else(|_| "/sys/fs/cgroup".into())
         .into();
-    edge_common::sandbox::restrict(&edge_common::sandbox::idle(&proc_dir, &cgroup_root));
-    run(proc_dir, cgroup_root)
+    let health = std::env::var("EDGE_IDLE_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:9751".into());
+    edge_common::sandbox::restrict(&edge_common::sandbox::idle(
+        &proc_dir,
+        &cgroup_root,
+        &health,
+    ));
+    run(proc_dir, cgroup_root, health)
 }
 
 #[tokio::main]
-async fn run(proc_dir: PathBuf, cgroup_root: PathBuf) -> anyhow::Result<()> {
+async fn run(proc_dir: PathBuf, cgroup_root: PathBuf, health: String) -> anyhow::Result<()> {
     let mut term = edge_common::Terminator::new();
+    let heartbeat = Heartbeat::default();
+    tokio::spawn(edge_common::health::serve(
+        health,
+        heartbeat.clone(),
+        STALE_AFTER,
+    ));
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -211,6 +227,7 @@ async fn run(proc_dir: PathBuf, cgroup_root: PathBuf) -> anyhow::Result<()> {
     let ticks = Arc::new(AtomicU64::new(0));
     let Some(client) = retry_until(
         &mut term,
+        &heartbeat,
         "kubernetes client",
         Duration::from_secs(1),
         Duration::from_secs(30),
@@ -258,6 +275,7 @@ async fn run(proc_dir: PathBuf, cgroup_root: PathBuf) -> anyhow::Result<()> {
     let mut gov = Governor::new(idle_after, STEP);
 
     loop {
+        heartbeat.beat();
         tokio::select! {
             _ = tokio::time::sleep(STEP) => {}
             _ = term.wait() => {
@@ -556,8 +574,10 @@ mod tests {
         let mut term = edge_common::Terminator::new();
         let mut calls = 0;
         let started = std::time::Instant::now();
+        let heartbeat = Heartbeat::default();
         let got = retry_until(
             &mut term,
+            &heartbeat,
             "x",
             Duration::from_millis(10),
             Duration::from_millis(40),
@@ -571,6 +591,10 @@ mod tests {
         assert_eq!(got, Some(4));
         // 10 + 20 + 40 ms, doubling to the cap.
         assert!(started.elapsed() >= Duration::from_millis(70));
+        assert!(
+            heartbeat.age() < Duration::from_millis(40),
+            "alive while waiting"
+        );
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
