@@ -96,10 +96,11 @@ pub fn set_aside(path: &Path) -> Option<PathBuf> {
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => sync_dir(d),
-        _ => sync_dir(Path::new(".")),
-    }
+    sync_dir(
+        path.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
 }
 
 // EINVAL/ENOTSUP: the filesystem cannot sync directories.

@@ -98,11 +98,14 @@ impl Server {
             .remove(&a)
             .filter(|l| l.holder == holder)
             .and_then(|l| l.granted);
-        self.leases.entry(a).or_insert(Lease {
-            holder,
-            until,
-            granted,
-        })
+        self.leases
+            .entry(a)
+            .insert_entry(Lease {
+                holder,
+                until,
+                granted,
+            })
+            .into_mut()
     }
 
     /// Granted and unexpired, by address, their expiry on the wall clock.

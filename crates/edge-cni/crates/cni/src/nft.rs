@@ -1,10 +1,7 @@
 //! Netfilter rather than a BPF NAT: conntrack handles IP fragments, ICMP errors and
 //! tuples a host socket already owns. Only off-node traffic reaches here: local
 //! sockets are translated at connect().
-//!
-//! ClientIP affinity hashes the source address over the backends instead of
-//! remembering a choice, so it has no timeout, and a client may move when the
-//! backend set changes.
+//! ClientIP affinity hashes the source address, so it has no timeout.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 

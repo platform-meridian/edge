@@ -233,12 +233,12 @@ fn laptop(dhcpcd: PathBuf) -> Laptop {
     Laptop { ns, dhcpcd }
 }
 
-/// Each line but the lease's expiry, once a file other than `stale` is there.
+/// The file's lines without lease expiries, once it replaces `stale` and holds a lease.
 fn lease_lines(file: &Path, stale: Option<u64>) -> Vec<String> {
-    use std::os::unix::fs::MetadataExt;
     let until = Instant::now() + Duration::from_secs(10);
     loop {
-        let fresh = std::fs::metadata(file).is_ok_and(|m| Some(m.ino()) != stale);
+        let ino = inode(file);
+        let fresh = ino.is_some() && ino != stale;
         let text = std::fs::read_to_string(file).unwrap_or_default();
         if fresh && text.lines().count() > 1 || Instant::now() > until {
             return text

@@ -313,7 +313,7 @@ mod tests {
         let tmp = config_dir(&[
             (
                 "50-payload.yaml",
-                "checks: [ { name: meridian, kind: tcp, addr: '127.0.0.1:8444' } ]",
+                "checks: [ { name: app, kind: tcp, addr: '127.0.0.1:8444' } ]",
             ),
             (
                 "10-platform.yaml",
@@ -326,7 +326,7 @@ mod tests {
         let d = tmp.path();
         let (c, degraded) = Config::load_or_fallback(d);
         assert!(!degraded);
-        assert_eq!(names(&c), ["store", "apiserver", "meridian"]);
+        assert_eq!(names(&c), ["store", "apiserver", "app"]);
         assert_eq!(
             (
                 c.timeout_secs,

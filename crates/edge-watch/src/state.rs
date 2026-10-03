@@ -308,7 +308,7 @@ mod tests {
         State {
             consecutive_resets: n,
             reset_pending: pending,
-            last_failure: vec!["meridian".into()],
+            last_failure: vec!["app".into()],
             last_failure_at: Some("epoch:1".into()),
             ..State::default()
         }
@@ -416,14 +416,14 @@ mod tests {
         let store = Store::new(d);
         let mut st = fold_boot(store.load());
         for _ in 0..2 {
-            arm_reset(&store, &mut st, vec!["meridian".into()], "epoch:1".into()).unwrap();
+            arm_reset(&store, &mut st, vec!["app".into()], "epoch:1".into()).unwrap();
             st = fold_boot(store.load());
             store.save(&st).unwrap();
         }
         st = fold_boot(store.load());
         store.save(&st).unwrap();
         assert_eq!(st.consecutive_resets, 2);
-        arm_reset(&store, &mut st, vec!["meridian".into()], "epoch:2".into()).unwrap();
+        arm_reset(&store, &mut st, vec!["app".into()], "epoch:2".into()).unwrap();
         assert_eq!(fold_boot(store.load()).consecutive_resets, 3);
     }
 
@@ -445,7 +445,6 @@ mod tests {
         };
         assert_eq!((&st, store.load()), (&want, want.clone()));
         assert!(!on_ladder(&st));
-        std::fs::remove_dir_all(d).ok();
 
         let Some((_tmp, store)) = readonly_store() else {
             return;
@@ -490,7 +489,6 @@ mod tests {
             record(1, false),
             "a new process starts with no health"
         );
-        std::fs::remove_dir_all(d).ok();
 
         let Some((_tmp, store)) = readonly_store() else {
             return;
@@ -538,8 +536,8 @@ mod tests {
         let r = rung(&st, 3);
         let at = format!("epoch:{boot}");
         match r {
-            Rung::Arm => arm_reset(store, &mut st, vec!["meridian".into()], at).unwrap(),
-            Rung::Repair => begin_repair(store, &mut st, vec!["meridian".into()], at).unwrap(),
+            Rung::Arm => arm_reset(store, &mut st, vec!["app".into()], at).unwrap(),
+            Rung::Repair => begin_repair(store, &mut st, vec!["app".into()], at).unwrap(),
             Rung::Exhausted => mark_exhausted(store, &mut st).unwrap(),
         }
         r
@@ -644,12 +642,12 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut st = State::default();
-        let r = arm_reset(&store, &mut st, vec!["meridian".into()], "epoch:9".into());
+        let r = arm_reset(&store, &mut st, vec!["app".into()], "epoch:9".into());
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
         r.expect("the in-place fallback must succeed");
         let back = store.load();
         assert!(back.reset_pending);
-        assert_eq!(back.last_failure, vec!["meridian".to_string()]);
+        assert_eq!(back.last_failure, vec!["app".to_string()]);
     }
 
     const P: Duration = Duration::from_secs(900);

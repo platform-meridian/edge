@@ -82,7 +82,7 @@ fn recv_failed(what: &str, e: std::io::Error) {
     std::thread::sleep(Duration::from_millis(100));
 }
 
-/// What a reader of the file sees; serving never waits on it.
+/// Written best-effort: serving never waits on it.
 struct LeaseFile {
     path: PathBuf,
     written: Option<String>,
@@ -112,11 +112,6 @@ impl LeaseFile {
     }
 }
 
-fn render(server: &dhcp::Server, subnet: Subnet, domain: Option<&str>) -> String {
-    let records = server.records(Instant::now(), SystemTime::now());
-    leases::render(subnet, domain, &records)
-}
-
 fn serve_dhcp(subnet: Subnet, domain: Option<String>, lease_file: Option<PathBuf>) {
     let sock = bind_retrying("dhcp", net::dhcp_socket);
     let mut server = dhcp::Server::new(subnet, domain.clone());
@@ -124,7 +119,8 @@ fn serve_dhcp(subnet: Subnet, domain: Option<String>, lease_file: Option<PathBuf
     let mut buf = [0u8; 1500];
     loop {
         if let Some(f) = &mut file {
-            f.write(render(&server, subnet, domain.as_deref()));
+            let records = server.records(Instant::now(), SystemTime::now());
+            f.write(leases::render(subnet, domain.as_deref(), &records));
         }
         let (n, ifindex) = match net::recv(&sock, &mut buf) {
             Ok(r) => r,

@@ -32,15 +32,12 @@ struct Unit {
 }
 
 impl Unit {
-    async fn new(name: &str, check_addr: &str, record: &str) -> Self {
-        Self::with_recovery(name, check_addr, record, 2).await
+    async fn new(check_addr: &str, record: &str) -> Self {
+        Self::with_recovery(check_addr, record, 2).await
     }
 
-    async fn with_recovery(name: &str, check_addr: &str, record: &str, recovery_secs: u64) -> Self {
-        let tmp = tempfile::Builder::new()
-            .prefix(&format!("edge-watch-ladder-{name}-"))
-            .tempdir()
-            .unwrap();
+    async fn with_recovery(check_addr: &str, record: &str, recovery_secs: u64) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         for d in ["cfg", "state", "machined"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
@@ -122,7 +119,7 @@ fn closed_port() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tripped_boot_repairs() {
-    let u = Unit::new("repair", &closed_port(), r#"{"consecutive_resets": 3}"#).await;
+    let u = Unit::new(&closed_port(), r#"{"consecutive_resets": 3}"#).await;
     let child = u.start();
     until("the reset request", Duration::from_secs(15), || {
         u.resets() == 1
@@ -161,12 +158,7 @@ async fn tripped_boot_repairs() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exhausted_stays_disarmed() {
-    let u = Unit::new(
-        "exhausted",
-        &closed_port(),
-        r#"{"consecutive_resets": 3, "repairs": 1}"#,
-    )
-    .await;
+    let u = Unit::new(&closed_port(), r#"{"consecutive_resets": 3, "repairs": 1}"#).await;
     let child = u.start();
     until("the exhausted mark", Duration::from_secs(10), || {
         u.record()["exhausted"] == true
@@ -188,7 +180,6 @@ async fn recovery_clears_and_arms() {
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(async move { while l.accept().await.is_ok() {} });
     let u = Unit::new(
-        "recover",
         &addr,
         r#"{"consecutive_resets": 3, "repairs": 1, "exhausted": true}"#,
     )
@@ -235,7 +226,7 @@ async fn armed_ladder_clears_after_sustained_health() {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(async move { while l.accept().await.is_ok() {} });
-    let u = Unit::with_recovery("sustained", &addr, r#"{"consecutive_resets": 2}"#, 4).await;
+    let u = Unit::with_recovery(&addr, r#"{"consecutive_resets": 2}"#, 4).await;
     let child = u.start();
     until("pets", Duration::from_secs(10), || {
         !u.watchdog_bytes().is_empty()

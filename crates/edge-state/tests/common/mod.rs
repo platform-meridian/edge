@@ -6,8 +6,7 @@ use edge_state::pb::etcdserverpb::{
 use edge_state::server::EtcdServer;
 use edge_state::store::Store;
 
-/// On disk rather than a RAM /tmp, and removed with the guard: nothing is
-/// left behind, not even a parent.
+/// On disk rather than a RAM /tmp.
 pub fn tempdir() -> tempfile::TempDir {
     let base = std::env::var_os("EDGE_STATE_TEST_TMP")
         .map(std::path::PathBuf::from)
