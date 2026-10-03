@@ -2,8 +2,8 @@
 #   @OPERATOR_DOMAIN@, @OPERATOR_ADDR@  the domain and address the unit is reached by
 #   @APISERVER_HOST@, @APISERVER_PORT@  the node's own apiserver
 #   @CLUSTER_DNS@                       the kubelet's clusterDNS address
-#   edge-<name>:appliance               each image, by an images: transformer
 #   the Gateway API CRDs
+# Images are the published ones; override these names to pin digests.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -15,3 +15,11 @@ resources:
   - edge-signer.yaml
   - edge-gateway.yaml
   - edge-update.yaml
+
+images:
+  - { name: ghcr.io/platform-meridian/edge-cni, newTag: v0.1.0 }
+  - { name: ghcr.io/platform-meridian/edge-dns, newTag: v0.1.0 }
+  - { name: ghcr.io/platform-meridian/edge-gateway, newTag: v0.1.0 }
+  - { name: ghcr.io/platform-meridian/edge-idle, newTag: v0.1.0 }
+  - { name: ghcr.io/platform-meridian/edge-signer, newTag: v0.1.0 }
+  - { name: ghcr.io/platform-meridian/edge-update, newTag: v0.1.0 }

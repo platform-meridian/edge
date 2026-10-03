@@ -59,7 +59,7 @@ spec:
         - operator: Exists
       containers:
         - name: edge-cni
-          image: "edge-cni:appliance"
+          image: "ghcr.io/platform-meridian/edge-cni"
           env:
             # The apiserver's ClusterIP is circular here: this daemon is what
             # makes ClusterIPs resolve.

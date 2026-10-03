@@ -57,7 +57,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: edge-dns
-          image: "edge-dns:appliance"
+          image: "ghcr.io/platform-meridian/edge-dns"
           securityContext:
             capabilities:
               add: [NET_BIND_SERVICE]

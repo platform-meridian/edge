@@ -10,9 +10,11 @@ substitute:
 | `@CLUSTER_DNS@` | the kubelet's `clusterDNS` address |
 | `@BUILD_EPOCH@` | the build time, the earliest the clock may read (edge-scope) |
 
+The images are the published `ghcr.io/platform-meridian/edge-<name>`, tagged in
+`kustomization.yaml`; override those names to pin digests.
+
 Then provide:
 
-- the images, named `edge-<name>:appliance`, through an `images:` transformer;
 - the Gateway API CRDs;
 - the CA edge-signer signs with, at `/etc/edge-signer/ca.pem` on the host;
 - for edge-update: Talos API access with `os:admin` for namespace `edge`

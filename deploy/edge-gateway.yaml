@@ -35,7 +35,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: edge-gateway
-          image: "edge-gateway:appliance"
+          image: "ghcr.io/platform-meridian/edge-gateway"
           args: ["/config/edge-gateway.yaml"]
           env:
             - name: POD_NAMESPACE

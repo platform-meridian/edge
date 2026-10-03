@@ -54,7 +54,7 @@ spec:
         - operator: Exists
       containers:
         - name: edge-idle
-          image: "edge-idle:appliance"
+          image: "ghcr.io/platform-meridian/edge-idle"
           env:
             - { name: EDGE_IDLE_PROC, value: /host/proc }
             - { name: EDGE_IDLE_CGROUP, value: /host/sys/fs/cgroup }

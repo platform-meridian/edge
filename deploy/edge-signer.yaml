@@ -58,7 +58,7 @@ spec:
         - operator: Exists
       containers:
         - name: edge-signer
-          image: "edge-signer:appliance"
+          image: "ghcr.io/platform-meridian/edge-signer"
           env:
             - { name: EDGE_SIGNER_CA, value: /etc/edge-signer/ca.pem }
             - { name: EDGE_SIGNER_DOMAIN, value: "@OPERATOR_DOMAIN@" }

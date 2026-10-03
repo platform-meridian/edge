@@ -78,7 +78,7 @@ spec:
         - operator: Exists
       containers:
         - name: edge-update
-          image: "edge-update:appliance"
+          image: "ghcr.io/platform-meridian/edge-update"
           env:
             - { name: KUBERNETES_SERVICE_HOST, value: "@APISERVER_HOST@" }
             - { name: KUBERNETES_SERVICE_PORT, value: "@APISERVER_PORT@" }
