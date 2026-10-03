@@ -1,7 +1,6 @@
-//! machined's event stream: its service state changes are recorded, and the
-//! sequence ending the boot is the cue to stop. Talos unmounts volumes before it
-//! stops extension services, so a ring still open then keeps the evidence volume
-//! busy and the reboot falls back to a forced one.
+//! machined's event stream: service state changes are recorded, and a sequence
+//! ending the boot closes the rings. Talos unmounts volumes before it stops
+//! extension services; an open ring would force the reboot.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -77,7 +76,7 @@ fn wall() -> u64 {
 }
 
 pub async fn wait(socket: &Path, services: &mut services::Store) -> anyhow::Result<String> {
-    let socket: PathBuf = socket.to_path_buf();
+    let socket = socket.to_path_buf();
     anyhow::ensure!(
         socket.exists(),
         "no machined socket at {}",

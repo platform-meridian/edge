@@ -1,5 +1,4 @@
-//! Talos service state changes as machined announces them, one record each. A
-//! service's last record of a boot is its state; the rest is how it got there.
+//! Talos service state changes as machined announces them, one record each.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,7 +12,7 @@ use crate::ring::{Entry, Ring};
 pub const FILE: &str = "services.bin";
 pub const RECORD_SIZE: usize = 512;
 /// Several boots: machined keeps its last 1000 events of every kind.
-pub const SLOTS: u64 = 4096;
+const SLOTS: u64 = 4096;
 const PAYLOAD: usize = RECORD_SIZE - crate::ring::HEADER;
 const MAX_NAME: usize = 64;
 const WARN_EVERY: Duration = Duration::from_secs(60);
@@ -68,7 +67,7 @@ fn encode(t: &Transition) -> Option<Vec<u8>> {
     )
 }
 
-pub fn parse(entry: &Entry) -> Option<Transition> {
+fn parse(entry: &Entry) -> Option<Transition> {
     let end = entry
         .payload
         .iter()
