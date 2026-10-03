@@ -1,4 +1,4 @@
-//! The appliance CA: one read-only file holding the issuing CA's P-256 key
+//! The node's CA: one read-only file holding the issuing CA's P-256 key
 //! (PKCS#8) and its chain, issuing CA first, up to a self-signed root.
 
 use std::net::IpAddr;
@@ -44,7 +44,7 @@ impl Ca {
         params.distinguished_name = DistinguishedName::new();
         params
             .distinguished_name
-            .push(DnType::CommonName, "meridian appliance ephemeral CA");
+            .push(DnType::CommonName, "edge ephemeral CA");
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = datetime(now)?;
@@ -218,7 +218,7 @@ impl Source {
             }
         };
         if problem.is_none() {
-            tracing::info!(path = %path.display(), "appliance CA loaded");
+            tracing::info!(path = %path.display(), "node CA loaded");
         }
         Ok(Self {
             path: path.into(),
@@ -230,7 +230,7 @@ impl Source {
     pub fn refresh(&mut self, now: i64) -> anyhow::Result<()> {
         match Ca::read(&self.path, now) {
             Ok(ca) if self.problem.is_some() || ca.certs != self.ca.certs => {
-                tracing::info!(path = %self.path.display(), "appliance CA loaded");
+                tracing::info!(path = %self.path.display(), "node CA loaded");
                 self.ca = ca;
                 self.problem = None;
             }
@@ -253,7 +253,7 @@ impl Source {
 fn unusable(path: &Path, why: &str) {
     tracing::error!(
         path = %path.display(), error = why,
-        "appliance CA unusable: signing with an ephemeral CA that clients will not trust"
+        "node CA unusable: signing with an ephemeral CA that clients will not trust"
     );
 }
 

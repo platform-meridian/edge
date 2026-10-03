@@ -231,7 +231,7 @@ mod tests {
             ),
             entry(
                 3,
-                r#"{"t":6,"up":9,"boot":"aa","fl":70,"failing":["meridian"],"cpu":0}"#,
+                r#"{"t":6,"up":9,"boot":"aa","fl":70,"failing":["app"],"cpu":0}"#,
             ),
             entry(
                 4,
@@ -246,7 +246,7 @@ mod tests {
         let h = history(&all);
         assert_eq!(h.len(), 4);
         assert_eq!((h[0].k.as_str(), h[0].boot.as_str(), h[0].fl), ("", "", 0));
-        assert_eq!(h[1].failing, ["meridian"]);
+        assert_eq!(h[1].failing, ["app"]);
         assert_eq!(
             (h[2].dev.as_str(), h[2].unsafe_shutdowns),
             ("nvme0", Some(4))

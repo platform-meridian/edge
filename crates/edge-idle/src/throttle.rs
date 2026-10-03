@@ -130,7 +130,7 @@ mod tests {
         for (pid, comm, cg) in [
             (100, "kube-scheduler", "kubepods/burstable/podAAA/sched"),
             (200, "kube-controller", "kubepods/burstable/podBBB/kcm"),
-            (300, "meridian", "kubepods/besteffort/podCCC/app"),
+            (300, "apps", "kubepods/besteffort/podCCC/app"),
             (400, "kube-scheduler", "kubepods/burstable/podDDD/second"),
         ] {
             let p = d.join("proc").join(pid.to_string());

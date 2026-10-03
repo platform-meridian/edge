@@ -175,13 +175,13 @@ mod tests {
 
         let gw = GatewayRef {
             name: "edge".into(),
-            namespace: "meridian".into(),
+            namespace: "edge".into(),
             bound_port: 443,
         };
         let gateway = |ns, name| object("Gateway", ns, name, json!({}));
-        assert!(is_our_gateway(&gateway(Some("meridian"), "edge"), &gw));
+        assert!(is_our_gateway(&gateway(Some("edge"), "edge"), &gw));
         assert!(!is_our_gateway(&gateway(Some("other"), "edge"), &gw));
-        assert!(!is_our_gateway(&gateway(Some("meridian"), "other"), &gw));
+        assert!(!is_our_gateway(&gateway(Some("edge"), "other"), &gw));
         assert!(!is_our_gateway(&gateway(None, "edge"), &gw));
     }
 

@@ -408,7 +408,7 @@ encryption:
 apiVersion: v1alpha1
 kind: EtcFileConfig
 name: signer/ca.pem
-contents: unit-appliance-ca-key
+contents: unit-signer-ca-key
 ---
 apiVersion: v1alpha1
 kind: KubePrismConfig
@@ -591,7 +591,7 @@ image: kubelet:new
             "unit-k8s-ca-key",
             "unit-cluster-secret",
             "unit-recovery-key",
-            "unit-appliance-ca-key",
+            "unit-signer-ca-key",
             "unit-bootstrap-token",
             "unit-a",
         ] {

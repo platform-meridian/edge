@@ -202,7 +202,7 @@ async fn member_list_reports_identity() {
     assert_eq!(
         r.members.len(),
         1,
-        "a single-node appliance has exactly one member"
+        "a single-node cluster has exactly one member"
     );
     let m = &r.members[0];
     assert_eq!(m.name, "node-1", "the name Talos passed as --name");
@@ -341,7 +341,7 @@ async fn write_racing_new_watch_is_delivered() {
     let mut kv = KvClient::connect(url.clone()).await.unwrap();
 
     for i in 0..40u32 {
-        let key = format!("/registry/secrets/meridian/key-{i}");
+        let key = format!("/registry/secrets/apps/key-{i}");
 
         let listed = kv
             .range(RangeRequest {

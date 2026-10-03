@@ -85,7 +85,7 @@ mod tests {
             "kind": "PodCertificateRequest",
             "metadata": { "name": "edge-gateway-abc-1", "namespace": "edge" },
             "spec": {
-                "signerName": "edge.meridian/appliance",
+                "signerName": "edge.meridian/node",
                 "podName": "edge-gateway-abc",
                 "podUID": "u", "serviceAccountName": "edge-gateway", "serviceAccountUID": "s",
                 "nodeName": "n", "nodeUID": "nu",

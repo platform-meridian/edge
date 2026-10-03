@@ -27,7 +27,7 @@ use heartbeat::Heartbeat;
 use policy::{Decision, SIGNER, Unit};
 
 /// The ClusterTrustBundle's name must start with the signer's, `/` as `:`.
-const BUNDLE_NAME: &str = "edge.meridian:appliance:ca";
+const BUNDLE_NAME: &str = "edge.meridian:node:ca";
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// The client sets no response timeout, so one hung apiserver call would stall
 /// the loop for good.

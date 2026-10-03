@@ -70,7 +70,7 @@ spec:
           projected:
             sources:
               - podCertificate:
-                  signerName: edge.meridian/appliance
+                  signerName: edge.meridian/node
                   keyType: ECDSAP256
                   maxExpirationSeconds: 864000
                   credentialBundlePath: credentialbundle.pem

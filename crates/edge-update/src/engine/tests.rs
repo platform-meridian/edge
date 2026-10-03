@@ -1056,7 +1056,7 @@ async fn refusals_change_nothing() {
     refused(&mut h, &s, "Secure Boot").await;
 
     let mut s = Spec::new("update-new");
-    s.extra = "LOCK_PROFILE=appliance\n".into();
+    s.extra = "LOCK_PROFILE=other\n".into();
     refused(&mut h, &s, "PROFILE").await;
 
     let mut s = Spec::new("update-new");

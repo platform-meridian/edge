@@ -789,14 +789,14 @@ mod tests {
         let st = edge_common::watch_state::State {
             consecutive_resets: 1,
             reset_pending: true,
-            last_failure: vec!["meridian".into(), "telemetry".into()],
+            last_failure: vec!["app".into(), "telemetry".into()],
             last_failure_at: Some("epoch:1".into()),
             ..Default::default()
         };
         let mut text = serde_json::to_string_pretty(&st).unwrap();
         text.push_str(&" ".repeat(600));
         std::fs::write(d.join("state.json"), text).unwrap();
-        assert_eq!(failing_checks(d), ["meridian", "telemetry"]);
+        assert_eq!(failing_checks(d), ["app", "telemetry"]);
 
         let calm = edge_common::watch_state::State {
             reset_pending: false,
@@ -884,7 +884,7 @@ mod tests {
             "stop" => s.stop(Instant::now(), 1_003, false),
             "release" => s.release(Instant::now(), 1_003, false),
             "watchdog" => {
-                watch(d, true, &["meridian"]);
+                watch(d, true, &["app"]);
                 s.tick(Instant::now(), 1_004, false);
             }
             _ => {}

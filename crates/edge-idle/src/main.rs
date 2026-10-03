@@ -399,16 +399,12 @@ mod tests {
     #[test]
     fn suppression_targets() {
         for (ns, name, want) in [
-            (Some("kube-system"), "kube-scheduler-meridian-01", true),
-            (
-                Some("kube-system"),
-                "kube-controller-manager-meridian-01",
-                true,
-            ),
-            (Some("kube-system"), "kube-apiserver-meridian-01", false),
+            (Some("kube-system"), "kube-scheduler-node-01", true),
+            (Some("kube-system"), "kube-controller-manager-node-01", true),
+            (Some("kube-system"), "kube-apiserver-node-01", false),
             (Some("kube-system"), "edge-dns-7d849f5bdb-nrzl4", false),
-            (Some("meridian"), "kube-scheduler-lookalike", false),
-            (None, "kube-scheduler-meridian-01", false),
+            (Some("apps"), "kube-scheduler-lookalike", false),
+            (None, "kube-scheduler-node-01", false),
         ] {
             assert_eq!(is_suppression_target(ns, name), want, "{ns:?}/{name}");
         }
@@ -417,8 +413,8 @@ mod tests {
     #[test]
     fn own_pods_not_activity_under_guard() {
         use watcher::Event::*;
-        let app = pod("meridian", "app-1");
-        let sched = pod("kube-system", "kube-scheduler-meridian-01");
+        let app = pod("apps", "app-1");
+        let sched = pod("kube-system", "kube-scheduler-node-01");
         for guard in [true, false] {
             assert!(is_activity::<Pod>(&Init, guard));
             assert!(is_activity::<Pod>(&InitDone, guard));

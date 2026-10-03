@@ -315,11 +315,7 @@ mod tests {
     fn fitting_sample_unchanged() {
         let tmp = fixture();
         let d = tmp.path();
-        let s = take(
-            d,
-            1_800_000_000,
-            vec!["meridian".into(), "telemetry".into()],
-        );
+        let s = take(d, 1_800_000_000, vec!["app".into(), "telemetry".into()]);
         assert_eq!(to_payload(&s, PAYLOAD), serde_json::to_vec(&s).unwrap());
     }
 

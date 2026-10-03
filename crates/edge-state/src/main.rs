@@ -1,4 +1,4 @@
-//! edge-state: a power-cut-native etcd v3 server for a single-node appliance.
+//! edge-state: a power-cut-native etcd v3 server for a single-node cluster.
 
 use edge_state::server::EtcdServer;
 use edge_state::store::Store;

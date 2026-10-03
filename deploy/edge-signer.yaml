@@ -1,4 +1,4 @@
-# Signs pod certificates for edge.meridian/appliance from the CA the consumer writes
+# Signs pod certificates for edge.meridian/node from the CA the consumer writes
 # to /etc/edge-signer/ca.pem.
 apiVersion: v1
 kind: ServiceAccount
@@ -20,7 +20,7 @@ rules:
   # sign: answering a request for this signer. attest: publishing its bundle.
   - apiGroups: ["certificates.k8s.io"]
     resources: ["signers"]
-    resourceNames: ["edge.meridian/appliance"]
+    resourceNames: ["edge.meridian/node"]
     verbs: ["sign", "attest"]
   - apiGroups: ["certificates.k8s.io"]
     resources: ["clustertrustbundles"]

@@ -204,7 +204,7 @@ mod tests {
     fn gw() -> GatewayRef {
         GatewayRef {
             name: "edge".into(),
-            namespace: "meridian".into(),
+            namespace: "edge".into(),
             bound_port: 8443,
         }
     }
@@ -235,7 +235,7 @@ mod tests {
         mut spec: Value,
     ) -> DynamicObject {
         if spec.get("parentRefs").is_none() {
-            spec["parentRefs"] = json!([{ "name": "edge", "namespace": "meridian" }]);
+            spec["parentRefs"] = json!([{ "name": "edge", "namespace": "edge" }]);
         }
         obj(
             "gateway.networking.k8s.io/v1",
@@ -252,7 +252,7 @@ mod tests {
         obj(
             "gateway.networking.k8s.io/v1",
             "Gateway",
-            "meridian",
+            "edge",
             "edge",
             T0,
             json!({}),
@@ -486,7 +486,7 @@ mod tests {
         ]);
         let one_listener =
             |allowed: Value| json!([{ "name": "https", "port": 8443, "allowedRoutes": allowed }]);
-        let default_parent = json!({ "name": "edge", "namespace": "meridian" });
+        let default_parent = json!({ "name": "edge", "namespace": "edge" });
         let parent = |extra: Value| {
             let mut p = default_parent.clone();
             p.as_object_mut()
@@ -508,7 +508,7 @@ mod tests {
             (
                 "Same admits the gateway's namespace",
                 json!([{ "name": "https", "port": 8443 }]),
-                "meridian",
+                "edge",
                 default_parent.clone(),
                 admitted,
             ),
@@ -627,10 +627,10 @@ mod tests {
     #[test]
     fn foreign_parent_refs_ignored() {
         for parent in [
-            json!({ "name": "edge", "namespace": "meridian", "kind": "Service" }),
-            json!({ "name": "edge", "namespace": "meridian", "group": "" }),
-            json!({ "name": "edge", "namespace": "meridian", "group": "example.com" }),
-            json!({ "name": "other", "namespace": "meridian" }),
+            json!({ "name": "edge", "namespace": "edge", "kind": "Service" }),
+            json!({ "name": "edge", "namespace": "edge", "group": "" }),
+            json!({ "name": "edge", "namespace": "edge", "group": "example.com" }),
+            json!({ "name": "other", "namespace": "edge" }),
             json!({ "name": "edge", "namespace": "elsewhere" }),
             json!({ "name": "edge" }),
         ] {
@@ -644,7 +644,7 @@ mod tests {
             );
         }
         let mut s = svc_spec();
-        s["parentRefs"] = json!([{ "name": "edge", "namespace": "meridian", "kind": "Gateway", "group": GATEWAY_GROUP }]);
+        s["parentRefs"] = json!([{ "name": "edge", "namespace": "edge", "kind": "Gateway", "group": GATEWAY_GROUP }]);
         assert_eq!(Cluster::basic().one(s, json!({})).0.len(), 1);
     }
 
@@ -1073,7 +1073,7 @@ mod tests {
         let spec = json!({
             "parentRefs": [
                 { "name": "other" },
-                { "name": "edge", "namespace": "meridian", "sectionName": "https", "port": 8443 },
+                { "name": "edge", "namespace": "edge", "sectionName": "https", "port": 8443 },
             ],
             "rules": [
                 { "filters": [{}], "backendRefs": [{ "name": "a", "port": 80 }] },
@@ -1086,7 +1086,7 @@ mod tests {
         let o = c.outcome("t");
         assert_eq!(
             o.parent,
-            json!({ "name": "edge", "namespace": "meridian", "kind": "Gateway", "group": GATEWAY_GROUP,
+            json!({ "name": "edge", "namespace": "edge", "kind": "Gateway", "group": GATEWAY_GROUP,
                     "sectionName": "https", "port": 8443 })
         );
         assert_eq!(
@@ -1102,7 +1102,7 @@ mod tests {
         let o = c.outcome("t");
         assert_eq!(
             o.parent,
-            json!({ "name": "edge", "namespace": "meridian", "kind": "Gateway", "group": GATEWAY_GROUP })
+            json!({ "name": "edge", "namespace": "edge", "kind": "Gateway", "group": GATEWAY_GROUP })
         );
         assert_eq!(o.accepted.message, "1 route(s) served");
     }

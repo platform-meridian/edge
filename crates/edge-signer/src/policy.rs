@@ -1,4 +1,4 @@
-//! What a pod may be issued. The appliance is single-tenant, so the rule is
+//! What a pod may be issued. The node is single-tenant, so the rule is
 //! about names, not pods: only the names this unit is reached by.
 //!
 //! A pod asks with its projection's `userAnnotations`:
@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use crate::api::Spec;
 
-pub const SIGNER: &str = "edge.meridian/appliance";
+pub const SIGNER: &str = "edge.meridian/node";
 const DNS_NAMES: &str = "edge.meridian/dns-names";
 const IP_ADDRESSES: &str = "edge.meridian/ip-addresses";
 /// kube-apiserver's default when the pod names none.
@@ -104,10 +104,10 @@ pub fn decide(spec: &Spec, unit: &Unit) -> Decision {
     let domain = unit.domain.as_deref();
     if let Some(bad) = dns.iter().find(|d| !dns_allowed(d, domain)) {
         return invalid(match domain {
-            Some(domain) => format!(
-                "{bad} is not a name of this appliance (localhost, {domain} or a name under it)"
-            ),
-            None => format!("{bad} is not a name of this appliance (localhost; it has no domain)"),
+            Some(domain) => {
+                format!("{bad} is not a name of this node (localhost, {domain} or a name under it)")
+            }
+            None => format!("{bad} is not a name of this node (localhost; it has no domain)"),
         });
     }
     let mut ips = Vec::new();
@@ -116,7 +116,7 @@ pub fn decide(spec: &Spec, unit: &Unit) -> Decision {
             Ok(ip) if ip.is_loopback() || unit.addresses.contains(&ip) => ips.push(ip),
             _ => {
                 return invalid(format!(
-                    "{raw} is not a loopback address or one of this appliance's {:?}",
+                    "{raw} is not a loopback address or one of this node's {:?}",
                     unit.addresses
                 ));
             }
