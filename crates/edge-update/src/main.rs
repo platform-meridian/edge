@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, watch};
 
 use api::{Command, Snapshot};
 use engine::{Engine, Tick};
-use pb::edge::update::v1::UpdateServiceExt;
+use pb::edge::update::v1::{UPDATE_SERVICE_SERVICE_NAME, UpdateServiceExt};
 
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
@@ -89,6 +89,12 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
 #[tokio::main]
 async fn serve() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let (health_router, health) =
+        connectrpc_health::install_static(connectrpc::Router::new(), [UPDATE_SERVICE_SERVICE_NAME]);
+    tokio::spawn(serve_health(
+        env("EDGE_UPDATE_HEALTH_LISTEN", "0.0.0.0:7444"),
+        health_router,
+    ));
     let settings: unit::Settings = serde_yaml::from_str(
         &std::fs::read_to_string(env("EDGE_UPDATE_CONFIG", "/etc/edge-update/config.yaml"))
             .context("read the settings")?,
@@ -146,11 +152,32 @@ async fn serve() -> anyhow::Result<()> {
         if let Err(e) = bound.serve_with_service(rpc).await {
             tracing::error!(error = %e, "the update API stopped");
         }
+        health.shutdown();
     });
 
     let mut term = edge_common::Terminator::new();
     run(&mut engine, rx, publish, term.wait()).await;
     Ok(())
+}
+
+/// `grpc.health.v1` for the kubelet's probe, which dials the pod's address: the
+/// update API itself stays on loopback. The bind is retried: a predecessor on
+/// the host's network may still hold the port.
+async fn serve_health(listen: String, router: connectrpc::Router) {
+    let mut outage = edge_common::Outage::default();
+    let mut delay = Duration::from_millis(250);
+    let bound = loop {
+        let r = connectrpc::Server::bind(&listen).await;
+        outage.observe("health bind", &r);
+        if let Ok(b) = r {
+            break b;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(5));
+    };
+    if let Err(e) = bound.serve(router).await {
+        tracing::error!(error = %e, "the health service stopped");
+    }
 }
 
 /// How often the unit is reread while nothing else happens.
@@ -232,6 +259,48 @@ async fn run(
 mod tests {
     use super::*;
     use crate::engine::tests::{Harness, OLD_TAG, Spec};
+
+    #[tokio::test]
+    async fn grpc_health_answers_until_shutdown() {
+        use connectrpc::client::{ClientConfig, HttpClient};
+        use connectrpc_health::wire::{HealthCheckRequest, ServingStatus};
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (router, health) = connectrpc_health::install_static(
+            connectrpc::Router::new(),
+            [UPDATE_SERVICE_SERVICE_NAME],
+        );
+        tokio::spawn(serve_health(addr.to_string(), router));
+        // The kubelet's probe: gRPC over cleartext HTTP/2.
+        let client = connectrpc_health::HealthClient::new(
+            HttpClient::plaintext_http2_only(),
+            ClientConfig::new(format!("http://{addr}").parse().unwrap())
+                .with_protocol(connectrpc::Protocol::Grpc),
+        );
+        let check = |service: &str| {
+            let request = HealthCheckRequest {
+                service: service.into(),
+                ..Default::default()
+            };
+            let client = &client;
+            async move {
+                for _ in 0..50 {
+                    if let Ok(r) = client.check(request.clone()).await {
+                        return r.into_owned().status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("no health answer");
+            }
+        };
+        for service in ["", UPDATE_SERVICE_SERVICE_NAME] {
+            assert_eq!(check(service).await, ServingStatus::SERVING, "{service:?}");
+        }
+        health.shutdown();
+        assert_eq!(check("").await, ServingStatus::NOT_SERVING);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn the_unit_is_reread_while_idle_and_sent_on_change() {

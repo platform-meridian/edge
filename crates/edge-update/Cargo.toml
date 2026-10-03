@@ -24,6 +24,7 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tonic-prost.workspace = true
 prost.workspace = true
 connectrpc = { version = "0.9", default-features = false, features = ["server", "client", "gzip"] }
+connectrpc-health = { version = "0.9", default-features = false }
 buffa = "0.9"
 sha2 = "0.10"
 hex = "0.4"
@@ -32,6 +33,7 @@ base64 = "0.22"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+connectrpc-health = "0.9"
 edge-bundle = { path = "../edge-bundle", features = ["testkit"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

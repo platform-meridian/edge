@@ -15,7 +15,6 @@ fn main() {
     connectrpc_build::Config::new()
         .descriptor_set(out.join("update.fds"))
         .files(&["edge/update/v1/update.proto"])
-        .generate_json(false)
         .include_file("_connectrpc.rs")
         .compile()
         .expect("generate the update API");

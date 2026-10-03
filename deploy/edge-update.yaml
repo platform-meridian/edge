@@ -1,5 +1,6 @@
 # Applies signed update bundles through the node's Talos API. The consumer supplies
-# ConfigMap edge-update, Talos os:admin for namespace edge, and both user volumes.
+# ConfigMap edge-update, Talos os:admin for namespace edge, the PersistentVolume
+# for claim edge-update-state, and the edge-registry user volume.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -55,6 +56,19 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edge-up
 subjects:
   - { kind: ServiceAccount, name: edge-update, namespace: edge }
 ---
+# Not EPHEMERAL, which a repair wipes mid-update. Twice the largest bundle: the
+# upload and its unpacked copy. Binds a pre-provisioned PV; set a class to provision one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edge-update-state
+  namespace: edge
+spec:
+  storageClassName: ""
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 16Gi }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -83,6 +97,13 @@ spec:
             - { name: KUBERNETES_SERVICE_HOST, value: "@APISERVER_HOST@" }
             - { name: KUBERNETES_SERVICE_PORT, value: "@APISERVER_PORT@" }
             - { name: EDGE_UPDATE_LISTEN, value: "127.0.0.1:7443" }
+          ports:
+            - { name: health, containerPort: 7444, protocol: TCP }
+          # grpc.health.v1, NOT_SERVING once the update API has stopped.
+          livenessProbe:
+            grpc: { port: 7444 }
+            periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { memory: 256Mi }
@@ -102,8 +123,7 @@ spec:
           configMap: { name: edge-update }
         - name: talos
           secret: { secretName: edge-update }
-        # Directory: a created one would put the record on EPHEMERAL.
         - name: state
-          hostPath: { path: /var/mnt/edge-update, type: Directory }
+          persistentVolumeClaim: { claimName: edge-update-state }
         - name: registry
           hostPath: { path: /var/mnt/edge-registry, type: Directory }

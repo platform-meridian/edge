@@ -21,9 +21,10 @@ Then provide:
   from the issuing CA up to the root. Until it exists the signer uses an
   ephemeral CA;
 - for edge-update: Talos API access with `os:admin` for namespace `edge`
-  (`KubeTalosAPIAccessConfig`), the `edge-update` and `edge-registry` user
-  volumes, and ConfigMap `edge-update` in `edge` whose `config.yaml` names the
-  key, the node's store and the stack:
+  (`KubeTalosAPIAccessConfig`), the `edge-registry` user volume, a
+  PersistentVolume of at least 16Gi for claim `edge/edge-update-state` (class
+  `""`, e.g. a local PV on a user volume), and ConfigMap `edge-update` in
+  `edge` whose `config.yaml` names the key, the node's store and the stack:
 
   ```yaml
   signingKey: ssh-ed25519 AAAA...     # signs every bundle
