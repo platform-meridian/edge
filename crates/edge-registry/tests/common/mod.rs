@@ -18,6 +18,7 @@ pub fn tempdir() -> tempfile::TempDir {
     let base = std::env::var_os("HOME")
         .map(|h| Path::new(&h).join(".cache"))
         .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&base).unwrap();
     tempfile::Builder::new()
         .prefix("edge-registry-test-")
         .tempdir_in(base)
