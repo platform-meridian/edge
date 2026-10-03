@@ -24,7 +24,7 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch"]
-  # The node's pod CIDR. Not named, so one stack serves every unit.
+  # The node's pod CIDR.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get"]

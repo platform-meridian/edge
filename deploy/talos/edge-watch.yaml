@@ -14,8 +14,6 @@ container:
     - EDGE_WATCH_STATE=/host/var/mnt/edge-evidence/edge-watch
     - EDGE_EVIDENCE=/host/var/mnt/edge-evidence
   mounts:
-    # The host's root, rslave, as edge-scope's: this runs until Talos stops
-    # the services, after it has unmounted the volumes.
     - source: /
       destination: /host
       type: bind

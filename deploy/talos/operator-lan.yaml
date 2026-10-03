@@ -1,8 +1,6 @@
 # An extension service, so it is up whatever state Kubernetes is in. Its
 # ExtensionServiceConfig supplies EDGE_DHCP_ADDR (address/prefix) and
 # EDGE_DHCP_DOMAIN; machined grants the host network and binding :53 and :67.
-# The lease file is on the host's /run for readers there, and for edge-dhcp
-# to take its leases back after a restart.
 name: operator-lan
 depends:
   - configuration: true
