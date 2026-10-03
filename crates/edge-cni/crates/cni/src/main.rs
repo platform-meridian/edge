@@ -8,6 +8,15 @@ use std::os::fd::AsRawFd;
 fn main() {
     // argv, not env: containerd controls the plugin's env.
     let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("ready") {
+        std::process::exit(match not_ready() {
+            None => 0,
+            Some(why) => {
+                eprintln!("{why}");
+                1
+            }
+        });
+    }
     if matches!(mode.as_deref(), Some("daemon" | "floor")) {
         edge_common::init_tracing();
         if mode.as_deref() == Some("floor") {
@@ -55,6 +64,17 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// The readiness probe: pods may start, with Services and NetworkPolicy in place.
+fn not_ready() -> Option<&'static str> {
+    if !pins::synced() {
+        Some("the dataplane has not synced")
+    } else if install::installed_pod_cidr().is_none() {
+        Some("no conflist with the Node's pod CIDR")
+    } else {
+        None
+    }
 }
 
 // The kubelet registers the Node under the host's name.

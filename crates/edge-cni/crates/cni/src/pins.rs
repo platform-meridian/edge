@@ -197,6 +197,15 @@ fn pin_base() -> String {
     std::env::var("EDGE_CNI_PIN_BASE").unwrap_or_else(|_| PIN_BASE.into())
 }
 
+/// This build's own: the probe of the daemon that is running.
+pub fn synced() -> bool {
+    synced_in(Path::new(&pin_base()))
+}
+
+fn synced_in(base: &Path) -> bool {
+    base.join(fnv1a(OBJECT)).join(SYNCED).is_dir()
+}
+
 // So a new pod cannot dial a ClusterIP before connect4 can rewrite it. Any
 // version counts: the plugin on disk may be another build.
 pub fn wait_for_dataplane(limit: Duration) -> anyhow::Result<()> {
@@ -336,6 +345,19 @@ mod tests {
         ] {
             assert!(!d.join(f).exists(), "{f}");
         }
+    }
+
+    #[test]
+    fn synced_means_this_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert!(!synced_in(d));
+        std::fs::create_dir_all(d.join("v1").join(SYNCED)).unwrap();
+        assert!(!synced_in(d), "another build's");
+        std::fs::create_dir_all(d.join(fnv1a(OBJECT))).unwrap();
+        assert!(!synced_in(d), "loaded, not synced");
+        std::fs::create_dir_all(d.join(fnv1a(OBJECT)).join(SYNCED)).unwrap();
+        assert!(synced_in(d));
     }
 
     #[test]

@@ -10,3 +10,8 @@ client's backend:
 
 - there is no timeout: `timeoutSeconds` applies only to clients on the node;
 - a client may move to another backend when the backend set changes.
+
+## Readiness
+
+`edge-cni ready` exits 0 once this build's dataplane has synced and its
+conflist names the Node's pod CIDR; the DaemonSet's readiness probe runs it.
