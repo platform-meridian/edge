@@ -11,7 +11,7 @@ use futures::TryStreamExt;
 use http::header::{
     ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, RANGE,
 };
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::Frame;
@@ -22,11 +22,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::ReaderStream;
 
-use crate::{Digest, Store, normalize_repo};
+use crate::reference::normalize_repo;
+use crate::{Digest, Store};
 
 type Body = UnsyncBoxBody<Bytes, io::Error>;
 
-const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
+const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 
 /// Serves `store` on `listen` until `stop`, passing misses through to `upstream`.
 pub async fn serve(
@@ -260,8 +261,7 @@ async fn blob(store: &Store, digest: &Digest, range: Option<&str>) -> Option<Res
     resp.body(BodyExt::boxed_unsync(body)).ok()
 }
 
-/// A read-only pass-through to another registry, Talos's registryd by default,
-/// for what the store does not hold. Nothing it serves is kept.
+/// A read-only pass-through for what the store does not hold; nothing it serves is kept.
 struct Upstream(Option<SocketAddr>);
 
 /// Covers the answer's head only: a blob then streams as long as it takes.
@@ -308,13 +308,16 @@ impl Upstream {
         }
         let (parts, body) = resp.into_parts();
         let mut out = Response::builder().status(status);
-        for name in [CONTENT_TYPE, CONTENT_LENGTH, CONTENT_RANGE, ACCEPT_RANGES] {
+        for name in [
+            CONTENT_TYPE,
+            CONTENT_LENGTH,
+            CONTENT_RANGE,
+            ACCEPT_RANGES,
+            DOCKER_CONTENT_DIGEST,
+        ] {
             if let Some(v) = parts.headers.get(&name) {
                 out = out.header(&name, v);
             }
-        }
-        if let Some(v) = parts.headers.get(DOCKER_CONTENT_DIGEST) {
-            out = out.header(DOCKER_CONTENT_DIGEST, v);
         }
         Ok(out.body(BodyExt::boxed_unsync(body.map_err(io::Error::other)))?)
     }

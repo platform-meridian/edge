@@ -11,10 +11,8 @@ const NAME_ANNOTATIONS: [&str; 2] = [
 ];
 
 impl Store {
-    /// Imports every image an OCI image layout holds and tags each from its
-    /// index annotation, which must be a full reference such as
-    /// `registry.k8s.io/pause:3.10`: a bare tag names no repository. An index
-    /// may lack some of its platforms' manifests. Returns the images tagged.
+    /// Imports an OCI image layout, tagging each image whose index annotation is
+    /// a full reference such as `registry.k8s.io/pause:3.10`. Returns the images tagged.
     pub fn import_layout(&self, layout: &Path) -> anyhow::Result<Vec<ImageRef>> {
         let _lock = self.lock()?;
         let marker: serde_json::Value = serde_json::from_slice(

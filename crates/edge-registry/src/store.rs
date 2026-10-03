@@ -16,11 +16,10 @@ const TAGS: &str = "tags";
 const LOCK: &str = "lock";
 
 /// A content-addressed image store: `blobs/sha256/<hex>`, `manifests/sha256/<hex>`
-/// and `tags/<repo>/<tag>`, each holding a digest.
+/// and `tags/<repo>/<tag>` holding a digest.
 ///
-/// Every write lands whole or not at all, and is written children first (blobs,
-/// then manifests, then tags) and removed parents first, so after a power cut
-/// every tag still resolves to a manifest whose blobs are all present.
+/// Writes land whole, children first, and removals go parents first, so after a
+/// power cut every tag resolves to a manifest whose blobs are all present.
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
@@ -84,11 +83,6 @@ impl Store {
         Ok(Some((media_type, bytes)))
     }
 
-    fn parsed_manifest(&self, digest: &Digest) -> Option<Manifest> {
-        let bytes = std::fs::read(self.manifest_path(digest)).ok()?;
-        Manifest::parse(&bytes).ok()
-    }
-
     /// `reference` is a tag or a digest; `repo` a normalised repository.
     pub fn resolve(&self, repo: &str, reference: &str) -> Option<Digest> {
         let digest = match reference.parse::<Digest>() {
@@ -105,8 +99,7 @@ impl Store {
         self.manifest_path(&digest).is_file().then_some(digest)
     }
 
-    /// The repositories held, under any registry, whose path is `path`: how a
-    /// request that names no registry finds one, as Talos's registryd does.
+    /// The repositories held, under any registry, whose path is `path`, as Talos's registryd finds them.
     pub fn repos_at_path(&self, path: &str) -> Vec<String> {
         let mut repos: Vec<String> = entries(&self.tag_dir())
             .unwrap_or_default()
@@ -199,7 +192,7 @@ impl Store {
     }
 
     pub(crate) fn children_and_blobs(&self, digest: &Digest) -> Option<(Vec<Digest>, Vec<Digest>)> {
-        let m = self.parsed_manifest(digest)?;
+        let m = Manifest::parse(&std::fs::read(self.manifest_path(digest)).ok()?).ok()?;
         let digests = |ds: Vec<Descriptor>| ds.into_iter().map(|d| d.digest).collect();
         Some((digests(m.children), digests(m.blobs)))
     }
@@ -216,8 +209,7 @@ impl Store {
         self.root.join(TAGS)
     }
 
-    /// Serialises writers: an import, a sweep and a repair each see a store no
-    /// other writer is part way through.
+    /// Serialises writers: imports, sweeps and repairs.
     pub(crate) fn lock(&self) -> io::Result<Flock<File>> {
         Flock::lock(self.lock_file()?, FlockArg::LockExclusive).map_err(|(_, e)| e.into())
     }
@@ -240,9 +232,8 @@ impl Store {
     }
 
     /// Removes what a power cut can leave: temp files, then manifests missing a
-    /// blob, then tags naming a missing manifest. A named file is whole, as it
-    /// was fsynced before its rename; [`Store::verify`] catches a rotted one.
-    /// Skipped while a writer holds the store: it leaves nothing torn behind.
+    /// blob, then tags naming a missing manifest. Skipped while a writer holds
+    /// the store; [`Store::verify`] catches rot.
     pub fn repair(&self) -> io::Result<usize> {
         let Some(_lock) = self.try_lock()? else {
             tracing::info!("store busy with a writer; not repairing");
@@ -288,9 +279,8 @@ impl Store {
         Ok(blobs + manifests + tags)
     }
 
-    /// Hashes every blob and manifest, and removes any whose content does not
-    /// match its name, with what then lacks it. Slow: hashing runs unlocked, and
-    /// only a removal waits for writers.
+    /// Hashes every blob and manifest and removes any that does not match its
+    /// name, with what then lacks it. Hashing runs unlocked; only removal waits.
     pub fn verify(&self) -> io::Result<usize> {
         let mut removed = 0;
         for dir in [self.blob_dir(), self.manifest_dir()] {

@@ -1,6 +1,5 @@
-//! Serves the image store read-only on loopback, and passes what it does not
-//! hold through to an upstream registry. Images arrive through the library, from
-//! the process that imports them, never over the network.
+//! Serves the image store read-only on loopback, passing misses through to an
+//! upstream registry. Images arrive through the library, never over the network.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -147,10 +146,15 @@ mod tests {
             ("EDGE_REGISTRY_UPSTREAM", "127.0.0.1:6001"),
             ("EDGE_REGISTRY_VOLUME", "/env-vol"),
         ];
-        assert_eq!(cfg(&[], &env).listen.port(), 6000);
-        assert_eq!(cfg(&[], &env).root, PathBuf::from("/env"));
-        assert_eq!(cfg(&[], &env).upstream.port(), 6001);
-        assert_eq!(cfg(&[], &env).volume, Some("/env-vol".into()));
+        assert_eq!(
+            cfg(&[], &env),
+            Config {
+                listen: "127.0.0.1:6000".parse().unwrap(),
+                root: "/env".into(),
+                upstream: "127.0.0.1:6001".parse().unwrap(),
+                volume: Some("/env-vol".into()),
+            }
+        );
         let c = cfg(
             &[
                 "--root",
@@ -164,10 +168,15 @@ mod tests {
             ],
             &env,
         );
-        assert_eq!(c.listen, "[::1]:7000".parse().unwrap());
-        assert_eq!(c.root, PathBuf::from("/arg"));
-        assert_eq!(c.upstream, "127.0.0.2:7001".parse().unwrap());
-        assert_eq!(c.volume, Some("/arg-vol".into()));
+        assert_eq!(
+            c,
+            Config {
+                listen: "[::1]:7000".parse().unwrap(),
+                root: "/arg".into(),
+                upstream: "127.0.0.2:7001".parse().unwrap(),
+                volume: Some("/arg-vol".into()),
+            }
+        );
     }
 
     #[test]

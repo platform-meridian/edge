@@ -8,13 +8,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use edge_registry::Digest;
+use edge_registry::{Digest, Store};
 
 pub const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
-/// On disk rather than a RAM /tmp, and removed with the guard: nothing is
-/// left behind, not even a parent.
+/// On disk rather than a RAM /tmp.
 pub fn tempdir() -> tempfile::TempDir {
     let base = std::env::var_os("HOME")
         .map(|h| Path::new(&h).join(".cache"))
@@ -43,7 +42,7 @@ impl Blob {
 /// An OCI image layout being written, as `skopeo copy … oci:` leaves one.
 pub struct Layout {
     pub dir: PathBuf,
-    index: Vec<serde_json::Value>,
+    pub index: Vec<serde_json::Value>,
 }
 
 pub struct Image {
@@ -95,8 +94,8 @@ impl Layout {
         }
     }
 
-    /// An index over `platforms`, of which only those in `held` are in the layout.
-    pub fn index(&self, platforms: &[&Image], held: usize) -> Blob {
+    /// An index over `platforms`, of which only the first `held` are in the layout.
+    pub fn multi(&self, platforms: &[&Image], held: usize) -> Blob {
         let manifests: Vec<_> = platforms
             .iter()
             .enumerate()
@@ -165,7 +164,22 @@ pub struct Registry {
     pub port: u16,
 }
 
-pub fn free_port() -> u16 {
+/// Tags one single-layer image per `(seed, name)` and imports them into `root`.
+pub fn import<const N: usize>(root: &Path, layout: &Path, images: [(&str, &str); N]) -> [Image; N] {
+    let mut layout = Layout::new(layout);
+    let images = images.map(|(seed, name)| {
+        let i = layout.image(seed, 1);
+        layout.tag(&i, name);
+        i
+    });
+    Store::open(root)
+        .unwrap()
+        .import_layout(layout.write())
+        .unwrap();
+    images
+}
+
+fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -176,18 +190,10 @@ pub fn free_port() -> u16 {
 impl Registry {
     /// Its upstream is a port nothing listens on.
     pub fn start(root: &Path) -> Registry {
-        Registry::with_upstream(root, free_port())
+        Registry::launch(root, free_port(), None)
     }
 
-    pub fn with_upstream(root: &Path, upstream: u16) -> Registry {
-        Registry::launch(root, upstream, None)
-    }
-
-    pub fn on_volume(root: &Path, upstream: u16, volume: &Path) -> Registry {
-        Registry::launch(root, upstream, Some(volume))
-    }
-
-    fn launch(root: &Path, upstream: u16, volume: Option<&Path>) -> Registry {
+    pub fn launch(root: &Path, upstream: u16, volume: Option<&Path>) -> Registry {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_edge-registry"));
         if let Some(v) = volume {
@@ -288,11 +294,10 @@ impl Response {
     }
 }
 
-/// A registry that answers each path with a canned response and records what
-/// it was asked.
+/// Answers each path with a canned response and records the request heads.
 pub struct Stub {
     pub port: u16,
-    pub seen: Arc<Mutex<Vec<String>>>,
+    seen: Arc<Mutex<Vec<String>>>,
 }
 
 pub struct Canned {

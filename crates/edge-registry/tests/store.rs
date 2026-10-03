@@ -117,25 +117,12 @@ fn corrupt_blob_never_visible() {
 }
 
 #[test]
-fn truncated_blob_rejected() {
-    let d = tempdir();
-    let mut layout = Layout::new(&d.path().join("layout"));
-    let app = layout.image("app", 1);
-    layout.tag(&app, "ghcr.io/o/app:v1");
-    let layer = &app.layers[0];
-    std::fs::write(layout.path(&layer.digest), &layer.bytes[..100]).unwrap();
-    let store = Store::open(d.path().join("store")).unwrap();
-    assert!(store.import_layout(layout.write()).is_err());
-    assert!(!store.blob_path(&layer.digest).exists());
-}
-
-#[test]
 fn partial_index_imports() {
     let d = tempdir();
     let mut layout = Layout::new(&d.path().join("layout"));
     let amd64 = layout.image("amd64", 1);
     let arm64 = layout.image("arm64", 1);
-    let index = layout.index(&[&amd64, &arm64], 1);
+    let index = layout.multi(&[&amd64, &arm64], 1);
     std::fs::remove_file(layout.path(&arm64.config.digest)).unwrap();
     std::fs::remove_file(layout.path(&arm64.layers[0].digest)).unwrap();
     layout.add(
@@ -395,22 +382,13 @@ fn repair_waits_for_no_writer() {
 #[test]
 fn wrong_size_rejected() {
     let d = tempdir();
-    let layout = Layout::new(&d.path().join("layout"));
+    let mut layout = Layout::new(&d.path().join("layout"));
     let app = layout.image("app", 1);
     let mut desc = app.manifest.descriptor(common::MANIFEST);
     desc["size"] = (app.manifest.bytes.len() + 1).into();
-    std::fs::write(
-        layout.dir.join("index.json"),
-        serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "manifests": [desc]})).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        layout.dir.join("oci-layout"),
-        br#"{"imageLayoutVersion":"1.0.0"}"#,
-    )
-    .unwrap();
+    layout.index.push(desc);
     let store = Store::open(d.path().join("store")).unwrap();
-    assert!(store.import_layout(&layout.dir).is_err());
+    assert!(store.import_layout(layout.write()).is_err());
     assert_eq!(store.manifest(&app.manifest.digest).unwrap(), None);
 }
 

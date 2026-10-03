@@ -9,7 +9,7 @@ mod store;
 mod sweep;
 
 pub use digest::Digest;
-pub use reference::{ImageRef, normalize_repo};
+pub use reference::ImageRef;
 pub use server::serve;
 pub use store::{Listing, Store};
 pub use sweep::Swept;

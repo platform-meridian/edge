@@ -1,6 +1,6 @@
 mod common;
 
-use common::{INDEX, Image, Layout, MANIFEST, Registry, tempdir};
+use common::{INDEX, Image, Layout, MANIFEST, Registry, import, tempdir};
 use edge_registry::Store;
 
 struct Fixture {
@@ -15,7 +15,7 @@ fn fixture() -> Fixture {
     let mut layout = Layout::new(&d.path().join("layout"));
     let app = layout.image("app", 2);
     let arm = layout.image("arm", 1);
-    let multi = layout.index(&[&app, &arm], 2);
+    let multi = layout.multi(&[&app, &arm], 2);
     layout.tag(&app, "ghcr.io/o/app:v1");
     layout.tag(&app, "nginx:1.27");
     layout.add(
@@ -224,14 +224,8 @@ fn read_only() {
 fn serves_what_is_imported_later() {
     let f = fixture();
     let d = tempdir();
-    let mut layout = Layout::new(d.path());
-    let next = layout.image("next", 1);
-    layout.tag(&next, "ghcr.io/o/app:v2");
     let root = f._d.path().join("store");
-    Store::open(&root)
-        .unwrap()
-        .import_layout(layout.write())
-        .unwrap();
+    let [next] = import(&root, d.path(), [("next", "ghcr.io/o/app:v2")]);
     let resp = f.registry.get("/v2/o/app/manifests/v2?ns=ghcr.io");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, next.manifest.bytes);
@@ -253,14 +247,13 @@ fn serves_what_is_imported_later() {
 #[test]
 fn repairs_at_start_and_verifies_after() {
     let d = tempdir();
-    let mut layout = Layout::new(&d.path().join("layout"));
-    let app = layout.image("app", 1);
-    let gone = layout.image("gone", 1);
-    layout.tag(&app, "ghcr.io/o/app:v1");
-    layout.tag(&gone, "ghcr.io/o/gone:v1");
     let root = d.path().join("store");
+    let [app, gone] = import(
+        &root,
+        &d.path().join("layout"),
+        [("app", "ghcr.io/o/app:v1"), ("gone", "ghcr.io/o/gone:v1")],
+    );
     let store = Store::open(&root).unwrap();
-    store.import_layout(layout.write()).unwrap();
     let rotted = store.blob_path(&app.layers[0].digest);
     std::fs::write(&rotted, b"rot").unwrap();
     let temp = rotted.with_extension("edge-tmp");
@@ -288,16 +281,14 @@ fn repairs_at_start_and_verifies_after() {
 #[test]
 fn finds_a_repository_without_its_registry() {
     let d = tempdir();
-    let mut layout = Layout::new(&d.path().join("layout"));
-    let stack = layout.image("stack", 1);
-    layout.tag(&stack, "127.0.0.1:5999/meridian-stack:t1");
     let root = d.path().join("store");
-    Store::open(&root)
-        .unwrap()
-        .import_layout(layout.write())
-        .unwrap();
+    let [stack] = import(
+        &root,
+        &d.path().join("layout"),
+        [("stack", "127.0.0.1:5999/stack:t1")],
+    );
     let registry = Registry::start(&root);
-    let resp = registry.get("/v2/meridian-stack/manifests/t1");
+    let resp = registry.get("/v2/stack/manifests/t1");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, stack.manifest.bytes);
     assert_eq!(registry.get("/v2/other-stack/manifests/t1").status, 404);
@@ -306,14 +297,12 @@ fn finds_a_repository_without_its_registry() {
 #[test]
 fn decodes_percent_encoding() {
     let d = tempdir();
-    let mut layout = Layout::new(&d.path().join("layout"));
-    let installer = layout.image("installer", 1);
-    layout.tag(&installer, "127.0.0.1:5999/installer:v1");
     let root = d.path().join("store");
-    Store::open(&root)
-        .unwrap()
-        .import_layout(layout.write())
-        .unwrap();
+    let [installer] = import(
+        &root,
+        &d.path().join("layout"),
+        [("installer", "127.0.0.1:5999/installer:v1")],
+    );
     let registry = Registry::start(&root);
     let encoded = installer.manifest.digest.to_string().replace(':', "%3A");
     for path in [

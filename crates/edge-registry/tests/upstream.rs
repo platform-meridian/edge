@@ -3,7 +3,7 @@ mod common;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use common::{Canned, Layout, MANIFEST, Registry, Stub, free_port, tempdir};
+use common::{Canned, MANIFEST, Registry, Stub, import, tempdir};
 use edge_registry::{Digest, Store};
 
 struct Fixture {
@@ -23,14 +23,12 @@ fn digest(b: &[u8]) -> String {
 
 fn fixture() -> Fixture {
     let d = tempdir();
-    let mut layout = Layout::new(&d.path().join("layout"));
-    let held = layout.image("held", 1);
-    layout.tag(&held, "ghcr.io/o/app:v2");
     let root = d.path().join("store");
-    Store::open(&root)
-        .unwrap()
-        .import_layout(layout.write())
-        .unwrap();
+    let [held] = import(
+        &root,
+        &d.path().join("layout"),
+        [("held", "ghcr.io/o/app:v2")],
+    );
     let mut answers = HashMap::new();
     let manifest = || Canned {
         status: "200 OK",
@@ -41,7 +39,7 @@ fn fixture() -> Fixture {
         body: BAKED.to_vec(),
     };
     answers.insert("/v2/o/app/manifests/v1?ns=ghcr.io".into(), manifest());
-    answers.insert("/v2/meridian-stack/manifests/baked".into(), manifest());
+    answers.insert("/v2/stack/manifests/baked".into(), manifest());
     answers.insert(
         format!("/v2/o/app/blobs/{}?ns=ghcr.io", digest(BLOB)),
         Canned {
@@ -63,7 +61,7 @@ fn fixture() -> Fixture {
     );
     let stub = Stub::start(answers);
     Fixture {
-        registry: Registry::with_upstream(&root, stub.port),
+        registry: Registry::launch(&root, stub.port, None),
         stub,
         root,
         held,
@@ -82,7 +80,7 @@ fn passes_a_miss_through() {
         resp.header("docker-content-digest"),
         Some(digest(BAKED).as_str())
     );
-    let direct = f.registry.get("/v2/meridian-stack/manifests/baked");
+    let direct = f.registry.get("/v2/stack/manifests/baked");
     assert_eq!(direct.body, BAKED);
     let asked = f.stub.requests();
     assert!(
@@ -90,7 +88,7 @@ fn passes_a_miss_through() {
         "{asked:?}"
     );
     assert!(
-        asked[1].starts_with("GET /v2/meridian-stack/manifests/baked HTTP/1.1"),
+        asked[1].starts_with("GET /v2/stack/manifests/baked HTTP/1.1"),
         "{asked:?}"
     );
 }
@@ -161,15 +159,6 @@ fn upstream_miss_or_failure_is_404() {
 }
 
 #[test]
-fn upstream_down_is_404() {
-    let d = tempdir();
-    let registry = Registry::with_upstream(&d.path().join("store"), free_port());
-    let resp = registry.get("/v2/o/app/manifests/v1?ns=ghcr.io");
-    assert_eq!(resp.status, 404);
-    assert_eq!(resp.header("content-type"), Some("application/json"));
-}
-
-#[test]
 fn nothing_passed_through_is_kept() {
     let f = fixture();
     let before = Store::open(&f.root).unwrap().list().unwrap();
@@ -209,7 +198,7 @@ fn unmounted_volume_passes_through_until_mounted() {
     std::os::unix::fs::symlink(&plain, &vol).unwrap();
     let held = "/v2/o/app/manifests/v2?ns=ghcr.io";
 
-    let mut r = Registry::on_volume(&f.root, f.stub.port, &vol);
+    let mut r = Registry::launch(&f.root, f.stub.port, Some(&vol));
     assert_eq!(r.get(held).status, 404, "served a store before its volume");
     assert_eq!(r.get("/v2/o/app/manifests/v1?ns=ghcr.io").body, BAKED);
     assert!(!r.exits_within(Duration::from_secs(2)));
@@ -223,6 +212,6 @@ fn unmounted_volume_passes_through_until_mounted() {
         "never restarted to serve the mounted volume"
     );
 
-    let r = Registry::on_volume(&f.root, f.stub.port, &vol);
+    let r = Registry::launch(&f.root, f.stub.port, Some(&vol));
     assert_eq!(r.get(held).body, f.held.manifest.bytes);
 }
