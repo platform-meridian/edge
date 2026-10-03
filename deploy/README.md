@@ -16,7 +16,10 @@ The images are the published `ghcr.io/platform-meridian/edge-<name>`, tagged in
 Then provide:
 
 - the Gateway API CRDs;
-- the CA edge-signer signs with, at `/etc/edge-signer/ca.pem` on the host;
+- the CA edge-signer signs with: Secret `edge-signer-ca` in `edge`, type
+  `kubernetes.io/tls`, `tls.key` its PKCS#8 P-256 key and `tls.crt` the chain
+  from the issuing CA up to the root. Until it exists the signer uses an
+  ephemeral CA;
 - for edge-update: Talos API access with `os:admin` for namespace `edge`
   (`KubeTalosAPIAccessConfig`), the `edge-update` and `edge-registry` user
   volumes, and ConfigMap `edge-update` in `edge` whose `config.yaml` names the

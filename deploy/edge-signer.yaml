@@ -1,5 +1,6 @@
-# Signs pod certificates for edge.meridian/node from the CA the consumer writes
-# to /etc/edge-signer/ca.pem.
+# Signs pod certificates for edge.meridian/node from the CA in Secret
+# edge-signer-ca (kubernetes.io/tls: tls.key, and tls.crt from the issuing CA up
+# to the root), and approves the kubelets' serving certificates.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -29,12 +30,46 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
+  # Approving kubelet serving certificates whose names are the Node's own.
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["patch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    resourceNames: ["kubernetes.io/kubelet-serving"]
+    verbs: ["approve"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: edge-signer
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edge-signer }
+subjects:
+  - { kind: ServiceAccount, name: edge-signer, namespace: edge }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: edge-signer
+  namespace: edge
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["edge-signer-ca"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: edge-signer
+  namespace: edge
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edge-signer }
 subjects:
   - { kind: ServiceAccount, name: edge-signer, namespace: edge }
 ---
@@ -60,9 +95,10 @@ spec:
         - name: edge-signer
           image: "ghcr.io/platform-meridian/edge-signer"
           env:
-            - { name: EDGE_SIGNER_CA, value: /etc/edge-signer/ca.pem }
             - { name: EDGE_SIGNER_DOMAIN, value: "@OPERATOR_DOMAIN@" }
             - { name: EDGE_SIGNER_ADDRESSES, value: "@OPERATOR_ADDR@" }
+          ports:
+            - { name: healthz, containerPort: 9750, protocol: TCP }
           resources:
             requests: { cpu: 5m, memory: 8Mi }
             limits: { memory: 32Mi }
@@ -71,16 +107,6 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
           livenessProbe:
-            exec: { command: ["/edge-signer", "check"] }
+            httpGet: { path: /healthz, port: healthz }
             periodSeconds: 10
             failureThreshold: 3
-          volumeMounts:
-            - { name: ca, mountPath: /etc/edge-signer, readOnly: true }
-            - { name: heartbeat, mountPath: /run/edge-signer }
-      volumes:
-        - name: ca
-          # The directory: a file replaced by rename stays visible. No type: the
-          # kubelet may not see the host's /etc/edge-signer to check it.
-          hostPath: { path: /etc/edge-signer }
-        - name: heartbeat
-          emptyDir: { medium: Memory, sizeLimit: 1Mi }

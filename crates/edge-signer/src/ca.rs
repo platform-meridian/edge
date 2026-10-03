@@ -1,10 +1,10 @@
-//! The node's CA: one read-only file holding the issuing CA's P-256 key
-//! (PKCS#8) and its chain, issuing CA first, up to a self-signed root.
+//! The node's CA: a `kubernetes.io/tls` Secret holding the issuing CA's P-256
+//! key (PKCS#8) and its chain, issuing CA first, up to a self-signed root.
 
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
+use k8s_openapi::api::core::v1::Secret;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, PublicKeyData, SanType,
@@ -32,10 +32,18 @@ pub struct Leaf {
     pub not_after: i64,
 }
 
+/// In the signer's own namespace.
+pub const SECRET: &str = "edge-signer-ca";
+
 impl Ca {
-    pub fn read(path: &Path, now: i64) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path).context("unreadable")?;
-        Self::parse(&bytes, now)
+    pub fn from_secret(secret: Option<&Secret>, now: i64) -> anyhow::Result<Self> {
+        let data = secret.context("no Secret")?.data.as_ref();
+        let field = |k: &str| {
+            data.and_then(|d| d.get(k))
+                .map(|b| b.0.as_slice())
+                .with_context(|| format!("no {k}"))
+        };
+        Self::parse(&[field("tls.key")?, b"\n", field("tls.crt")?].concat(), now)
     }
 
     pub fn ephemeral(now: i64) -> anyhow::Result<Self> {
@@ -199,38 +207,33 @@ fn issued_by(cert: &X509Certificate, issuer: &X509Certificate) -> bool {
     cert.issuer() == issuer.subject() && cert.verify_signature(Some(issuer.public_key())).is_ok()
 }
 
-/// The CA the signer signs with: the file's, or while the file is unusable an
-/// ephemeral one, kept until the file is fixed.
+/// The CA the signer signs with: the Secret's, or while it is unusable an
+/// ephemeral one, kept until the Secret is fixed.
 pub struct Source {
-    path: PathBuf,
     pub ca: Ca,
     problem: Option<String>,
 }
 
 impl Source {
-    pub fn open(path: &Path, now: i64) -> anyhow::Result<Self> {
-        let (ca, problem) = match Ca::read(path, now) {
+    pub fn new(secret: Option<&Secret>, now: i64) -> anyhow::Result<Self> {
+        let (ca, problem) = match Ca::from_secret(secret, now) {
             Ok(ca) => (ca, None),
             Err(e) => {
                 let why = format!("{e:#}");
-                unusable(path, &why);
+                unusable(&why);
                 (Ca::ephemeral(now)?, Some(why))
             }
         };
         if problem.is_none() {
-            tracing::info!(path = %path.display(), "node CA loaded");
+            tracing::info!(secret = SECRET, "node CA loaded");
         }
-        Ok(Self {
-            path: path.into(),
-            ca,
-            problem,
-        })
+        Ok(Self { ca, problem })
     }
 
-    pub fn refresh(&mut self, now: i64) -> anyhow::Result<()> {
-        match Ca::read(&self.path, now) {
+    pub fn refresh(&mut self, secret: Option<&Secret>, now: i64) -> anyhow::Result<()> {
+        match Ca::from_secret(secret, now) {
             Ok(ca) if self.problem.is_some() || ca.certs != self.ca.certs => {
-                tracing::info!(path = %self.path.display(), "node CA loaded");
+                tracing::info!(secret = SECRET, "node CA loaded");
                 self.ca = ca;
                 self.problem = None;
             }
@@ -238,7 +241,7 @@ impl Source {
             Err(e) => {
                 let why = format!("{e:#}");
                 if self.problem.as_ref() != Some(&why) {
-                    unusable(&self.path, &why);
+                    unusable(&why);
                     if self.problem.is_none() {
                         self.ca = Ca::ephemeral(now)?;
                     }
@@ -250,9 +253,10 @@ impl Source {
     }
 }
 
-fn unusable(path: &Path, why: &str) {
+fn unusable(why: &str) {
     tracing::error!(
-        path = %path.display(), error = why,
+        secret = SECRET,
+        error = why,
         "node CA unusable: signing with an ephemeral CA that clients will not trust"
     );
 }
@@ -284,11 +288,26 @@ pub(crate) mod tests {
     pub const NOW: i64 = 1_790_000_000;
     const YEAR: i64 = 365 * 86_400;
 
-    /// A CA path in a directory removed with the guard.
-    pub fn scratch() -> (tempfile::TempDir, PathBuf) {
-        let d = tempfile::tempdir().unwrap();
-        let path = d.path().join("ca.pem");
-        (d, path)
+    pub fn tls(key: &str, crt: &str) -> Secret {
+        Secret {
+            data: Some(
+                [("tls.key", key), ("tls.crt", crt)]
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), k8s_openapi::ByteString(v.into())))
+                    .collect(),
+            ),
+            ..Secret::default()
+        }
+    }
+
+    pub fn secret(key: &TestCert, chain: &[&TestCert]) -> Secret {
+        let crt: String = chain.iter().map(|c| c.pem.as_str()).collect();
+        tls(&key.key.serialize_pem(), &crt)
+    }
+
+    /// One text in `tls.key`: the two fields are read as one.
+    fn raw(text: &str) -> Secret {
+        tls(text, "")
     }
 
     pub fn csr(alg: &'static rcgen::SignatureAlgorithm) -> (KeyPair, Vec<u8>) {
@@ -408,10 +427,10 @@ pub(crate) mod tests {
         (out, text)
     }
 
-    fn one_error(log: &str, path: &Path, why: &str) -> bool {
+    fn one_error(log: &str, why: &str) -> bool {
         log.lines().count() == 1
             && log.trim_start().starts_with("ERROR")
-            && log.contains(&path.display().to_string())
+            && log.contains(SECRET)
             && log.contains(why)
     }
 
@@ -462,9 +481,8 @@ pub(crate) mod tests {
     fn intermediate_leaves_verify_to_root() {
         let r = root("operator root", NOW - 60, NOW + 20 * YEAR);
         let i = intermediate(&r);
-        let (_tmp, path) = scratch();
-        std::fs::write(&path, file(&i, &[&i, &r])).unwrap();
-        let (source, log) = logged_warnings(|| Source::open(&path, NOW).unwrap());
+        let (source, log) =
+            logged_warnings(|| Source::new(Some(&secret(&i, &[&i, &r])), NOW).unwrap());
         assert_eq!(log, "");
         assert_eq!(source.ca.root(), r.pem);
 
@@ -489,9 +507,7 @@ pub(crate) mod tests {
     #[test]
     fn self_signed_ca_leaves_come_alone() {
         let r = root("unit CA", NOW - 60, NOW + 10 * YEAR);
-        let (_tmp, path) = scratch();
-        std::fs::write(&path, file(&r, &[&r])).unwrap();
-        let source = Source::open(&path, NOW).unwrap();
+        let source = Source::new(Some(&secret(&r, &[&r])), NOW).unwrap();
         assert_eq!(source.ca.root(), r.pem);
         let leaf = leaf(&source.ca, NOW, 864_000);
         assert_eq!(leaf.chain.matches("BEGIN CERTIFICATE").count(), 1);
@@ -500,7 +516,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unusable_file_falls_back_to_ephemeral() {
+    fn unusable_secret_falls_back_to_ephemeral() {
         let r = root("root", NOW - 60, NOW + 20 * YEAR);
         let i = intermediate(&r);
         let other = root("other", NOW - 60, NOW + 20 * YEAR);
@@ -515,7 +531,6 @@ pub(crate) mod tests {
         no_cert_sign.key_usages = vec![KeyUsagePurpose::DigitalSignature];
 
         let shapes: Vec<(&str, Option<String>, &str)> = vec![
-            ("missing", None, "unreadable"),
             ("garbage", Some("not pem".into()), "no private key"),
             ("empty", Some(String::new()), "no private key"),
             ("key only", Some(key.clone()), "no certificate"),
@@ -621,77 +636,77 @@ pub(crate) mod tests {
                 "no certificate",
             ),
         ];
-        for (what, bytes, why) in shapes {
-            let (_tmp, path) = scratch();
-            if let Some(b) = &bytes {
-                std::fs::write(&path, b).unwrap();
-            }
-            let (source, log) = logged_warnings(|| Source::open(&path, NOW).unwrap());
-            assert!(one_error(&log, &path, why), "{what}: {log}");
+        let mut shapes: Vec<(&str, Option<Secret>, &str)> = shapes
+            .into_iter()
+            .map(|(what, text, why)| (what, text.as_deref().map(raw), why))
+            .collect();
+        let mut no_crt = secret(&r, &[&r]);
+        no_crt.data.as_mut().unwrap().remove("tls.crt");
+        let mut no_key = secret(&r, &[&r]);
+        no_key.data.as_mut().unwrap().remove("tls.key");
+        shapes.extend([
+            ("no Secret", None, "no Secret"),
+            ("no data", Some(Secret::default()), "no tls.key"),
+            ("no tls.crt", Some(no_crt), "no tls.crt"),
+            ("no tls.key", Some(no_key), "no tls.key"),
+        ]);
+        for (what, secret, why) in shapes {
+            let (source, log) = logged_warnings(|| Source::new(secret.as_ref(), NOW).unwrap());
+            assert!(one_error(&log, why), "{what}: {log}");
             assert!(source.ca.ephemeral, "{what}");
             for m in [&r, &i, &other] {
                 assert_ne!(source.ca.root(), m.pem, "{what}");
             }
-            assert_eq!(
-                std::fs::read(&path).ok(),
-                bytes.map(String::into_bytes),
-                "{what}: left as found"
-            );
         }
-
-        let (_tmp, path) = scratch();
-        std::fs::create_dir(&path).unwrap();
-        let (source, log) = logged_warnings(|| Source::open(&path, NOW).unwrap());
-        assert!(one_error(&log, &path, "unreadable"), "a directory: {log}");
-        assert!(source.ca.ephemeral);
     }
 
     #[test]
-    fn refresh_follows_file_changes() {
-        let (_tmp, path) = scratch();
+    fn refresh_follows_secret_changes() {
         let a = root("a", NOW - 60, NOW + 10 * YEAR);
         let b = root("b", NOW - 60, NOW + 10 * YEAR);
-        std::fs::write(&path, file(&a, &[&a])).unwrap();
-        let mut source = Source::open(&path, NOW).unwrap();
-        let info = |source: &mut Source| logged_info(|| source.refresh(NOW).unwrap()).1;
-        assert_eq!(info(&mut source), "", "an unchanged file is not reloaded");
+        let mut source = Source::new(Some(&secret(&a, &[&a])), NOW).unwrap();
+        let info = |source: &mut Source, s: Option<&Secret>| {
+            logged_info(|| source.refresh(s, NOW).unwrap()).1
+        };
+        assert_eq!(
+            info(&mut source, Some(&secret(&a, &[&a]))),
+            "",
+            "an unchanged Secret is not reloaded"
+        );
 
-        std::fs::write(&path, file(&b, &[&b])).unwrap();
-        let log = info(&mut source);
+        let log = info(&mut source, Some(&secret(&b, &[&b])));
         assert_eq!(source.ca.root(), b.pem);
         assert!(log.lines().count() == 1 && log.contains("loaded"), "{log}");
 
-        std::fs::write(&path, "garbage").unwrap();
-        let ((), log) = logged_warnings(|| source.refresh(NOW).unwrap());
-        assert!(one_error(&log, &path, "no private key"), "{log}");
+        let garbage = raw("garbage");
+        let ((), log) = logged_warnings(|| source.refresh(Some(&garbage), NOW).unwrap());
+        assert!(one_error(&log, "no private key"), "{log}");
         let ephemeral = source.ca.root().to_string();
         assert!(source.ca.ephemeral && ephemeral != b.pem);
-        let ((), log) = logged_warnings(|| source.refresh(NOW).unwrap());
+        let ((), log) = logged_warnings(|| source.refresh(Some(&garbage), NOW).unwrap());
         assert_eq!(log, "", "the same problem is logged once");
 
-        std::fs::remove_file(&path).unwrap();
-        let ((), log) = logged_warnings(|| source.refresh(NOW).unwrap());
-        assert!(one_error(&log, &path, "unreadable"), "{log}");
+        let ((), log) = logged_warnings(|| source.refresh(None, NOW).unwrap());
+        assert!(one_error(&log, "no Secret"), "{log}");
         assert_eq!(source.ca.root(), ephemeral, "one ephemeral CA while broken");
 
-        std::fs::write(&path, file(&a, &[&a])).unwrap();
-        let ((), log) = logged_warnings(|| source.refresh(NOW).unwrap());
+        let fixed = secret(&a, &[&a]);
+        let ((), log) = logged_warnings(|| source.refresh(Some(&fixed), NOW).unwrap());
         assert_eq!((source.ca.root(), log.as_str()), (a.pem.as_str(), ""));
         assert!(!source.ca.ephemeral);
 
-        let ((), log) = logged_warnings(|| source.refresh(NOW + 10 * YEAR).unwrap());
-        assert!(one_error(&log, &path, "expires within an hour"), "{log}");
+        let ((), log) = logged_warnings(|| source.refresh(Some(&fixed), NOW + 10 * YEAR).unwrap());
+        assert!(one_error(&log, "expires within an hour"), "{log}");
         assert!(source.ca.ephemeral);
     }
 
     #[test]
     fn not_yet_valid_ca_taken_once_valid() {
-        let (_tmp, path) = scratch();
         let r = root("r", NOW, NOW + 10 * YEAR);
-        std::fs::write(&path, file(&r, &[&r])).unwrap();
-        let (mut source, log) = logged_warnings(|| Source::open(&path, NOW - 1).unwrap());
-        assert!(one_error(&log, &path, "not valid yet"), "{log}");
-        source.refresh(NOW).unwrap();
+        let s = secret(&r, &[&r]);
+        let (mut source, log) = logged_warnings(|| Source::new(Some(&s), NOW - 1).unwrap());
+        assert!(one_error(&log, "not valid yet"), "{log}");
+        source.refresh(Some(&s), NOW).unwrap();
         assert_eq!(source.ca.root(), r.pem);
     }
 

@@ -5,25 +5,25 @@
 
 mod api;
 mod ca;
-mod heartbeat;
+mod kubelet;
 mod policy;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use edge_common::health::Heartbeat;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::certificates::v1::CertificateSigningRequest;
+use k8s_openapi::api::core::v1::{Node, Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{
     ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, Preconditions,
 };
-use kube::runtime::watcher::Event;
+use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 
 use api::{PodCertificateRequest, Status};
 use ca::{Ca, Source};
-use heartbeat::Heartbeat;
 use policy::{Decision, SIGNER, Unit};
 
 /// The ClusterTrustBundle's name must start with the signer's, `/` as `:`.
@@ -32,8 +32,10 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// The client sets no response timeout, so one hung apiserver call would stall
 /// the loop for good.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Six loop ticks, and twice the longest an apiserver call may take.
+const STALE_AFTER: Duration = Duration::from_secs(30);
 const _: () = assert!(
-    RETRY_INTERVAL.as_secs() + CALL_TIMEOUT.as_secs() < heartbeat::STALE_AFTER.as_secs(),
+    RETRY_INTERVAL.as_secs() + CALL_TIMEOUT.as_secs() < STALE_AFTER.as_secs(),
     "a pass waiting on a hung call must not go stale"
 );
 /// Re-applied this often even unchanged, so a deleted bundle comes back.
@@ -43,18 +45,13 @@ const REPUBLISH_INTERVAL: Duration = Duration::from_secs(600);
 const CLOCK_SKEW_SECS: i64 = 300;
 
 fn main() -> anyhow::Result<()> {
-    let heartbeat_dir = Path::new(heartbeat::DIR);
-    if std::env::args().nth(1).as_deref() == Some("check") {
-        return heartbeat::check(heartbeat_dir, heartbeat::monotonic());
-    }
     edge_common::init_tracing();
-    let ca_path: PathBuf = std::env::var("EDGE_SIGNER_CA")
-        .unwrap_or_else(|_| "/etc/edge-signer/ca.pem".into())
-        .into();
     let env = |name| std::env::var(name).unwrap_or_default();
     let unit = Unit::new(&env("EDGE_SIGNER_DOMAIN"), &env("EDGE_SIGNER_ADDRESSES"));
-    edge_common::sandbox::restrict(&edge_common::sandbox::signer(&ca_path, heartbeat_dir));
-    run(&ca_path, &unit, &Heartbeat::new(heartbeat_dir))
+    let health =
+        std::env::var("EDGE_SIGNER_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:9750".into());
+    edge_common::sandbox::restrict(&edge_common::sandbox::signer(&health));
+    run(health, &unit)
 }
 
 fn now() -> i64 {
@@ -64,21 +61,26 @@ fn now() -> i64 {
 }
 
 #[tokio::main]
-async fn run(ca_path: &Path, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Result<()> {
+async fn run(health: String, unit: &Unit) -> anyhow::Result<()> {
     let mut term = edge_common::Terminator::new();
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let source = Source::open(ca_path, now())?;
+    let heartbeat = Heartbeat::default();
+    tokio::spawn(edge_common::health::serve(
+        health,
+        heartbeat.clone(),
+        STALE_AFTER,
+    ));
     tracing::info!(
         signer = SIGNER,
         bundle = BUNDLE_NAME,
+        ca = ca::SECRET,
         ?unit,
         "edge-signer: ready"
     );
 
     let mut outage = edge_common::Outage::default();
     let client = loop {
-        heartbeat.beat().ok();
+        heartbeat.beat();
         let r = Client::try_default().await;
         outage.observe("kubernetes client", &r);
         if let Ok(c) = r {
@@ -90,20 +92,56 @@ async fn run(ca_path: &Path, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Resu
         }
     };
     tokio::select! {
-        r = serve(client, unit, source, heartbeat) => r,
+        r = serve(client, unit, &heartbeat) => r,
         _ = term.wait() => Ok(()),
+    }
+}
+
+/// The CA Secret as last listed: unknown until the first listing answers.
+#[derive(Default)]
+struct CaSecret {
+    listing: Option<Secret>,
+    current: Option<Option<Secret>>,
+}
+
+impl CaSecret {
+    fn apply(&mut self, ev: Event<Secret>) {
+        match ev {
+            Event::Init => self.listing = None,
+            Event::InitApply(s) => self.listing = Some(s),
+            Event::InitDone => self.current = Some(self.listing.take()),
+            Event::Apply(s) => self.current = Some(Some(s)),
+            Event::Delete(_) => self.current = Some(None),
+        }
+    }
+
+    /// An apiserver that refuses the first listing (no RBAC, say) leaves it as
+    /// good as missing; once known, a refusal keeps what was known.
+    fn failed(&mut self, e: &watcher::Error) {
+        let answered = matches!(
+            e,
+            watcher::Error::InitialListFailed(kube::Error::Api(_))
+                | watcher::Error::WatchStartFailed(kube::Error::Api(_))
+                | watcher::Error::WatchFailed(kube::Error::Api(_))
+                | watcher::Error::WatchError(_)
+        );
+        if answered && self.current.is_none() {
+            self.current = Some(None);
+        }
+    }
+
+    fn known(&self) -> Option<Option<&Secret>> {
+        self.current.as_ref().map(Option::as_ref)
     }
 }
 
 /// Beats only from the loop itself, so a wedged loop goes stale while an
 /// apiserver outage does not.
-async fn serve(
-    client: Client,
-    unit: &Unit,
-    mut source: Source,
-    heartbeat: &Heartbeat,
-) -> anyhow::Result<()> {
+async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Result<()> {
     let requests: Api<PodCertificateRequest> = Api::all(client.clone());
+    let secrets: Api<Secret> = Api::default_namespaced(client.clone());
+    let csrs: Api<CertificateSigningRequest> = Api::all(client.clone());
+    let nodes: Api<Node> = Api::all(client.clone());
     let bundles: Api<DynamicObject> = Api::all_with(
         client.clone(),
         &ApiResource::from_gvk(&GroupVersionKind::gvk(
@@ -113,33 +151,68 @@ async fn serve(
         )),
     );
 
-    let mut events = edge_kube::watch(requests.clone(), "podcertificaterequests").boxed();
+    let watch_requests = || edge_kube::watch(requests.clone(), "podcertificaterequests").boxed();
+    let watch_secret = || {
+        let named = watcher::Config::default().fields(&format!("metadata.name={}", ca::SECRET));
+        edge_kube::watch_with(secrets.clone(), named, "node CA secret").boxed()
+    };
+    let watch_csrs = || {
+        let kubelet =
+            watcher::Config::default().fields(&format!("spec.signerName={}", kubelet::SIGNER));
+        edge_kube::watch_with(csrs.clone(), kubelet, "certificatesigningrequests").boxed()
+    };
+    let (mut events, mut secret_events, mut csr_events) =
+        (watch_requests(), watch_secret(), watch_csrs());
+    let mut secret = CaSecret::default();
+    let mut source: Option<Source> = None;
     let mut pending = BTreeMap::new();
     let mut issued = BTreeMap::new();
+    let mut kubelet_csrs = kubelet::Pending::default();
     let mut published: Option<(String, Instant)> = None;
     let mut bundle_outage = edge_common::Outage::default();
     let mut status_outage = edge_common::Outage::default();
     let mut pod_outage = edge_common::Outage::default();
-    let mut heartbeat_outage = edge_common::Outage::default();
-    let mut beat = || heartbeat_outage.observe("heartbeat", &heartbeat.beat());
+    let mut approval_outage = edge_common::Outage::default();
     let mut tick = tokio::time::interval(RETRY_INTERVAL);
     loop {
-        beat();
+        heartbeat.beat();
         tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(ev)) => apply_event(&mut pending, &mut issued, ev),
                 Some(Err(_)) => continue,
-                None => events = edge_kube::watch(requests.clone(), "podcertificaterequests").boxed(),
+                None => events = watch_requests(),
+            },
+            ev = secret_events.next() => match ev {
+                Some(Ok(ev)) => secret.apply(ev),
+                Some(Err(e)) => secret.failed(&e),
+                None => secret_events = watch_secret(),
+            },
+            ev = csr_events.next() => match ev {
+                Some(Ok(ev)) => kubelet_csrs.apply(ev),
+                Some(Err(_)) => continue,
+                None => csr_events = watch_csrs(),
             },
             _ = tick.tick() => {}
         }
 
         let now = now();
-        source.refresh(now)?;
+        let approved = approve_kubelets(&csrs, &nodes, &mut kubelet_csrs, heartbeat, now).await;
+        approval_outage.observe("certificatesigningrequest approval", &approved);
+
+        let Some(known) = secret.known() else {
+            continue;
+        };
+        let source = match &mut source {
+            Some(s) => {
+                s.refresh(known, now)?;
+                s
+            }
+            None => source.insert(Source::new(known, now)?),
+        };
         let root = source.ca.root();
         if bundle_due(&published, root) {
             let r = bounded(publish(&bundles, root)).await;
-            beat();
+            heartbeat.beat();
             bundle_outage.observe("clustertrustbundle", &r);
             if r.is_ok() {
                 published = Some((root.to_string(), Instant::now()));
@@ -156,7 +229,7 @@ async fn serve(
                 &Patch::Merge(serde_json::json!({ "status": status })),
             ))
             .await;
-            beat();
+            heartbeat.beat();
             status_outage.observe("podcertificaterequest status", &r);
             if r.is_ok() {
                 log_verdict(pcr, &status);
@@ -171,7 +244,7 @@ async fn serve(
         for (key, cert) in issued.iter().filter(|(_, c)| c.dated_ahead(now)) {
             let pods = Api::<Pod>::namespaced(client.clone(), &key.0);
             let r = bounded(recreate(&pods, cert)).await;
-            beat();
+            heartbeat.beat();
             pod_outage.observe("pod deletion", &r);
             if let Ok(deleted) = r {
                 if deleted {
@@ -189,6 +262,58 @@ async fn serve(
             issued.remove(&key);
         }
     }
+}
+
+/// A request that is not the kubelet's own stays pending: its Node may yet
+/// report the names it asks for.
+async fn approve_kubelets(
+    csrs: &Api<CertificateSigningRequest>,
+    nodes: &Api<Node>,
+    pending: &mut kubelet::Pending,
+    heartbeat: &Heartbeat,
+    now: i64,
+) -> kube::Result<()> {
+    let mut result = Ok(());
+    let names: Vec<String> = pending.0.keys().cloned().collect();
+    for name in names {
+        let csr = &pending.0[&name].0;
+        let node = match kubelet::requesting_node(csr) {
+            Ok(n) => n,
+            Err(why) => {
+                pending.passed_over(&name, why);
+                continue;
+            }
+        };
+        let got = bounded(nodes.get_opt(&node)).await;
+        heartbeat.beat();
+        let verdict = match got {
+            Ok(Some(n)) => kubelet::check_names(csr, &n),
+            Ok(None) => Err(format!("no Node {node}")),
+            Err(e) => {
+                result = Err(e);
+                continue;
+            }
+        };
+        if let Err(why) = verdict {
+            pending.passed_over(&name, why);
+            continue;
+        }
+        let r = bounded(csrs.patch_approval(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(kubelet::approval(time(now))),
+        ))
+        .await;
+        heartbeat.beat();
+        match r {
+            Ok(_) => {
+                tracing::info!(csr = name, node, "kubelet serving certificate approved");
+                pending.0.remove(&name);
+            }
+            Err(e) => result = Err(e),
+        }
+    }
+    result
 }
 
 async fn bounded<T>(call: impl Future<Output = kube::Result<T>>) -> kube::Result<T> {
@@ -367,7 +492,7 @@ fn log_verdict(pcr: &PodCertificateRequest, status: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ca::tests::{NOW, csr, file, file_ca, root, scratch};
+    use crate::ca::tests::{NOW, TestCert, csr, file_ca, root, secret};
     use rcgen::PKCS_ECDSA_P256_SHA256;
     use rustls_pki_types::pem::PemObject;
     use x509_parser::prelude::*;
@@ -721,33 +846,85 @@ mod tests {
     }
 
     type Writes = std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
-
     type Watch = tokio::sync::mpsc::UnboundedSender<serde_json::Value>;
 
-    async fn fake_apiserver(pcr: serde_json::Value) -> (String, Writes, Watch) {
+    /// What the fake apiserver lists; writes are recorded and echoed.
+    #[derive(Clone, Default)]
+    struct World {
+        pcrs: Vec<serde_json::Value>,
+        secret: Option<serde_json::Value>,
+        secrets_forbidden: bool,
+        csrs: Vec<serde_json::Value>,
+        node: Option<serde_json::Value>,
+        hang_writes: bool,
+    }
+
+    struct Watches {
+        pcrs: Watch,
+        secrets: Watch,
+    }
+
+    const LISTED: [&str; 3] = [
+        "podcertificaterequests",
+        "secrets",
+        "certificatesigningrequests",
+    ];
+
+    async fn fake_apiserver(world: World) -> (String, Writes, Watches) {
         use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+        use std::sync::{Arc, Mutex};
         type Body = BoxBody<bytes::Bytes, std::convert::Infallible>;
+        type Rx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>>;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let writes = Writes::default();
         let recorded = writes.clone();
-        let (watch, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+        let (pcrs, pcr_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (secrets, secret_rx) = tokio::sync::mpsc::unbounded_channel();
+        let streams: Arc<Vec<(&str, Rx)>> = Arc::new(vec![
+            ("podcertificaterequests", Arc::new(Mutex::new(Some(pcr_rx)))),
+            ("secrets", Arc::new(Mutex::new(Some(secret_rx)))),
+        ]);
         tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
-                let (recorded, pcr, rx) = (recorded.clone(), pcr.clone(), rx.clone());
+                let (recorded, world, streams) = (recorded.clone(), world.clone(), streams.clone());
                 let svc = hyper::service::service_fn(
                     move |req: hyper::Request<hyper::body::Incoming>| {
-                        let (recorded, pcr, rx) = (recorded.clone(), pcr.clone(), rx.clone());
+                        let (recorded, world, streams) =
+                            (recorded.clone(), world.clone(), streams.clone());
                         async move {
                             let (method, uri) = (req.method().to_string(), req.uri().to_string());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             let json = |v: &serde_json::Value| -> Body {
                                 Full::new(bytes::Bytes::from(v.to_string())).boxed()
                             };
-                            let resp = if method == "GET" && uri.contains("watch=") {
-                                let frames = match rx.lock().unwrap().take() {
+                            let list = |items: Vec<serde_json::Value>| {
+                                json(&serde_json::json!({
+                                    "apiVersion": "v1", "kind": "List",
+                                    "metadata": { "resourceVersion": "1" },
+                                    "items": items,
+                                }))
+                            };
+                            let status = |code: u16| {
+                                json(&serde_json::json!({
+                                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                    "code": code, "reason": "", "message": "",
+                                }))
+                            };
+                            let mut code = 200;
+                            let resp = if method == "GET"
+                                && uri.contains("/secrets")
+                                && world.secrets_forbidden
+                            {
+                                code = 403;
+                                status(403)
+                            } else if method == "GET" && uri.contains("watch=") {
+                                let rx = streams
+                                    .iter()
+                                    .find(|(what, _)| uri.contains(what))
+                                    .and_then(|(_, rx)| rx.lock().unwrap().take());
+                                let frames = match rx {
                                     Some(rx) => futures::stream::unfold(rx, |mut rx| async move {
                                         let line = format!("{}\n", rx.recv().await?);
                                         let frame = hyper::body::Frame::data(line.into());
@@ -757,29 +934,44 @@ mod tests {
                                     None => futures::stream::pending().right_stream(),
                                 };
                                 BodyExt::boxed(StreamBody::new(frames))
+                            } else if method == "GET" && uri.contains("/nodes/") {
+                                match &world.node {
+                                    Some(n) => json(n),
+                                    None => {
+                                        code = 404;
+                                        status(404)
+                                    }
+                                }
                             } else if method == "GET" {
-                                json(&serde_json::json!({
-                                    "apiVersion": "certificates.k8s.io/v1",
-                                    "kind": "PodCertificateRequestList",
-                                    "metadata": { "resourceVersion": "1" },
-                                    "items": [pcr],
-                                }))
+                                assert!(LISTED.iter().any(|l| uri.contains(l)), "{uri}");
+                                list(if uri.contains("/secrets") {
+                                    world.secret.clone().into_iter().collect()
+                                } else if uri.contains("certificatesigningrequests") {
+                                    world.csrs.clone()
+                                } else {
+                                    world.pcrs.clone()
+                                })
                             } else {
+                                if world.hang_writes {
+                                    std::future::pending::<()>().await;
+                                }
                                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
                                 let pod = serde_json::json!({ "apiVersion": "v1", "kind": "Pod" });
                                 let echo = if uri.contains("clustertrustbundles") {
-                                    &v
+                                    v.clone()
                                 } else if uri.contains("/pods/") {
-                                    &pod
+                                    pod
+                                } else if uri.contains("certificatesigningrequests") {
+                                    world.csrs[0].clone()
                                 } else {
-                                    &pcr
+                                    world.pcrs[0].clone()
                                 };
-                                let resp = json(echo);
                                 recorded.lock().unwrap().push((method, uri, v));
-                                resp
+                                json(&echo)
                             };
                             Ok::<_, std::convert::Infallible>(
                                 hyper::Response::builder()
+                                    .status(code)
                                     .header("content-type", "application/json")
                                     .body(resp)
                                     .unwrap(),
@@ -793,41 +985,83 @@ mod tests {
                 );
             }
         });
-        (url, writes, watch)
+        (url, writes, Watches { pcrs, secrets })
+    }
+
+    fn ca_secret(r: &TestCert) -> serde_json::Value {
+        let mut s = serde_json::to_value(secret(r, &[r])).unwrap();
+        s["metadata"] = serde_json::json!({
+            "name": ca::SECRET, "namespace": "default", "resourceVersion": "2",
+        });
+        s
+    }
+
+    fn pcr_json(
+        name: &str,
+        pod: &str,
+        uid: &str,
+        der: Vec<u8>,
+        status: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "PodCertificateRequest",
+            "metadata": { "name": name, "namespace": "edge", "resourceVersion": "1" },
+            "spec": {
+                "signerName": SIGNER, "podName": pod, "podUID": uid,
+                "serviceAccountName": "edge-gateway", "serviceAccountUID": "s",
+                "nodeName": "n", "nodeUID": "nu", "maxExpirationSeconds": 3600,
+                "stubPKCS10Request": k8s_openapi::ByteString(der),
+                "unverifiedUserAnnotations": { "edge.meridian/dns-names": "example.lan" },
+            },
+            "status": status,
+        })
+    }
+
+    fn start(url: &str) -> (tokio::task::JoinHandle<anyhow::Result<()>>, Heartbeat) {
+        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
+        let hb = Heartbeat::default();
+        let beat = hb.clone();
+        let task = tokio::spawn(async move { serve(client, &unit(), &beat).await });
+        (task, hb)
+    }
+
+    fn leaf_of(body: &serde_json::Value) -> Vec<u8> {
+        let chain = body["status"]["certificateChain"].as_str().unwrap();
+        rustls_pki_types::CertificateDer::from_pem_slice(chain.as_bytes())
+            .unwrap()
+            .to_vec()
+    }
+
+    fn status_writes(writes: &Writes) -> Vec<(String, String, serde_json::Value)> {
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.1.contains("/status"))
+            .cloned()
+            .collect()
     }
 
     #[tokio::test]
     async fn answers_once_and_publishes_root() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (key, der) = csr(&PKCS_ECDSA_P256_SHA256);
-        let pcr = serde_json::json!({
-            "apiVersion": "certificates.k8s.io/v1",
-            "kind": "PodCertificateRequest",
-            "metadata": { "name": "gw-1", "namespace": "edge", "resourceVersion": "1" },
-            "spec": {
-                "signerName": SIGNER, "podName": "gw", "podUID": "u",
-                "serviceAccountName": "edge-gateway", "serviceAccountUID": "s",
-                "nodeName": "n", "nodeUID": "nu", "maxExpirationSeconds": 3600,
-                "stubPKCS10Request": k8s_openapi::ByteString(der),
-                "unverifiedUserAnnotations": { "edge.meridian/dns-names": "example.lan" },
-            },
-        });
-        let (url, writes, _watch) = fake_apiserver(pcr).await;
-        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
-        let (_tmp, path) = scratch();
         let r = root("r", now() - 60, now() + 86_400 * 365);
-        std::fs::write(&path, file(&r, &[&r])).unwrap();
-        let source = Source::open(&path, now()).unwrap();
-        let heartbeat = Heartbeat::new(path.parent().unwrap());
-        let task = tokio::spawn(async move { serve(client, &unit(), source, &heartbeat).await });
+        let (url, writes, _watch) = fake_apiserver(World {
+            pcrs: vec![pcr_json("gw-1", "gw", "u", der, serde_json::json!({}))],
+            secret: Some(ca_secret(&r)),
+            ..World::default()
+        })
+        .await;
+        let (task, _hb) = start(&url);
 
         // Long enough for the retry tick to answer a request twice if it would.
         tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
         task.abort();
-        let writes = writes.lock().unwrap().clone();
-        let status: Vec<_> = writes.iter().filter(|w| w.1.contains("/status")).collect();
-        assert_eq!(status.len(), 1, "{writes:?}");
-        let (method, uri, body) = status[0];
+        let status = status_writes(&writes);
+        assert_eq!(status.len(), 1, "{status:?}");
+        let (method, uri, body) = &status[0];
         assert_eq!(method, "PATCH");
         assert!(
             uri.starts_with(
@@ -836,14 +1070,18 @@ mod tests {
             "{uri}"
         );
         assert_eq!(body["status"]["conditions"][0]["type"], "Issued");
-        let chain = body["status"]["certificateChain"].as_str().unwrap();
-        let der = rustls_pki_types::CertificateDer::from_pem_slice(chain.as_bytes()).unwrap();
+        let der = leaf_of(body);
         let (_, leaf) = parse_x509_certificate(&der).unwrap();
         assert_eq!(
             leaf.public_key().subject_public_key.data.as_ref(),
             key.public_key_raw()
         );
+        let ca_der = rustls_pki_types::CertificateDer::from_pem_slice(r.pem.as_bytes()).unwrap();
+        let (_, ca) = parse_x509_certificate(&ca_der).unwrap();
+        leaf.verify_signature(Some(ca.public_key()))
+            .expect("signed by the Secret's CA");
 
+        let writes = writes.lock().unwrap().clone();
         let bundle: Vec<_> = writes
             .iter()
             .filter(|w| w.1.contains("clustertrustbundles"))
@@ -870,24 +1108,122 @@ mod tests {
         .unwrap_or_else(|_| panic!("{:?}", writes.lock().unwrap()));
     }
 
+    fn bundles(w: &[(String, String, serde_json::Value)]) -> Vec<String> {
+        w.iter()
+            .filter(|w| w.1.contains("clustertrustbundles"))
+            .map(|w| w.2["spec"]["trustBundle"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn missing_secret_signs_ephemeral_until_it_appears() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (url, writes, watch) = fake_apiserver(World {
+            pcrs: vec![pcr_json(
+                "gw-1",
+                "gw",
+                "u",
+                csr(&PKCS_ECDSA_P256_SHA256).1,
+                serde_json::json!({}),
+            )],
+            ..World::default()
+        })
+        .await;
+        let (task, _hb) = start(&url);
+        wait_for_writes(&writes, |w| {
+            !bundles(w).is_empty() && w.iter().any(|w| w.1.contains("/status"))
+        })
+        .await;
+        let ephemeral = bundles(&writes.lock().unwrap())[0].clone();
+        assert_eq!(
+            status_writes(&writes)[0].2["status"]["conditions"][0]["type"],
+            "Issued",
+            "a missing Secret still signs"
+        );
+
+        let r = root("r", now() - 60, now() + 86_400 * 365);
+        assert_ne!(ephemeral, r.pem);
+        watch
+            .secrets
+            .send(serde_json::json!({ "type": "ADDED", "object": ca_secret(&r) }))
+            .unwrap();
+        wait_for_writes(&writes, |w| bundles(w).last() == Some(&r.pem)).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_secret_signs_ephemeral() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (url, writes, _watch) = fake_apiserver(World {
+            secrets_forbidden: true,
+            ..World::default()
+        })
+        .await;
+        let (task, _hb) = start(&url);
+        wait_for_writes(&writes, |w| !bundles(w).is_empty()).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn approves_only_the_kubelets_own_request() {
+        use crate::kubelet::tests::{kubelet_csr, node, own_csr, pem};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut foreign = kubelet_csr(
+            "foreign",
+            pem(
+                &[
+                    (rcgen::DnType::CommonName, "system:node:node-1"),
+                    (rcgen::DnType::OrganizationName, "system:nodes"),
+                ],
+                vec![rcgen::SanType::DnsName("elsewhere".try_into().unwrap())],
+            ),
+        );
+        foreign.metadata.resource_version = Some("1".into());
+        let mut own = own_csr("own");
+        own.metadata.resource_version = Some("1".into());
+        let (url, writes, _watch) = fake_apiserver(World {
+            csrs: vec![
+                serde_json::to_value(own).unwrap(),
+                serde_json::to_value(foreign).unwrap(),
+            ],
+            node: Some(
+                serde_json::to_value(node(&["node-1", "192.0.2.10", "2001:db8::10"])).unwrap(),
+            ),
+            ..World::default()
+        })
+        .await;
+        let (task, _hb) = start(&url);
+        let approvals = |w: &[(String, String, serde_json::Value)]| {
+            w.iter()
+                .filter(|w| w.1.contains("/approval"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        wait_for_writes(&writes, |w| !approvals(w).is_empty()).await;
+        // Long enough for the retry tick to approve twice, or the other, if it would.
+        tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
+        task.abort();
+        let approvals = approvals(&writes.lock().unwrap());
+        assert_eq!(approvals.len(), 1, "{approvals:?}");
+        let (method, uri, body) = &approvals[0];
+        assert_eq!(method, "PATCH");
+        assert!(
+            uri.starts_with("/apis/certificates.k8s.io/v1/certificatesigningrequests/own/approval"),
+            "{uri}"
+        );
+        let c = &body["status"]["conditions"][0];
+        assert_eq!(
+            (&c["type"], &c["status"]),
+            (&"Approved".into(), &"True".into())
+        );
+    }
+
     #[tokio::test]
     async fn deletes_pod_dated_ahead_once() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let year = now() + 365 * 86_400;
         let pcr = |name: &str, pod: &str, uid: &str, status: serde_json::Value| {
-            serde_json::json!({
-                "apiVersion": "certificates.k8s.io/v1",
-                "kind": "PodCertificateRequest",
-                "metadata": { "name": name, "namespace": "edge", "resourceVersion": "1" },
-                "spec": {
-                    "signerName": SIGNER, "podName": pod, "podUID": uid,
-                    "serviceAccountName": "edge-gateway", "serviceAccountUID": "s",
-                    "nodeName": "n", "nodeUID": "nu", "maxExpirationSeconds": 3600,
-                    "stubPKCS10Request": k8s_openapi::ByteString(csr(&PKCS_ECDSA_P256_SHA256).1),
-                    "unverifiedUserAnnotations": { "edge.meridian/dns-names": "example.lan" },
-                },
-                "status": status,
-            })
+            pcr_json(name, pod, uid, csr(&PKCS_ECDSA_P256_SHA256).1, status)
         };
         let ahead = serde_json::to_value(settle(
             &serde_json::from_value(pcr("gw-a-1", "gw-a", "old", serde_json::json!({}))).unwrap(),
@@ -896,14 +1232,14 @@ mod tests {
             year,
         ))
         .unwrap();
-        let (url, writes, watch) = fake_apiserver(pcr("gw-a-1", "gw-a", "old", ahead)).await;
-        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
-        let (_tmp, path) = scratch();
         let r = root("r", now() - 60, year + 86_400);
-        std::fs::write(&path, file(&r, &[&r])).unwrap();
-        let source = Source::open(&path, now()).unwrap();
-        let heartbeat = Heartbeat::new(path.parent().unwrap());
-        let task = tokio::spawn(async move { serve(client, &unit(), source, &heartbeat).await });
+        let (url, writes, watch) = fake_apiserver(World {
+            pcrs: vec![pcr("gw-a-1", "gw-a", "old", ahead)],
+            secret: Some(ca_secret(&r)),
+            ..World::default()
+        })
+        .await;
+        let (task, _hb) = start(&url);
 
         let deletes = |w: &[(String, String, serde_json::Value)]| {
             w.iter()
@@ -914,6 +1250,7 @@ mod tests {
         wait_for_writes(&writes, |w| !deletes(w).is_empty()).await;
         let replacement = pcr("gw-b-1", "gw-b", "new", serde_json::json!({}));
         watch
+            .pcrs
             .send(serde_json::json!({ "type": "ADDED", "object": replacement }))
             .unwrap();
         wait_for_writes(&writes, |w| w.iter().any(|w| w.1.contains("gw-b-1/status"))).await;
@@ -929,6 +1266,7 @@ mod tests {
         answered["status"] = issued;
         answered["metadata"]["resourceVersion"] = "2".into();
         watch
+            .pcrs
             .send(serde_json::json!({ "type": "MODIFIED", "object": answered }))
             .unwrap();
 
@@ -945,37 +1283,13 @@ mod tests {
         assert_eq!(body["preconditions"], serde_json::json!({ "uid": "old" }));
     }
 
-    fn signer_at(url: &str) -> (Client, Source, tempfile::TempDir) {
-        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
-        let (dir, path) = scratch();
-        let r = root("r", now() - 60, now() + 86_400 * 365);
-        std::fs::write(&path, file(&r, &[&r])).unwrap();
-        let source = Source::open(&path, now()).unwrap();
-        (client, source, dir)
-    }
-
-    fn stamp(dir: &Path) -> Option<u128> {
-        std::fs::read_to_string(dir.join("heartbeat"))
-            .ok()?
-            .parse()
-            .ok()
-    }
-
-    async fn max_heartbeat_age(dir: &Path, span: Duration) -> Duration {
-        let (mut first, mut oldest) = (None, Duration::ZERO);
-        tokio::time::timeout(span * 2, async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let Some(s) = stamp(dir) else { continue };
-                let first = *first.get_or_insert(s);
-                oldest = oldest.max(heartbeat::monotonic() - Duration::from_millis(s as u64));
-                if s - first >= span.as_millis() {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("heartbeat stuck at {:?}", stamp(dir)));
+    async fn max_heartbeat_age(hb: &Heartbeat, span: Duration) -> Duration {
+        let mut oldest = Duration::ZERO;
+        let until = tokio::time::Instant::now() + span;
+        while tokio::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            oldest = oldest.max(hb.age());
+        }
         oldest
     }
 
@@ -987,11 +1301,8 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let (client, source, tmp) = signer_at(&format!("http://127.0.0.1:{port}"));
-        let dir = tmp.path();
-        let heartbeat = Heartbeat::new(dir);
-        let task = tokio::spawn(async move { serve(client, &unit(), source, &heartbeat).await });
-        let oldest = max_heartbeat_age(dir, RETRY_INTERVAL).await;
+        let (task, hb) = start(&format!("http://127.0.0.1:{port}"));
+        let oldest = max_heartbeat_age(&hb, RETRY_INTERVAL * 2).await;
         task.abort();
         assert!(
             oldest <= RETRY_INTERVAL + Duration::from_secs(1),
@@ -1002,44 +1313,45 @@ mod tests {
     #[tokio::test]
     async fn hung_apiserver_keeps_beating() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let mut unanswered = Vec::new();
-            loop {
-                unanswered.push(listener.accept().await.unwrap().0);
-            }
-        });
-        let (client, source, tmp) = signer_at(&url);
-        let dir = tmp.path();
-        let heartbeat = Heartbeat::new(dir);
-        let task = tokio::spawn(async move { serve(client, &unit(), source, &heartbeat).await });
-        let oldest = max_heartbeat_age(dir, CALL_TIMEOUT).await;
+        let r = root("r", now() - 60, now() + 86_400 * 365);
+        let (url, writes, _watch) = fake_apiserver(World {
+            secret: Some(ca_secret(&r)),
+            hang_writes: true,
+            ..World::default()
+        })
+        .await;
+        let (task, hb) = start(&url);
+        let oldest = max_heartbeat_age(&hb, CALL_TIMEOUT * 2).await;
         task.abort();
+        assert!(
+            oldest > CALL_TIMEOUT - Duration::from_secs(1),
+            "the bundle write never hung: {oldest:?}"
+        );
         assert!(
             oldest <= CALL_TIMEOUT + Duration::from_secs(1),
             "{oldest:?}"
         );
-        assert!(heartbeat::check(dir, heartbeat::monotonic()).is_ok());
+        assert!(oldest < STALE_AFTER);
+        assert!(writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn stalled_loop_stops_beating() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let (url, _writes, _watch) = fake_apiserver(serde_json::json!({})).await;
-        let (client, source, tmp) = signer_at(&url);
-        let dir = tmp.path();
-        let heartbeat = Heartbeat::new(dir);
+        let (url, _writes, _watch) = fake_apiserver(World::default()).await;
+        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
+        let hb = Heartbeat::default();
         let unit = unit();
-        let mut serving = std::pin::pin!(serve(client, &unit, source, &heartbeat));
+        let mut serving = std::pin::pin!(serve(client, &unit, &hb));
         let poll = Duration::from_millis(500);
 
+        let beating = poll * 2;
         assert!(tokio::time::timeout(poll, serving.as_mut()).await.is_err());
-        let before = stamp(dir).expect("first pass beat");
+        assert!(hb.age() < beating, "first pass beat");
         tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
-        assert_eq!(stamp(dir), Some(before), "beat while stalled");
+        assert!(hb.age() > RETRY_INTERVAL, "beat while stalled");
 
         assert!(tokio::time::timeout(poll, serving.as_mut()).await.is_err());
-        assert!(stamp(dir).unwrap() > before, "no beat once running again");
+        assert!(hb.age() < beating, "no beat once running again");
     }
 }

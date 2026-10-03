@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 mod durable;
+pub mod health;
 mod logging;
 pub mod mount;
 mod outage;

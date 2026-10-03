@@ -253,10 +253,10 @@ pub fn scope(s: Scope) -> Rules {
     }
 }
 
-pub fn idle(proc_dir: &Path, cgroup_root: &Path) -> Rules {
+pub fn idle(proc_dir: &Path, cgroup_root: &Path, health: &str) -> Rules {
     let (rules, api) = kube(Rules::default());
     Rules {
-        bind_tcp: Some(vec![]),
+        bind_tcp: Some(port(health).into_iter().collect()),
         connect_tcp: api.map(|api| vec![api]),
         ..rules
             .with(Access::Read, [proc_dir])
@@ -264,15 +264,12 @@ pub fn idle(proc_dir: &Path, cgroup_root: &Path) -> Rules {
     }
 }
 
-/// The directory, not the file: the CA file is replaced by rename.
-pub fn signer(ca: &Path, heartbeat: &Path) -> Rules {
+pub fn signer(health: &str) -> Rules {
     let (rules, api) = kube(Rules::default());
     Rules {
-        bind_tcp: Some(vec![]),
+        bind_tcp: Some(port(health).into_iter().collect()),
         connect_tcp: api.map(|api| vec![api]),
         ..rules
-            .with(Access::Read, [dir_of(ca)])
-            .with(Access::Write, [heartbeat])
     }
 }
 
@@ -712,11 +709,15 @@ mod tests {
         std::fs::create_dir_all(d.join("cg/pod")).unwrap();
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
-        let port = free_port();
+        let (port, health) = (free_port(), free_port());
         sandboxed(
             || {
                 set_api_port(api);
-                idle(Path::new("/proc"), &d.join("cg"))
+                idle(
+                    Path::new("/proc"),
+                    &d.join("cg"),
+                    &format!("0.0.0.0:{health}"),
+                )
             },
             || {
                 allowed("read pid 1's comm", read("/proc/1/comm"))?;
@@ -725,6 +726,7 @@ mod tests {
                 denied("read outside", read(&secret))?;
                 allowed("dial the apiserver", dial(api))?;
                 denied("dial another port", dial(unlisted))?;
+                allowed("bind its health port", bind(health))?;
                 denied("bind", bind(port))
             },
         );
@@ -735,27 +737,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         let secret = outside(d);
-        let ca = d.join("etc/edge-signer/ca.pem");
-        std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
-        std::fs::write(&ca, b"ca").unwrap();
-        let heartbeat = d.join("run/edge-signer");
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
-        let port = free_port();
+        let (port, health) = (free_port(), free_port());
         sandboxed(
             || {
                 set_api_port(api);
-                signer(&ca, &heartbeat)
+                signer(&format!("0.0.0.0:{health}"))
             },
             || {
-                allowed("read the CA", read(&ca))?;
-                allowed("write the heartbeat", write_in(&heartbeat))?;
-                denied("write beside the heartbeat", write_in(d.join("run")))?;
-                denied("write beside it", write_in(ca.parent().unwrap()))?;
-                denied("write over it", std::fs::write(&ca, b"x"))?;
                 denied("read outside", read(&secret))?;
+                denied("write outside", write_in(d))?;
                 allowed("dial the apiserver", dial(api))?;
                 denied("dial another port", dial(unlisted))?;
+                allowed("bind its health port", bind(health))?;
                 denied("bind", bind(port))
             },
         );

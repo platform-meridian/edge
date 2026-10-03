@@ -254,8 +254,25 @@ where
         + 'static,
     K::DynamicType: Default,
 {
+    watch_with(api, watcher::Config::default(), what)
+}
+
+pub fn watch_with<K>(
+    api: Api<K>,
+    config: watcher::Config,
+    what: &'static str,
+) -> impl futures::Stream<Item = Result<Event<K>, watcher::Error>> + Send
+where
+    K: kube::Resource
+        + Clone
+        + std::fmt::Debug
+        + k8s_openapi::serde::de::DeserializeOwned
+        + Send
+        + 'static,
+    K::DynamicType: Default,
+{
     let mut outage = edge_common::Outage::default();
-    watcher(api, watcher::Config::default())
+    watcher(api, config)
         .default_backoff()
         .inspect(move |r| outage.observe(what, r))
 }
