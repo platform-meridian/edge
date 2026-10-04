@@ -2,7 +2,7 @@
 //! the sums name. Nothing past the first two entries is written anywhere until
 //! the signature has verified against the pinned key.
 //!
-//! - `MANIFEST`: `KEY=value` lines. `FORMAT=2` (`3` with `refs`), `STACK_TAG`, `STACK_DIGEST`,
+//! - `MANIFEST`: `KEY=value` lines. `FORMAT=4` ([`FORMAT`]), `STACK_TAG`, `STACK_DIGEST`,
 //!   `INSTALLER_REF` (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version
 //!   anti-rollback compares), `SECUREBOOT`; optionally `STACK_PATH`, and
 //!   `LOCK_<KEY>=v`, which the unit's stack lock must match.
@@ -12,8 +12,8 @@
 //! - `images/`: an OCI image layout holding every image, the installer and the
 //!   stack artifact, each named in its index by `io.containerd.image.name`
 //!   (`oci`).
-//! - optionally `refs`: every ref the release runs, one per line, when the
-//!   layout carries only those the unit lacks (a partial bundle).
+//! - `refs`: every ref the release runs, one per line. The layout carries
+//!   some or all of them; the unit must already hold the rest.
 //! - `NOTES.md`, optional: release notes for a person, at most 64 KiB.
 //! - `fluxinstance.yaml`, optional: the FluxInstance the release runs on,
 //!   applied once the stack has brought the operator that knows it.
@@ -51,6 +51,9 @@ pub const IMAGES: &str = "images";
 pub const REFS: &str = "refs";
 pub const NOTES: &str = "NOTES.md";
 pub const INSTANCE: &str = "fluxinstance.yaml";
+
+/// The one layout read and written: any other `FORMAT` is refused.
+pub const FORMAT: &str = "4";
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIG: u64 = 64 << 10;
@@ -334,7 +337,26 @@ fn head_of(start: &mut impl Read, verifier: &Verifier) -> anyhow::Result<Head> {
         }
     }
     head.manifest = manifest.unwrap_or_default();
+    signed_format(&sums, &head.manifest)?;
     Ok(head)
+}
+
+fn format_check(m: &Manifest) -> anyhow::Result<()> {
+    match m.get("FORMAT").map(String::as_str) {
+        Some(FORMAT) => Ok(()),
+        Some(f) => bail!("the bundle is format {f}, and only format {FORMAT} is read: rebuild it"),
+        None => bail!("the bundle names no FORMAT, and only format {FORMAT} is read: rebuild it"),
+    }
+}
+
+/// A bundle of another format is refused as that, before what it lacks for this one.
+fn signed_format(sums: &Sums, m: &Manifest) -> anyhow::Result<()> {
+    format_check(m)?;
+    ensure!(
+        sums.contains_key(Path::new(REFS)),
+        "the signed sums do not cover {REFS}"
+    );
+    Ok(())
 }
 
 struct Counting<'a, R> {
@@ -401,7 +423,9 @@ fn unpack_into(tar: impl Read, dest: &Path, verifier: &Verifier) -> anyhow::Resu
         );
     }
     sync_fs(dest)?;
-    parse_manifest(&std::fs::read_to_string(dest.join(MANIFEST))?)
+    let manifest = parse_manifest(&std::fs::read_to_string(dest.join(MANIFEST))?)?;
+    signed_format(&sums, &manifest)?;
+    Ok(manifest)
 }
 
 /// An unpacked bundle's FluxInstance, if it carries one.
@@ -458,33 +482,19 @@ fn sync_fs(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// What a unit checks of an unpacked bundle before it moves: a patch that
-/// carries nothing the unit keeps, and a layout naming at least one image.
-/// Returns the layout's refs.
+/// carries nothing the unit keeps, and a layout naming at least one image,
+/// each of them in `refs`. Returns the layout's refs.
 pub fn check(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
     machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
-    let refs = layout_refs(&dir.join(IMAGES))?;
-    ensure!(!refs.is_empty(), "the image layout names no image");
-    if let Some(listed) = listed_refs(dir)? {
-        unlisted(&refs, &listed)?;
-    }
-    Ok(refs)
+    let carried = layout_refs(&dir.join(IMAGES))?;
+    ensure!(!carried.is_empty(), "the image layout names no image");
+    unlisted(&carried, &release_refs(dir)?)?;
+    Ok(carried)
 }
 
-/// Every ref the release runs: its `refs`, else its layout's.
+/// Every ref the release runs: an unpacked bundle's `refs`.
 pub fn release_refs(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
-    match listed_refs(dir)? {
-        Some(r) => Ok(r),
-        None => layout_refs(&dir.join(IMAGES)),
-    }
-}
-
-/// An unpacked bundle's `refs`, if it has one.
-pub fn listed_refs(dir: &Path) -> anyhow::Result<Option<BTreeSet<String>>> {
-    match std::fs::read_to_string(dir.join(REFS)) {
-        Ok(t) => parse_refs(&t).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).context("reading the refs"),
-    }
+    parse_refs(&std::fs::read_to_string(dir.join(REFS)).context("reading the refs")?)
 }
 
 fn parse_refs(text: &str) -> anyhow::Result<BTreeSet<String>> {
@@ -519,8 +529,8 @@ pub struct Contents<'a> {
     pub seed: &'a str,
     /// An OCI image layout ([`oci::from_flat_cache`]).
     pub images: &'a Path,
-    /// Every ref the release runs, when `images` carries only some of them.
-    pub refs: Option<&'a BTreeSet<String>>,
+    /// Every ref the release runs: `images` carries some or all of them.
+    pub refs: &'a BTreeSet<String>,
     /// Release notes for a person: [`NOTES`].
     pub notes: Option<&'a str>,
     /// The FluxInstance the release runs on: [`INSTANCE`].
@@ -562,24 +572,26 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
     }
     let carried = layout_refs(contents.images)?;
     ensure!(!carried.is_empty(), "the image layout names no image");
-    if let Some(refs) = contents.refs {
-        let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
-        unlisted(&carried, &parse_refs(&text)?)?;
+    let refs: String = contents.refs.iter().map(|r| format!("{r}\n")).collect();
+    unlisted(&carried, &parse_refs(&refs)?)?;
+    let mut manifest = contents.manifest.clone();
+    if let Some(f) = manifest.insert("FORMAT".into(), FORMAT.into()) {
+        ensure!(
+            f == FORMAT,
+            "the MANIFEST says FORMAT={f}; this writes {FORMAT}"
+        );
     }
     let mut files = BTreeMap::new();
     files.insert(
         MANIFEST.to_string(),
-        Source::Bytes(render_manifest(contents.manifest)?.into_bytes()),
+        Source::Bytes(render_manifest(&manifest)?.into_bytes()),
     );
     files.insert(
         PATCH.into(),
         Source::Bytes(contents.patch.as_bytes().into()),
     );
     files.insert(SEED.into(), Source::Bytes(contents.seed.as_bytes().into()));
-    if let Some(refs) = contents.refs {
-        let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
-        files.insert(REFS.into(), Source::Bytes(text.into_bytes()));
-    }
+    files.insert(REFS.into(), Source::Bytes(refs.into_bytes()));
     if let Some(i) = contents.instance {
         files.insert(INSTANCE.into(), Source::Bytes(i.as_bytes().into()));
     }
@@ -651,7 +663,7 @@ mod tests {
     use super::testkit::*;
     use super::*;
 
-    const MF: &str = "FORMAT=2\nSTACK_TAG=t2\n";
+    const MF: &str = "FORMAT=4\nSTACK_TAG=t2\n";
 
     struct Case {
         dir: tempfile::TempDir,
@@ -753,7 +765,7 @@ mod tests {
     #[test]
     fn resealed_sums_are_refused() {
         let c = Case::new();
-        std::fs::write(c.src().join(MANIFEST), "FORMAT=2\nSTACK_TAG=t9\n").unwrap();
+        std::fs::write(c.src().join(MANIFEST), "FORMAT=4\nSTACK_TAG=t9\n").unwrap();
         let (other, _) = keygen(c.dir.path(), "attacker");
         seal(&c.src(), &other, NAMESPACE);
         refused(&c, c.open(HEAD), "pinned update key");
@@ -830,11 +842,47 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_list_is_no_full_bundle() {
+    fn another_format_is_refused_by_name() {
+        for (mf, why) in [
+            (
+                "FORMAT=2\nSTACK_TAG=t2\n",
+                "the bundle is format 2, and only format 4 is read",
+            ),
+            (
+                "FORMAT=3\nSTACK_TAG=t2\n",
+                "the bundle is format 3, and only format 4 is read",
+            ),
+            ("STACK_TAG=t2\n", "names no FORMAT"),
+        ] {
+            let c = Case::new();
+            std::fs::write(c.src().join(MANIFEST), mf).unwrap();
+            std::fs::remove_file(c.src().join(REFS)).unwrap();
+            seal(&c.src(), &c.key, NAMESPACE);
+            refused(&c, c.open(HEAD), why);
+            let t = c.dir.path().join("b.tar");
+            let v = Verifier::new(&c.public, NAMESPACE).unwrap();
+            let e = format!("{:#}", read_head(File::open(&t).unwrap(), &v).unwrap_err());
+            assert!(e.contains(why), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_bundle_without_refs_is_refused() {
+        let c = Case::new();
+        std::fs::remove_file(c.src().join(REFS)).unwrap();
+        seal(&c.src(), &c.key, NAMESPACE);
+        refused(&c, c.open(HEAD), "do not cover refs");
+        let t = c.dir.path().join("b.tar");
+        let v = Verifier::new(&c.public, NAMESPACE).unwrap();
+        let e = format!("{:#}", read_head(File::open(&t).unwrap(), &v).unwrap_err());
+        assert!(e.contains("do not cover refs"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_list_is_refused() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(listed_refs(d.path()).unwrap(), None);
+        assert!(release_refs(d.path()).is_err());
         std::fs::write(d.path().join(REFS), b"\xff\xfe\n").unwrap();
-        assert!(listed_refs(d.path()).is_err());
         assert!(release_refs(d.path()).is_err());
     }
 
@@ -888,7 +936,7 @@ mod tests {
     #[test]
     fn a_manifest_renders_back_to_itself() {
         let m =
-            parse_manifest("FORMAT=2\nLOCK_A=x=y\nCOMPONENT_B=img:1 sha256:aa dirty=0\nEMPTY=\n")
+            parse_manifest("FORMAT=4\nLOCK_A=x=y\nCOMPONENT_B=img:1 sha256:aa dirty=0\nEMPTY=\n")
                 .unwrap();
         assert_eq!(parse_manifest(&render_manifest(&m).unwrap()).unwrap(), m);
         for (k, v) in [

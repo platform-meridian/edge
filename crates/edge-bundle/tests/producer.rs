@@ -6,8 +6,8 @@ use std::process::Command;
 use std::collections::BTreeSet;
 
 use edge_bundle::{
-    Contents, Manifest, SigningKey, Verifier, check, listed_refs, machineconfig, oci, read_head,
-    release_refs, unpack, write,
+    Contents, Manifest, SigningKey, Verifier, check, machineconfig, oci, read_head, release_refs,
+    unpack, write,
 };
 use sha2::{Digest, Sha256};
 
@@ -73,6 +73,8 @@ struct Build {
     manifest: Manifest,
     patch: String,
     refs: Vec<String>,
+    /// Every ref the release runs: the carried ones and one the unit holds.
+    all: BTreeSet<String>,
     images: PathBuf,
 }
 
@@ -89,12 +91,13 @@ impl Build {
         );
         oci::from_flat_cache(&dir.path().join("flat"), &dir.path().join("images"), &refs).unwrap();
         let manifest =
-            edge_bundle::parse_manifest("FORMAT=2\nSTACK_TAG=t2\nBUILT_EPOCH=2000\n").unwrap();
+            edge_bundle::parse_manifest("FORMAT=4\nSTACK_TAG=t2\nBUILT_EPOCH=2000\n").unwrap();
         Self {
             key: SigningKey::from_openssh(&private, NS).unwrap(),
             public,
             manifest,
             patch: machineconfig::strip(&build_config()).unwrap(),
+            all: refs.iter().cloned().collect(),
             refs,
             images: dir.path().join("images"),
             dir,
@@ -111,7 +114,7 @@ impl Build {
             patch: &self.patch,
             seed: "kind: ConfigMap\n",
             images: &self.images,
-            refs: None,
+            refs: &self.all,
             notes: None,
             instance: None,
         }
@@ -328,28 +331,47 @@ fn a_build_refuses_what_a_unit_would() {
 }
 
 #[test]
-fn a_partial_bundle_lists_what_it_does_not_carry() {
+fn full_and_partial_bundles_round_trip_in_the_one_format() {
     let b = Build::new();
-    let mut all: BTreeSet<String> = b.refs.iter().cloned().collect();
+    let mut all = b.all.clone();
     all.insert("registry.example/base:v1".into());
-    let mut c = b.contents();
-    c.refs = Some(&all);
-    let out = b.path("partial.tar");
-    write(&c, &b.key, 0, &out).unwrap();
-    b.open(&out).unwrap();
+    let unformatted: Manifest = b
+        .manifest
+        .iter()
+        .filter(|(k, _)| *k != "FORMAT")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let dest = b.path("unpacked");
-    let carried = check(&dest).unwrap();
-    assert_eq!(carried.into_iter().collect::<Vec<_>>(), b.refs);
-    assert_eq!(listed_refs(&dest).unwrap().as_ref(), Some(&all));
-    assert_eq!(release_refs(&dest).unwrap(), all);
+    for (name, refs) in [("full.tar", &b.all), ("partial.tar", &all)] {
+        let mut c = b.contents();
+        c.refs = refs;
+        c.manifest = &unformatted;
+        let out = b.path(name);
+        write(&c, &b.key, 0, &out).unwrap();
+        let m = b.open(&out).unwrap();
+        assert_eq!(m["FORMAT"], edge_bundle::FORMAT, "{name}");
+        assert_eq!(m, b.manifest, "{name}");
+        let carried = check(&dest).unwrap();
+        assert_eq!(carried.into_iter().collect::<Vec<_>>(), b.refs, "{name}");
+        assert_eq!(&release_refs(&dest).unwrap(), refs, "{name}");
+    }
+}
 
-    let full = b.write("full.tar");
-    b.open(&full).unwrap();
-    assert_eq!(listed_refs(&dest).unwrap(), None);
-    assert_eq!(
-        release_refs(&dest).unwrap().into_iter().collect::<Vec<_>>(),
-        b.refs
-    );
+#[test]
+fn a_build_writes_no_other_format() {
+    let b = Build::new();
+    let out = b.path("b.tar");
+    for f in ["2", "3", ""] {
+        let mut m = b.manifest.clone();
+        m.insert("FORMAT".into(), f.into());
+        let mut c = b.contents();
+        c.manifest = &m;
+        assert!(
+            err(write(&c, &b.key, 0, &out)).contains("this writes 4"),
+            "{f}"
+        );
+    }
+    assert!(!out.exists());
 }
 
 #[test]
@@ -358,10 +380,10 @@ fn a_list_must_name_every_carried_image() {
     let out = b.path("b.tar");
     let some: BTreeSet<String> = ["registry.example/base:v1".to_string()].into();
     let mut c = b.contents();
-    c.refs = Some(&some);
+    c.refs = &some;
     assert!(err(write(&c, &b.key, 0, &out)).contains("leaves out images the layout carries"));
     let none = BTreeSet::new();
-    c.refs = Some(&none);
+    c.refs = &none;
     assert!(err(write(&c, &b.key, 0, &out)).contains("names no image"));
     assert!(!out.exists());
 }

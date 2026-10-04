@@ -42,6 +42,11 @@ pub fn tree(dir: &Path, manifest: &str) {
     std::fs::write(dir.join("config-patch.yaml"), "version: v1alpha1\n").unwrap();
     std::fs::write(dir.join("seed.yaml"), "").unwrap();
     std::fs::write(
+        dir.join("refs"),
+        "registry.example/app:v2\nregistry.example/installer@sha256:bb\n",
+    )
+    .unwrap();
+    std::fs::write(
         dir.join("images/oci-layout"),
         r#"{"imageLayoutVersion":"1.0.0"}"#,
     )

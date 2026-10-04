@@ -328,7 +328,6 @@ pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
     use anyhow::ensure;
     let get = |k: &str| m.get(k).map(String::as_str).unwrap_or_default();
     for k in [
-        "FORMAT",
         "STACK_TAG",
         "STACK_DIGEST",
         "INSTALLER_REF",
@@ -338,11 +337,6 @@ pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
     ] {
         ensure!(!get(k).is_empty(), "the MANIFEST lacks {k}");
     }
-    ensure!(
-        matches!(get("FORMAT"), "2" | "3"),
-        "the bundle is format {}, not 2 or 3",
-        get("FORMAT")
-    );
     ensure!(
         get("INSTALLER_REF").contains("@sha256:"),
         "the MANIFEST names the installer by tag, not digest"
@@ -930,18 +924,6 @@ impl Engine {
         use anyhow::ensure;
         manifest_check(&rel.manifest)?;
         let dir = self.release_dir(&rel.sha256);
-        let listed = bundle::listed_refs(&dir)?.is_some();
-        match rel.get("FORMAT") {
-            "2" => ensure!(
-                !listed,
-                "a format 2 bundle carries every image, and this one lists refs"
-            ),
-            "3" => ensure!(
-                listed,
-                "a format 3 bundle lists its refs, and this one does not"
-            ),
-            f => anyhow::bail!("the bundle is format {f}, not 2 or 3"),
-        }
         let carried = bundle::layout_refs(&dir.join(bundle::IMAGES))?;
         let lacking: Vec<&str> = rel
             .refs

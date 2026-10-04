@@ -386,7 +386,7 @@ mod tests {
         assert!(e.to_string().contains("free"), "{e}");
     }
 
-    const MF: &str = "FORMAT=2\nSTACK_TAG=s2\nSTACK_DIGEST=sha256:11\nINSTALLER_REF=r/i:1@sha256:22\n\
+    const MF: &str = "FORMAT=4\nSTACK_TAG=s2\nSTACK_DIGEST=sha256:11\nINSTALLER_REF=r/i:1@sha256:22\n\
                       TALOS_VERSION=v1.14.1\nBUILT_EPOCH=2000\nSECUREBOOT=1\n";
 
     /// A bundle three chunks long, its head in the first.
@@ -447,7 +447,11 @@ mod tests {
         let up = checking(d.path(), &public);
         for (key, manifest, why) in [
             (&stranger, MF, "pinned update key"),
-            (&key, &MF.replace("FORMAT=2", "FORMAT=1")[..], "format 1"),
+            (
+                &key,
+                &MF.replace("FORMAT=4", "FORMAT=3")[..],
+                "the bundle is format 3, and only format 4 is read",
+            ),
         ] {
             let data = signed(d.path(), key, manifest);
             up.begin(data.len() as u64, &hex::encode(sha(&data)), "")

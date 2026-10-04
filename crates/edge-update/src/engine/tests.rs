@@ -584,9 +584,9 @@ pub(crate) struct Spec {
     extra: String,
     patch: String,
     format: &'static str,
-    /// What the layout carries; default: the release's app and judge, and a shared base.
-    carried: Option<Vec<String>>,
-    /// A partial bundle's list of every ref.
+    /// What the layout carries: by default the release's app and judge, and a shared base.
+    carried: Vec<String>,
+    /// Every ref the release runs, signed as `refs`: by default what it carries.
     refs: Option<Vec<String>>,
     notes: Option<String>,
     instance: Option<String>,
@@ -601,8 +601,12 @@ impl Spec {
             secureboot: "1",
             extra: "LOCK_PROFILE=edge\nSTACK_PATH=./base\n".into(),
             patch: patch(tag),
-            format: "2",
-            carried: None,
+            format: crate::bundle::FORMAT,
+            carried: vec![
+                format!("reg/app:{tag}"),
+                format!("reg/judge:{tag}"),
+                BASE.into(),
+            ],
             refs: None,
             notes: None,
             instance: None,
@@ -615,8 +619,7 @@ impl Spec {
         let mut refs = own.to_vec();
         refs.push(BASE.into());
         Self {
-            format: "3",
-            carried: Some(own.to_vec()),
+            carried: own.to_vec(),
             refs: Some(refs),
             ..Self::new(tag)
         }
@@ -732,20 +735,16 @@ impl Harness {
             std::fs::write(src.join(crate::bundle::INSTANCE), i).unwrap();
         }
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
-        let carried = s.carried.clone().unwrap_or_else(|| {
-            vec![
-                format!("reg/app:{}", s.tag),
-                format!("reg/judge:{}", s.tag),
-                BASE.into(),
-            ]
-        });
-        let manifests: Vec<_> = carried
+        let manifests: Vec<_> = s
+            .carried
             .iter()
             .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}}))
             .collect();
         let index = serde_json::json!({ "manifests": manifests });
         std::fs::write(src.join("images/index.json"), index.to_string()).unwrap();
-        if let Some(refs) = &s.refs {
+        // A bundle of the formats before lists no refs.
+        if s.format == crate::bundle::FORMAT {
+            let refs = s.refs.as_ref().unwrap_or(&s.carried);
             let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
             std::fs::write(src.join(crate::bundle::REFS), text).unwrap();
         }
@@ -1230,23 +1229,18 @@ async fn a_partial_bundle_keeps_what_a_failed_release_left_it() {
 }
 
 #[tokio::test]
-async fn the_format_says_whether_refs_are_listed() {
+async fn a_bundle_of_an_old_format_is_refused_as_it_arrives() {
     let mut h = Harness::new();
-    let mut s = Spec::partial("update-new");
-    s.format = "2";
-    refused(&mut h, &s, "a format 2 bundle carries every image").await;
-
-    let mut s = Spec::new("update-new");
-    s.format = "3";
-    refused(&mut h, &s, "a format 3 bundle lists its refs").await;
-
-    // Refused by its head, as it arrives.
-    let mut s = Spec::new("update-new");
-    s.format = "4";
-    let sha = h.upload(&s);
-    let up = h.e().uploads().current().unwrap();
-    assert!(up.refused.contains("not 2 or 3"), "{}", up.refused);
-    assert!(h.e().request_verify(&sha).is_err());
+    for f in ["2", "3"] {
+        let mut s = Spec::new("update-new");
+        s.format = f;
+        let sha = h.upload(&s);
+        let up = h.e().uploads().current().unwrap();
+        let want = format!("the bundle is format {f}, and only format 4 is read: rebuild it");
+        assert!(up.refused.contains(&want), "{}", up.refused);
+        assert!(h.e().request_verify(&sha).is_err());
+        assert!(h.w().log.is_empty());
+    }
 }
 
 #[tokio::test]
