@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -36,6 +37,18 @@ pub async fn serve(
     upstream: Option<SocketAddr>,
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
+    serve_waiting(store, listen, upstream, Duration::ZERO, stop).await
+}
+
+/// [`serve`], a miss waiting out an upstream that refuses for up to `wait`
+/// from the start, until it has first answered: one coming up after this one.
+pub async fn serve_waiting(
+    store: Option<Store>,
+    listen: SocketAddr,
+    upstream: Option<SocketAddr>,
+    wait: Duration,
+    stop: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let root = store.as_ref().map(|s| s.root().display().to_string());
     tracing::info!(addr = %listener.local_addr()?, ?root, ?upstream, "serving images");
@@ -52,7 +65,14 @@ pub async fn serve(
             }
         });
     }
-    let state = Arc::new((store, Upstream(upstream)));
+    let state = Arc::new((
+        store,
+        Upstream {
+            addr: upstream,
+            until: tokio::time::Instant::now() + wait,
+            seen: AtomicBool::new(false),
+        },
+    ));
     let mut term = edge_common::Terminator::new();
     tokio::pin!(stop);
     loop {
@@ -262,15 +282,46 @@ async fn blob(store: &Store, digest: &Digest, range: Option<&str>) -> Option<Res
 }
 
 /// A read-only pass-through for what the store does not hold; nothing it serves is kept.
-struct Upstream(Option<SocketAddr>);
+struct Upstream {
+    addr: Option<SocketAddr>,
+    /// Until then, and until it first answers, a refused connection is retried.
+    until: tokio::time::Instant,
+    seen: AtomicBool,
+}
 
 /// Covers the answer's head only: a blob then streams as long as it takes.
 const UPSTREAM_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Upstream {
+    async fn connect(&self, up: SocketAddr) -> io::Result<TcpStream> {
+        loop {
+            match TcpStream::connect(up).await {
+                Ok(s) => {
+                    self.seen.store(true, Ordering::Relaxed);
+                    return Ok(s);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::ConnectionRefused
+                        && !self.seen.load(Ordering::Relaxed)
+                        && tokio::time::Instant::now() < self.until =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     async fn fetch<B>(&self, req: &Request<B>) -> Option<Response<Body>> {
-        let up = self.0?;
-        match tokio::time::timeout(UPSTREAM_PATIENCE, Self::send(up, req)).await {
+        let up = self.addr?;
+        let stream = match self.connect(up).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(uri = %req.uri(), error = %e, "not upstream either");
+                return None;
+            }
+        };
+        match tokio::time::timeout(UPSTREAM_PATIENCE, Self::send(stream, up, req)).await {
             Ok(Ok(resp)) => Some(resp),
             Ok(Err(e)) => {
                 tracing::debug!(uri = %req.uri(), error = %e, "not upstream either");
@@ -283,8 +334,11 @@ impl Upstream {
         }
     }
 
-    async fn send<B>(up: SocketAddr, req: &Request<B>) -> anyhow::Result<Response<Body>> {
-        let stream = TcpStream::connect(up).await?;
+    async fn send<B>(
+        stream: TcpStream,
+        up: SocketAddr,
+        req: &Request<B>,
+    ) -> anyhow::Result<Response<Body>> {
         let (mut sender, conn) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         tokio::spawn(async move {

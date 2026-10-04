@@ -10,6 +10,6 @@ mod sweep;
 
 pub use digest::Digest;
 pub use reference::ImageRef;
-pub use server::serve;
+pub use server::{serve, serve_waiting};
 pub use store::{Listing, Store};
 pub use sweep::Swept;

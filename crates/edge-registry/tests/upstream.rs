@@ -215,3 +215,27 @@ fn unmounted_volume_passes_through_until_mounted() {
     let r = Registry::launch(&f.root, f.stub.port, Some(&vol));
     assert_eq!(r.get(held).body, f.held.manifest.bytes);
 }
+
+#[test]
+fn a_miss_waits_for_an_upstream_coming_up_after_it() {
+    let d = tempdir();
+    let up = common::free_port();
+    let registry = Registry::launch_waiting(&d.path().join("store"), up, None, 30);
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        let mut answers = HashMap::new();
+        answers.insert(
+            "/v2/o/app/manifests/v1?ns=ghcr.io".to_string(),
+            Canned {
+                status: "200 OK",
+                headers: vec![("Content-Type", MANIFEST.into())],
+                body: BAKED.to_vec(),
+            },
+        );
+        Stub::start_on(up, answers)
+    });
+    let resp = registry.get("/v2/o/app/manifests/v1?ns=ghcr.io");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, BAKED);
+    drop(late.join());
+}

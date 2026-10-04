@@ -13,12 +13,15 @@ const DEFAULT_ROOT: &str = "/var/lib/edge-registry";
 /// Talos's registryd, which serves the image cache baked into the media.
 const DEFAULT_UPSTREAM: &str = "127.0.0.1:3172";
 const VOLUME_POLL: Duration = Duration::from_secs(1);
+/// At boot registryd comes up after the first pulls: a refused one is held this long.
+const DEFAULT_UPSTREAM_WAIT: u64 = 60;
 
 #[derive(Debug, PartialEq)]
 struct Config {
     listen: SocketAddr,
     root: PathBuf,
     upstream: SocketAddr,
+    upstream_wait: Duration,
     volume: Option<PathBuf>,
 }
 
@@ -27,6 +30,7 @@ fn config(args: impl IntoIterator<Item = String>, env: impl Fn(&str) -> Option<S
     let mut root = env("EDGE_REGISTRY_ROOT");
     let mut upstream = env("EDGE_REGISTRY_UPSTREAM");
     let mut volume = env("EDGE_REGISTRY_VOLUME");
+    let mut wait = env("EDGE_REGISTRY_UPSTREAM_WAIT");
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -34,6 +38,7 @@ fn config(args: impl IntoIterator<Item = String>, env: impl Fn(&str) -> Option<S
             "--root" => root = args.next(),
             "--upstream" => upstream = args.next(),
             "--volume" => volume = args.next(),
+            "--upstream-wait" => wait = args.next(),
             _ => tracing::warn!(arg, "ignoring an unknown argument"),
         }
     }
@@ -41,6 +46,10 @@ fn config(args: impl IntoIterator<Item = String>, env: impl Fn(&str) -> Option<S
         listen: loopback("listen", listen, DEFAULT_LISTEN),
         root: root.map_or_else(|| DEFAULT_ROOT.into(), PathBuf::from),
         upstream: loopback("upstream", upstream, DEFAULT_UPSTREAM),
+        upstream_wait: Duration::from_secs(
+            wait.and_then(|w| w.parse().ok())
+                .unwrap_or(DEFAULT_UPSTREAM_WAIT),
+        ),
         volume: volume.map(PathBuf::from),
     }
 }
@@ -63,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         listen,
         root,
         upstream,
+        upstream_wait,
         volume,
     } = config(std::env::args().skip(1), |k| std::env::var(k).ok());
     let unmounted = volume.filter(|v| !is_mount_point(v));
@@ -81,10 +91,11 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(edge_registry::serve(
+        .block_on(edge_registry::serve_waiting(
             store,
             listen,
             Some(upstream),
+            upstream_wait,
             mounted(unmounted),
         ))
 }
@@ -133,6 +144,7 @@ mod tests {
                 listen: DEFAULT_LISTEN.parse().unwrap(),
                 root: DEFAULT_ROOT.into(),
                 upstream: DEFAULT_UPSTREAM.parse().unwrap(),
+                upstream_wait: Duration::from_secs(DEFAULT_UPSTREAM_WAIT),
                 volume: None,
             }
         );
@@ -152,6 +164,7 @@ mod tests {
                 listen: "127.0.0.1:6000".parse().unwrap(),
                 root: "/env".into(),
                 upstream: "127.0.0.1:6001".parse().unwrap(),
+                upstream_wait: Duration::from_secs(DEFAULT_UPSTREAM_WAIT),
                 volume: Some("/env-vol".into()),
             }
         );
@@ -165,6 +178,8 @@ mod tests {
                 "127.0.0.2:7001",
                 "--volume",
                 "/arg-vol",
+                "--upstream-wait",
+                "3",
             ],
             &env,
         );
@@ -174,6 +189,7 @@ mod tests {
                 listen: "[::1]:7000".parse().unwrap(),
                 root: "/arg".into(),
                 upstream: "127.0.0.2:7001".parse().unwrap(),
+                upstream_wait: Duration::from_secs(3),
                 volume: Some("/arg-vol".into()),
             }
         );

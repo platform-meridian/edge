@@ -180,7 +180,7 @@ pub fn import<const N: usize>(root: &Path, layout: &Path, images: [(&str, &str);
     images
 }
 
-fn free_port() -> u16 {
+pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -195,8 +195,19 @@ impl Registry {
     }
 
     pub fn launch(root: &Path, upstream: u16, volume: Option<&Path>) -> Registry {
+        Registry::launch_waiting(root, upstream, volume, 0)
+    }
+
+    /// Its misses wait up to `wait` seconds for an upstream that is not up yet.
+    pub fn launch_waiting(
+        root: &Path,
+        upstream: u16,
+        volume: Option<&Path>,
+        wait: u64,
+    ) -> Registry {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_edge-registry"));
+        cmd.args(["--upstream-wait", &wait.to_string()]);
         if let Some(v) = volume {
             cmd.args(["--volume".as_ref(), v.as_os_str()]);
         }
@@ -309,7 +320,11 @@ pub struct Canned {
 
 impl Stub {
     pub fn start(answers: HashMap<String, Canned>) -> Stub {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Stub::start_on(0, answers)
+    }
+
+    pub fn start_on(port: u16, answers: HashMap<String, Canned>) -> Stub {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
