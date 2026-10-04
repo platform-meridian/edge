@@ -110,7 +110,7 @@ impl Release {
         self.get("STACK_TAG")
     }
     pub fn components(&self) -> Vec<Component> {
-        diff::of_release(&self.manifest, &self.images)
+        diff::of_release(&self.manifest, &self.refs, &self.images)
     }
 }
 

@@ -47,17 +47,30 @@ fn without_digest(image: &str) -> &str {
     image.split('@').next().unwrap_or(image)
 }
 
-/// A release's images, named and versioned by its `COMPONENT_` lines where
-/// they say. `images` maps each layout ref to its digest.
-pub fn of_release(manifest: &Manifest, images: &BTreeMap<String, String>) -> Vec<Component> {
+/// A release's images: every ref it runs, not only those its bundle carries,
+/// named and versioned by its `COMPONENT_` lines where they say. `images`
+/// maps each carried ref to its digest; another ref's digest is its own, else
+/// its component line's.
+pub fn of_release(
+    manifest: &Manifest,
+    refs: &BTreeSet<String>,
+    images: &BTreeMap<String, String>,
+) -> Vec<Component> {
     let named: BTreeMap<String, bundle::Component> = bundle::components(manifest)
         .into_iter()
         .map(|c| (key(&c.image), c))
         .collect();
     let mut out = BTreeMap::new();
-    for (image, digest) in images {
+    for image in refs.iter().chain(images.keys()) {
         let k = key(image);
-        let c = match named.get(&k) {
+        let c = named.get(&k);
+        let digest = images
+            .get(image)
+            .cloned()
+            .or_else(|| image.split_once('@').map(|(_, d)| d.to_string()))
+            .or_else(|| c.map(|c| c.digest.clone()))
+            .unwrap_or_default();
+        let c = match c {
             Some(c) => Component {
                 name: c.name.clone(),
                 image: without_digest(image).into(),
@@ -66,14 +79,14 @@ pub fn of_release(manifest: &Manifest, images: &BTreeMap<String, String>) -> Vec
                 } else {
                     c.version.clone()
                 },
-                digest: digest.clone(),
+                digest,
                 dirty: c.dirty == Some(true),
             },
             None => Component {
                 name: k.clone(),
                 image: without_digest(image).into(),
                 version: tag(image).into(),
-                digest: digest.clone(),
+                digest,
                 dirty: false,
             },
         };
@@ -214,7 +227,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            of_release(&m, &images),
+            of_release(&m, &BTreeSet::new(), &images),
             [
                 Component {
                     name: "edge-cni".into(),
@@ -230,6 +243,49 @@ mod tests {
                     digest: "sha256:bb".into(),
                     dirty: false,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_partial_release_runs_every_ref_it_lists_not_only_those_it_carries() {
+        let m = manifest("COMPONENT_ETCD=reg.io/etcd:3.6 sha256:ee 3.6.1\n");
+        let refs = BTreeSet::from([
+            "reg.io/gateway:2".to_string(),
+            "reg.io/etcd:3.6".into(),
+            "reg.io/flux@sha256:ff".into(),
+            "reg.io/kube:1".into(),
+        ]);
+        let carried = BTreeMap::from([("reg.io/gateway:2".to_string(), "sha256:g2".to_string())]);
+        let got = of_release(&m, &refs, &carried);
+        assert_eq!(
+            got.iter()
+                .map(|c| (c.name.as_str(), c.version.as_str(), c.digest.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("etcd", "3.6.1", "sha256:ee"),
+                ("flux", "", "sha256:ff"),
+                ("gateway", "2", "sha256:g2"),
+                ("kube", "1", ""),
+            ]
+        );
+        let before = [
+            c("reg.io/gateway:1", "1", "sha256:g1"),
+            c("reg.io/etcd:3.6", "3.6.1", "sha256:ee"),
+            c("reg.io/flux", "", "sha256:ff"),
+            c("reg.io/kube:1", "1", ""),
+        ];
+        let changes: Vec<_> = components(&before, &got, true)
+            .into_iter()
+            .map(|c| (c.name, c.change))
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                ("etcd".to_string(), Change::Unchanged),
+                ("flux".into(), Change::Unchanged),
+                ("gateway".into(), Change::Changed),
+                ("kube".into(), Change::Unchanged),
             ]
         );
     }
