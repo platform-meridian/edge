@@ -17,9 +17,9 @@ resources:
   - edge-update.yaml
 
 images:
-  - { name: ghcr.io/platform-meridian/edge-cni, newTag: v0.1.0 }
-  - { name: ghcr.io/platform-meridian/edge-dns, newTag: v0.1.0 }
-  - { name: ghcr.io/platform-meridian/edge-gateway, newTag: v0.1.0 }
-  - { name: ghcr.io/platform-meridian/edge-idle, newTag: v0.1.0 }
-  - { name: ghcr.io/platform-meridian/edge-signer, newTag: v0.1.0 }
-  - { name: ghcr.io/platform-meridian/edge-update, newTag: v0.1.0 }
+  - { name: ghcr.io/platform-meridian/edge-cni, newTag: v0.2.0 }
+  - { name: ghcr.io/platform-meridian/edge-dns, newTag: v0.2.0 }
+  - { name: ghcr.io/platform-meridian/edge-gateway, newTag: v0.2.0 }
+  - { name: ghcr.io/platform-meridian/edge-idle, newTag: v0.2.0 }
+  - { name: ghcr.io/platform-meridian/edge-signer, newTag: v0.2.0 }
+  - { name: ghcr.io/platform-meridian/edge-update, newTag: v0.2.0 }
