@@ -150,6 +150,26 @@ pub struct CtKey {
 
 pub const IPPROTO_UDP: u8 = 17;
 
+// `::ffff:0:0/96`'s third word as `sock_addr`'s user_ip6 holds it.
+const V4_MAPPED_WORD: u32 = u32::from_ne_bytes([0, 0, 0xff, 0xff]);
+
+/// The IPv4 address inside `::ffff:a.b.c.d`, as user_ip4 would hold it: dual-stack
+/// sockets reach IPv4 peers through the IPv6 hooks with these.
+#[inline(always)]
+pub fn v4_mapped(ip6: [u32; 4]) -> Option<u32> {
+    // Word by word: a slice compare is a bcmp the BPF backend cannot emit.
+    if ip6[0] == 0 && ip6[1] == 0 && ip6[2] == V4_MAPPED_WORD {
+        Some(ip6[3])
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+pub fn set_v4_mapped(ip6: &mut [u32; 4], addr: u32) {
+    ip6[3] = addr;
+}
+
 #[cfg(feature = "user")]
 mod user {
     use super::*;
@@ -194,5 +214,53 @@ mod tests {
             ALLOW_EXACT_BITS as usize / 8,
             core::mem::offset_of!(AllowKey, peer)
         );
+    }
+
+    extern crate std;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn words(ip: Ipv6Addr) -> [u32; 4] {
+        let o = ip.octets();
+        core::array::from_fn(|i| u32::from_ne_bytes(o[i * 4..i * 4 + 4].try_into().unwrap()))
+    }
+
+    fn user_ip4(ip: Ipv4Addr) -> u32 {
+        u32::from_ne_bytes(ip.octets())
+    }
+
+    #[test]
+    fn v4_mapped_yields_the_ipv4_address() {
+        let ip = Ipv4Addr::new(10, 96, 0, 1);
+        assert_eq!(v4_mapped(words(ip.to_ipv6_mapped())), Some(user_ip4(ip)));
+        assert_eq!(
+            v4_mapped(words(Ipv4Addr::UNSPECIFIED.to_ipv6_mapped())),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn genuine_ipv6_is_not_v4_mapped() {
+        for ip in [
+            "::1",
+            "::",
+            "::10.96.0.1",
+            "::ffff:0:10.96.0.1",
+            "64:ff9b::10.96.0.1",
+            "fd00::ffff:a60:1",
+            "0:0:1::ffff:a60:1",
+            "2001:db8::ffff:a60:1",
+            "ffff::ffff:a60:1",
+        ] {
+            assert_eq!(v4_mapped(words(ip.parse().unwrap())), None, "{ip}");
+        }
+    }
+
+    #[test]
+    fn set_v4_mapped_keeps_it_mapped() {
+        let backend = Ipv4Addr::new(10, 244, 0, 7);
+        let mut ip6 = words(Ipv4Addr::new(10, 96, 0, 1).to_ipv6_mapped());
+        set_v4_mapped(&mut ip6, user_ip4(backend));
+        assert_eq!(ip6, words(backend.to_ipv6_mapped()));
+        assert_eq!(v4_mapped(ip6), Some(user_ip4(backend)));
     }
 }

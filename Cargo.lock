@@ -873,6 +873,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aya",
+ "aya-obj",
  "edge-cni-common",
  "edge-common",
  "edge-kube",

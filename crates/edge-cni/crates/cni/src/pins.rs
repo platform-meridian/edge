@@ -18,7 +18,7 @@ pub const OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
 ));
 
 const PIN_BASE: &str = "/sys/fs/bpf/edge-cni";
-const PROGRAMS: [&str; 3] = ["connect4", "sendmsg4", "recvmsg4"];
+const PROGRAMS: [&str; 5] = ["connect4", "connect6", "sendmsg4", "recvmsg4", "recvmsg6"];
 
 // A directory: bpffs refuses plain files.
 pub(crate) const SYNCED: &str = "synced";
@@ -319,6 +319,25 @@ fn fnv1a(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_socket_program_attached() {
+        let obj = aya_obj::Object::parse(OBJECT).unwrap();
+        let mut built: Vec<&str> = obj
+            .programs
+            .iter()
+            .filter(|(_, p)| matches!(p.section, aya_obj::ProgramSection::CgroupSockAddr { .. }))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        built.sort();
+        let mut attached = PROGRAMS.to_vec();
+        attached.sort();
+        assert_eq!(built, attached);
+        // Dual-stack sockets reach IPv4 services through these.
+        for twin in ["connect6", "recvmsg6"] {
+            assert!(attached.contains(&twin), "{twin}");
+        }
+    }
 
     #[test]
     fn purge_removes_malformed_version_dir() {

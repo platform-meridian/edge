@@ -35,6 +35,7 @@ bytes = "1"
 serde_json = "1"
 rtnetlink = "0.23"
 aya = { git = "https://github.com/aya-rs/aya", rev = "c0f9940" }
+aya-obj = { git = "https://github.com/aya-rs/aya", rev = "c0f9940" }
 netlink-packet-route = "0.33"
 nix = { version = "0.31", features = ["sched", "fs"] }
 serde = { version = "1", features = ["derive"] }

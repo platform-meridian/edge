@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -27,9 +27,10 @@ use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
 mod common;
 
 const SERVICES_TEST: &str = "services_rewritten_in_cgroup";
+const DUAL_STACK_TEST: &str = "services_rewritten_for_dual_stack_sockets";
 const HANDOVER_TEST: &str = "socket_hooks_handed_over";
 const PROBE_ENV: &str = "EDGE_CNI_PROBE";
-const SOCKET_PROGRAMS: [&str; 3] = ["connect4", "sendmsg4", "recvmsg4"];
+const SOCKET_PROGRAMS: [&str; 5] = ["connect4", "connect6", "sendmsg4", "recvmsg4", "recvmsg6"];
 const VIP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
 const NO_BACKENDS_VIP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 11);
 const REPLY: &str = "backend";
@@ -161,14 +162,23 @@ fn tcp_reply(to: SocketAddr) -> String {
     }
 }
 
-fn probe() {
-    println!("tcp={}", tcp_reply(SocketAddr::from((VIP, 80))));
+// A dual-stack socket (AF_INET6, IPV6_V6ONLY off) dials IPv4 as `::ffff:a.b.c.d`.
+fn dual_stack(ip: Ipv4Addr) -> IpAddr {
+    IpAddr::V6(ip.to_ipv6_mapped())
+}
 
-    let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
+fn probe(at: fn(Ipv4Addr) -> IpAddr) {
+    println!("tcp={}", tcp_reply(SocketAddr::new(at(VIP), 80)));
+
+    let any = match at(Ipv4Addr::UNSPECIFIED) {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let udp = UdpSocket::bind((any, 0)).unwrap();
     udp.set_read_timeout(Some(TIMEOUT)).unwrap();
     let mut b = [0u8; 64];
     let udp = match udp
-        .send_to(b"ping", (VIP, 53))
+        .send_to(b"ping", (at(VIP), 53))
         .and_then(|_| udp.recv_from(&mut b))
     {
         Ok((n, from)) => format!("{from} {}", String::from_utf8_lossy(&b[..n])),
@@ -177,7 +187,7 @@ fn probe() {
     println!("udp={udp}");
 
     let no_backends =
-        match TcpStream::connect_timeout(&SocketAddr::from((NO_BACKENDS_VIP, 80)), TIMEOUT) {
+        match TcpStream::connect_timeout(&SocketAddr::new(at(NO_BACKENDS_VIP), 80), TIMEOUT) {
             Ok(_) => "connected".to_string(),
             Err(e) => format!("{:?}", e.kind()),
         };
@@ -208,7 +218,11 @@ fn probe_command(test: &str, cgroup: Option<&Path>) -> Command {
 }
 
 fn probe_from(cgroup: Option<&Path>) -> BTreeMap<String, String> {
-    let out = probe_command(SERVICES_TEST, cgroup).output().unwrap();
+    probe_test(SERVICES_TEST, cgroup)
+}
+
+fn probe_test(test: &str, cgroup: Option<&Path>) -> BTreeMap<String, String> {
+    let out = probe_command(test, cgroup).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -250,7 +264,7 @@ fn udp_backend(reply: &'static str) -> u16 {
 #[ignore = "needs root"]
 fn services_rewritten_in_cgroup() {
     if std::env::var_os(PROBE_ENV).is_some() {
-        return probe();
+        return probe(IpAddr::V4);
     }
     let Some(cgroup) = test_cgroup("svc") else {
         return;
@@ -301,6 +315,52 @@ fn services_rewritten_in_cgroup() {
         assert!(!seen["udp"].ends_with(REPLY), "{who}: {seen:?}");
         assert_ne!(seen["no_backends"], "ConnectionRefused", "{who}: {seen:?}");
     }
+}
+
+#[test]
+#[ignore = "needs root"]
+fn services_rewritten_for_dual_stack_sockets() {
+    if std::env::var_os(PROBE_ENV).is_some() {
+        return probe(dual_stack);
+    }
+    let Some(cgroup) = test_cgroup("dual") else {
+        return;
+    };
+    let (tcp_port, udp_port) = (tcp_backend(REPLY), udp_backend(REPLY));
+
+    let pins = Pins::new("dual");
+    let vdir = pins.version("v1");
+    let (mut bpf, mut programmer) = daemon::load_services(&vdir).unwrap();
+    let mut view = ServiceView::default();
+    view.apply_service(service(
+        "web",
+        VIP,
+        &[("http", 80, "TCP"), ("dns", 53, "UDP")],
+    ));
+    view.apply_slice(slice(
+        "web",
+        &[("http", tcp_port), ("dns", udp_port)],
+        Ipv4Addr::LOCALHOST,
+    ));
+    view.apply_service(service("idle", NO_BACKENDS_VIP, &[("http", 80, "TCP")]));
+    programmer.on_synced(&view).unwrap();
+    pins::take_over_sockets(&mut bpf, &vdir, &cgroup.0).unwrap();
+
+    let inside = probe_test(DUAL_STACK_TEST, Some(&cgroup.0));
+    assert_eq!(
+        inside["tcp"], REPLY,
+        "TCP to the mapped VIP reaches the backend"
+    );
+    assert_eq!(
+        inside["udp"],
+        format!("{} {REPLY}", SocketAddr::new(dual_stack(VIP), 53)),
+        "the UDP reply comes from the mapped VIP"
+    );
+    assert_eq!(inside["no_backends"], "ConnectionRefused");
+
+    let outside = probe_test(DUAL_STACK_TEST, None);
+    assert_ne!(outside["tcp"], REPLY, "{outside:?}");
+    assert!(!outside["udp"].ends_with(REPLY), "{outside:?}");
 }
 
 fn dial_until_stdin_closes() {

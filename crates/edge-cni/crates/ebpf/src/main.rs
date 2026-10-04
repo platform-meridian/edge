@@ -18,7 +18,7 @@ use edge_cni_common::{
     ALLOW_EXACT_BITS, ANY_NODE_ADDR, Affinity, AffinityKey, AllowKey, AllowVal, BackendKey,
     BackendVal, CtKey, DIR_EGRESS, DIR_INGRESS, FLAG_EGRESS_ISOLATED, FLAG_INGRESS_ISOLATED,
     IPPROTO_ICMP, IPPROTO_SCTP, IPPROTO_TCP, IPPROTO_UDP, MAX_RANGES, PodVal, RevNat, RevNatKey,
-    ServiceKey, ServiceVal,
+    ServiceKey, ServiceVal, set_v4_mapped, v4_mapped,
 };
 
 // NO_PREALLOC: only userspace writes these, so entries are allocated on insert.
@@ -45,7 +45,7 @@ static AFFINITY: LruHashMap<AffinityKey, Affinity> = LruHashMap::pinned(16384, 0
 enum Resolved {
     NotAService,
     NoBackends,
-    Backend(ServiceKey),
+    Backend(ServiceKey, BackendVal),
 }
 
 enum Target {
@@ -68,13 +68,13 @@ fn target(key: &ServiceKey) -> Option<Target> {
 
 /// `sticky` picks the backend by socket cookie rather than at random: unconnected
 /// UDP resolves every datagram, and one socket's datagrams must stay one flow.
+/// `addr` is the destination as user_ip4 holds it; the caller rewrites it.
 #[inline(always)]
-fn resolve(ctx: &SockAddrContext, proto: u8, sticky: bool) -> Resolved {
-    let sock_addr = unsafe { &mut *ctx.sock_addr };
+fn resolve(ctx: &SockAddrContext, addr: u32, proto: u8, sticky: bool) -> Resolved {
     let key = ServiceKey {
-        addr: sock_addr.user_ip4,
+        addr,
         // A u32 holding a be16 in its low half.
-        port: (sock_addr.user_port & 0xffff) as u16,
+        port: (unsafe { (*ctx.sock_addr).user_port } & 0xffff) as u16,
         proto,
         _pad: 0,
     };
@@ -102,9 +102,8 @@ fn resolve(ctx: &SockAddrContext, proto: u8, sticky: bool) -> Resolved {
             }
         }
     };
-    sock_addr.user_ip4 = backend.addr;
-    sock_addr.user_port = backend.port as u32;
-    Resolved::Backend(key)
+    unsafe { (*ctx.sock_addr).user_port = backend.port as u32 };
+    Resolved::Backend(key, backend)
 }
 
 #[inline(always)]
@@ -166,28 +165,60 @@ fn refuse() -> i32 {
     0
 }
 
+/// Returns the backend for the caller to write in, or None to pass the call.
+#[inline(always)]
+fn connect(ctx: &SockAddrContext, addr: u32) -> Result<Option<u32>, i32> {
+    let proto = unsafe { (*ctx.sock_addr).protocol } as u8;
+    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return Ok(None);
+    }
+    match resolve(ctx, addr, proto, false) {
+        Resolved::Backend(_, backend) => Ok(Some(backend.addr)),
+        Resolved::NoBackends => Err(refuse()),
+        Resolved::NotAService => Ok(None),
+    }
+}
+
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
-    let proto = unsafe { (*ctx.sock_addr).protocol } as u8;
-    if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
-        && matches!(resolve(&ctx, proto, false), Resolved::NoBackends)
-    {
-        return refuse();
+    let sock_addr = unsafe { &mut *ctx.sock_addr };
+    match connect(&ctx, sock_addr.user_ip4) {
+        Ok(Some(backend)) => sock_addr.user_ip4 = backend,
+        Ok(None) => {}
+        Err(verdict) => return verdict,
     }
     1
 }
 
+// Dual-stack sockets dial IPv4 as `::ffff:a.b.c.d`; genuine IPv6 passes untouched.
+#[cgroup_sock_addr(connect6)]
+pub fn connect6(ctx: SockAddrContext) -> i32 {
+    let sock_addr = unsafe { &mut *ctx.sock_addr };
+    let Some(addr) = v4_mapped(sock_addr.user_ip6) else {
+        return 1;
+    };
+    match connect(&ctx, addr) {
+        Ok(Some(backend)) => set_v4_mapped(&mut sock_addr.user_ip6, backend),
+        Ok(None) => {}
+        Err(verdict) => return verdict,
+    }
+    1
+}
+
+// A dual-stack socket's datagram to `::ffff:a.b.c.d` is sent as IPv4, through
+// this hook: the kernel never runs sendmsg6 on a mapped address.
 #[cgroup_sock_addr(sendmsg4)]
 pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
-    match resolve(&ctx, IPPROTO_UDP, true) {
-        Resolved::Backend(orig) => {
-            let sock_addr = unsafe { &*ctx.sock_addr };
+    let sock_addr = unsafe { &mut *ctx.sock_addr };
+    match resolve(&ctx, sock_addr.user_ip4, IPPROTO_UDP, true) {
+        Resolved::Backend(orig, backend) => {
+            sock_addr.user_ip4 = backend.addr;
             let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
-            // Already rewritten: the backend is the source recvmsg4 will see.
+            // The backend is the source recvmsg will see.
             let key = RevNatKey {
                 cookie,
-                addr: sock_addr.user_ip4,
-                port: (sock_addr.user_port & 0xffff) as u16,
+                addr: backend.addr,
+                port: backend.port,
                 _pad: 0,
             };
             let rev = RevNat {
@@ -203,20 +234,39 @@ pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
     }
 }
 
+/// `addr` is the datagram's source as user_ip4 holds it; user_port is rewritten.
+#[inline(always)]
+fn reverse(ctx: &SockAddrContext, addr: u32) -> Option<u32> {
+    let sock_addr = unsafe { &mut *ctx.sock_addr };
+    let key = RevNatKey {
+        cookie: unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) },
+        addr,
+        port: (sock_addr.user_port & 0xffff) as u16,
+        _pad: 0,
+    };
+    let rev = unsafe { REVNAT.get(key) }?;
+    sock_addr.user_port = rev.port as u32;
+    Some(rev.addr)
+}
+
 // Resolvers drop replies whose source is not the address they sent to.
 #[cgroup_sock_addr(recvmsg4)]
 pub fn recvmsg4(ctx: SockAddrContext) -> i32 {
     let sock_addr = unsafe { &mut *ctx.sock_addr };
-    // user_ip4/user_port are the datagram's source here.
-    let key = RevNatKey {
-        cookie: unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) },
-        addr: sock_addr.user_ip4,
-        port: (sock_addr.user_port & 0xffff) as u16,
-        _pad: 0,
-    };
-    if let Some(rev) = unsafe { REVNAT.get(key) } {
-        sock_addr.user_ip4 = rev.addr;
-        sock_addr.user_port = rev.port as u32;
+    if let Some(addr) = reverse(&ctx, sock_addr.user_ip4) {
+        sock_addr.user_ip4 = addr;
+    }
+    1
+}
+
+// A dual-stack socket sees an IPv4 reply's source as `::ffff:a.b.c.d`.
+#[cgroup_sock_addr(recvmsg6)]
+pub fn recvmsg6(ctx: SockAddrContext) -> i32 {
+    let sock_addr = unsafe { &mut *ctx.sock_addr };
+    if let Some(addr) = v4_mapped(sock_addr.user_ip6)
+        && let Some(orig) = reverse(&ctx, addr)
+    {
+        set_v4_mapped(&mut sock_addr.user_ip6, orig);
     }
     1
 }
