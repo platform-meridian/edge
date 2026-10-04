@@ -90,8 +90,10 @@ impl Build {
             ],
         );
         oci::from_flat_cache(&dir.path().join("flat"), &dir.path().join("images"), &refs).unwrap();
-        let manifest =
-            edge_bundle::parse_manifest("FORMAT=4\nSTACK_TAG=t2\nBUILT_EPOCH=2000\n").unwrap();
+        let manifest = edge_bundle::parse_manifest(
+            "FORMAT=4\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=2000\n",
+        )
+        .unwrap();
         Self {
             key: SigningKey::from_openssh(&private, NS).unwrap(),
             public,
@@ -111,12 +113,13 @@ impl Build {
     fn contents(&self) -> Contents<'_> {
         Contents {
             manifest: &self.manifest,
-            patch: &self.patch,
-            seed: "kind: ConfigMap\n",
+            patch: Some(&self.patch),
+            seed: Some("kind: ConfigMap\n"),
             images: &self.images,
             refs: &self.all,
             notes: None,
             instance: None,
+            components: None,
         }
     }
 
@@ -310,10 +313,13 @@ fn a_build_refuses_what_a_unit_would() {
     let out = b.path("b.tar");
     let full = build_config();
     let mut c = b.contents();
-    c.patch = &full;
+    c.patch = Some(&full);
     assert!(err(write(&c, &b.key, 0, &out)).contains("which the unit keeps"));
 
-    let bad = Manifest::from([("lower".into(), "x".into())]);
+    let bad = Manifest::from([
+        ("lower".into(), "x".into()),
+        ("STACK_DIGEST".into(), "sha256:00".into()),
+    ]);
     let mut c = b.contents();
     c.manifest = &bad;
     assert!(err(write(&c, &b.key, 0, &out)).contains("is not KEY"));

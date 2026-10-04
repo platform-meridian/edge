@@ -14,6 +14,11 @@
 //!   (`oci`).
 //! - `refs`: every ref the release runs, one per line. The layout carries
 //!   some or all of them; the unit must already hold the rest.
+//! - `components.json`, optional: what the bundle brings, the base or not and
+//!   modules, and what it removes ([`components`]). With it, installing merges
+//!   the bundle into the unit's installed set. A bundle without a base (its
+//!   MANIFEST names no `STACK_DIGEST`) has no config patch, seed or stack of
+//!   its own, and its `refs` may be empty.
 //! - `NOTES.md`, optional: release notes for a person, at most 64 KiB.
 //! - `fluxinstance.yaml`, optional: the FluxInstance the release runs on,
 //!   applied once the stack has brought the operator that knows it.
@@ -25,6 +30,7 @@
 //! A build writes one with [`write`]; a unit reads one with [`unpack`] and
 //! [`check`], or its signed head alone, as it arrives, with [`read_head`].
 
+pub mod components;
 pub mod machineconfig;
 pub mod oci;
 #[cfg(any(test, feature = "testkit"))]
@@ -54,6 +60,11 @@ pub const INSTANCE: &str = "fluxinstance.yaml";
 
 /// The one layout read and written: any other `FORMAT` is refused.
 pub const FORMAT: &str = "4";
+
+/// The bundle brings a base: its MANIFEST names the stack.
+pub fn has_base(m: &Manifest) -> bool {
+    m.contains_key("STACK_DIGEST")
+}
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIG: u64 = 64 << 10;
@@ -253,12 +264,10 @@ fn signed_sums<R: Read>(
     let sig = next(SIG, MAX_SIG)?;
     verifier.verify(&sums_bytes, &sig)?;
     let sums = parse_sums(std::str::from_utf8(&sums_bytes).context("the sums are not text")?)?;
-    for need in [MANIFEST, PATCH, SEED] {
-        ensure!(
-            sums.contains_key(Path::new(need)),
-            "the signed sums do not cover {need}"
-        );
-    }
+    ensure!(
+        sums.contains_key(Path::new(MANIFEST)),
+        "the signed sums do not cover {MANIFEST}"
+    );
     Ok(sums)
 }
 
@@ -341,9 +350,10 @@ fn head_of(start: &mut impl Read, verifier: &Verifier) -> anyhow::Result<Head> {
     Ok(head)
 }
 
-fn format_check(m: &Manifest) -> anyhow::Result<()> {
+fn format_check(m: &Manifest) -> anyhow::Result<&'static [&'static str]> {
     match m.get("FORMAT").map(String::as_str) {
-        Some(FORMAT) => Ok(()),
+        Some(FORMAT) if has_base(m) => Ok(&[PATCH, SEED, REFS]),
+        Some(FORMAT) => Ok(&[components::COMPONENTS, REFS]),
         Some(f) => bail!("the bundle is format {f}, and only format {FORMAT} is read: rebuild it"),
         None => bail!("the bundle names no FORMAT, and only format {FORMAT} is read: rebuild it"),
     }
@@ -351,10 +361,15 @@ fn format_check(m: &Manifest) -> anyhow::Result<()> {
 
 /// A bundle of another format is refused as that, before what it lacks for this one.
 fn signed_format(sums: &Sums, m: &Manifest) -> anyhow::Result<()> {
-    format_check(m)?;
+    for need in format_check(m)? {
+        ensure!(
+            sums.contains_key(Path::new(need)),
+            "the signed sums do not cover {need}"
+        );
+    }
     ensure!(
-        sums.contains_key(Path::new(REFS)),
-        "the signed sums do not cover {REFS}"
+        has_base(m) || !sums.contains_key(Path::new(PATCH)),
+        "the bundle carries a config patch, and its MANIFEST names no STACK_DIGEST"
     );
     Ok(())
 }
@@ -485,16 +500,27 @@ fn sync_fs(dir: &Path) -> anyhow::Result<()> {
 /// carries nothing the unit keeps, and a layout naming at least one image,
 /// each of them in `refs`. Returns the layout's refs.
 pub fn check(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
-    machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
+    let base = components::Components::read(dir)?.is_none_or(|c| c.base.is_some());
+    if base {
+        machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
+    }
     let carried = layout_refs(&dir.join(IMAGES))?;
-    ensure!(!carried.is_empty(), "the image layout names no image");
+    ensure!(
+        !base || !carried.is_empty(),
+        "the image layout names no image"
+    );
     unlisted(&carried, &release_refs(dir)?)?;
     Ok(carried)
 }
 
-/// Every ref the release runs: an unpacked bundle's `refs`.
+/// Every ref the release runs: an unpacked bundle's `refs`, which only a
+/// bundle without a base may leave empty.
 pub fn release_refs(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
-    parse_refs(&std::fs::read_to_string(dir.join(REFS)).context("reading the refs")?)
+    let text = std::fs::read_to_string(dir.join(REFS)).context("reading the refs")?;
+    if text.is_empty() && components::Components::read(dir)?.is_some_and(|c| c.base.is_none()) {
+        return Ok(BTreeSet::new());
+    }
+    parse_refs(&text)
 }
 
 fn parse_refs(text: &str) -> anyhow::Result<BTreeSet<String>> {
@@ -524,9 +550,9 @@ fn unlisted(carried: &BTreeSet<String>, listed: &BTreeSet<String>) -> anyhow::Re
 /// What a build puts in a bundle.
 pub struct Contents<'a> {
     pub manifest: &'a Manifest,
-    /// From [`machineconfig::strip`].
-    pub patch: &'a str,
-    pub seed: &'a str,
+    /// From [`machineconfig::strip`]; a bundle without a base has none.
+    pub patch: Option<&'a str>,
+    pub seed: Option<&'a str>,
     /// An OCI image layout ([`oci::from_flat_cache`]).
     pub images: &'a Path,
     /// Every ref the release runs: `images` carries some or all of them.
@@ -535,6 +561,8 @@ pub struct Contents<'a> {
     pub notes: Option<&'a str>,
     /// The FluxInstance the release runs on: [`INSTANCE`].
     pub instance: Option<&'a str>,
+    /// What the bundle brings: [`components::COMPONENTS`].
+    pub components: Option<&'a components::Components>,
 }
 
 enum Source {
@@ -562,7 +590,20 @@ impl Source {
 /// root's and dated `mtime` so the same inputs make the same tar. Refuses
 /// what a unit would refuse.
 pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> anyhow::Result<()> {
-    machineconfig::check_patch(contents.patch)?;
+    let base = contents.components.is_none_or(|c| c.base.is_some());
+    match (contents.patch, contents.seed) {
+        (Some(p), Some(_)) if base => machineconfig::check_patch(p)?,
+        (None, None) if !base => {}
+        _ if base => bail!("a bundle with a base carries its config patch and seed"),
+        _ => bail!("a bundle without a base carries no config patch or seed"),
+    }
+    if let Some(c) = contents.components {
+        c.check()?;
+        ensure!(
+            &c.refs() == contents.refs,
+            "{REFS} is not every ref the components run"
+        );
+    }
     if let Some(n) = contents.notes {
         ensure!(
             n.len() as u64 <= MAX_NOTES,
@@ -571,9 +612,20 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
         );
     }
     let carried = layout_refs(contents.images)?;
-    ensure!(!carried.is_empty(), "the image layout names no image");
+    ensure!(
+        !base || !carried.is_empty(),
+        "the image layout names no image"
+    );
     let refs: String = contents.refs.iter().map(|r| format!("{r}\n")).collect();
-    unlisted(&carried, &parse_refs(&refs)?)?;
+    let listed = match refs.is_empty() && !base {
+        true => BTreeSet::new(),
+        false => parse_refs(&refs)?,
+    };
+    unlisted(&carried, &listed)?;
+    ensure!(
+        has_base(contents.manifest) == base,
+        "a bundle's MANIFEST names a STACK_DIGEST exactly when it brings a base"
+    );
     let mut manifest = contents.manifest.clone();
     if let Some(f) = manifest.insert("FORMAT".into(), FORMAT.into()) {
         ensure!(
@@ -586,11 +638,18 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
         MANIFEST.to_string(),
         Source::Bytes(render_manifest(&manifest)?.into_bytes()),
     );
-    files.insert(
-        PATCH.into(),
-        Source::Bytes(contents.patch.as_bytes().into()),
-    );
-    files.insert(SEED.into(), Source::Bytes(contents.seed.as_bytes().into()));
+    if let Some(p) = contents.patch {
+        files.insert(PATCH.into(), Source::Bytes(p.as_bytes().into()));
+    }
+    if let Some(s) = contents.seed {
+        files.insert(SEED.into(), Source::Bytes(s.as_bytes().into()));
+    }
+    if let Some(c) = contents.components {
+        files.insert(
+            components::COMPONENTS.into(),
+            Source::Bytes(serde_json::to_vec_pretty(c)?),
+        );
+    }
     files.insert(REFS.into(), Source::Bytes(refs.into_bytes()));
     if let Some(i) = contents.instance {
         files.insert(INSTANCE.into(), Source::Bytes(i.as_bytes().into()));
@@ -663,7 +722,7 @@ mod tests {
     use super::testkit::*;
     use super::*;
 
-    const MF: &str = "FORMAT=4\nSTACK_TAG=t2\n";
+    const MF: &str = "FORMAT=4\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\n";
 
     struct Case {
         dir: tempfile::TempDir,
@@ -765,7 +824,11 @@ mod tests {
     #[test]
     fn resealed_sums_are_refused() {
         let c = Case::new();
-        std::fs::write(c.src().join(MANIFEST), "FORMAT=4\nSTACK_TAG=t9\n").unwrap();
+        std::fs::write(
+            c.src().join(MANIFEST),
+            "FORMAT=4\nSTACK_TAG=t9\nSTACK_DIGEST=sha256:00\n",
+        )
+        .unwrap();
         let (other, _) = keygen(c.dir.path(), "attacker");
         seal(&c.src(), &other, NAMESPACE);
         refused(&c, c.open(HEAD), "pinned update key");
@@ -839,6 +902,75 @@ mod tests {
         c.open(HEAD).unwrap();
         assert_eq!(check(&c.out()).unwrap().len(), 2);
         assert_eq!(release_refs(&c.out()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_bundle_without_a_base_carries_no_patch_seed_or_image() {
+        let d = tempfile::tempdir().unwrap();
+        let (key, public) = keygen(d.path(), "k");
+        let sk =
+            SigningKey::from_openssh(&std::fs::read_to_string(&key).unwrap(), NAMESPACE).unwrap();
+        let images = d.path().join("images");
+        std::fs::create_dir_all(images.join("blobs/sha256")).unwrap();
+        std::fs::write(
+            images.join("index.json"),
+            r#"{"schemaVersion":2,"manifests":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(images.join("oci-layout"), "{}").unwrap();
+        let c = components::Components {
+            remove: ["a".to_string()].into(),
+            ..Default::default()
+        };
+        let m: Manifest = [("STACK_TAG", "t3"), ("BUILT_EPOCH", "3")]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into();
+        let refs = BTreeSet::new();
+        let contents = Contents {
+            manifest: &m,
+            patch: None,
+            seed: None,
+            images: &images,
+            refs: &refs,
+            notes: None,
+            instance: None,
+            components: Some(&c),
+        };
+        let out = d.path().join("b.tar");
+        write(&contents, &sk, 1, &out).unwrap();
+        let dest = d.path().join("out");
+        let got = unpack(&out, &dest, &Verifier::new(&public, NAMESPACE).unwrap()).unwrap();
+        assert_eq!(got["FORMAT"], FORMAT);
+        assert!(!has_base(&got));
+        assert!(check(&dest).unwrap().is_empty());
+        assert!(release_refs(&dest).unwrap().is_empty());
+        assert_eq!(
+            components::Components::read(&dest).unwrap(),
+            Some(c.clone())
+        );
+        assert!(!dest.join(PATCH).exists() && !dest.join(SEED).exists());
+
+        let patched = Contents {
+            patch: Some("version: v1alpha1\n"),
+            seed: Some(""),
+            ..contents
+        };
+        assert!(write(&patched, &sk, 1, &out).is_err());
+        let based = components::Components {
+            base: Some(BTreeSet::new()),
+            ..c.clone()
+        };
+        let unpatched = Contents {
+            components: Some(&based),
+            ..contents
+        };
+        assert!(write(&unpatched, &sk, 1, &out).is_err());
+        let other = ["r/x:1".to_string()].into();
+        let unlisted = Contents {
+            refs: &other,
+            ..contents
+        };
+        assert!(write(&unlisted, &sk, 1, &out).is_err());
     }
 
     #[test]

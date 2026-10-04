@@ -310,6 +310,46 @@ pub fn merge(unit: &str, patch: &str) -> anyhow::Result<String> {
     render(&out)
 }
 
+/// Documents a component adds to the base's: each of a kind and name, none the unit's.
+pub fn check_part(part: &str) -> anyhow::Result<()> {
+    for (k, _) in parse(part)? {
+        ensure!(
+            matches!(&k, Key::Typed(_, n) if !n.is_empty()),
+            "{} is not a named document a component can add",
+            describe(&k)
+        );
+        ensure!(!held_kind(&k), "{} is the unit's to keep", describe(&k));
+    }
+    Ok(())
+}
+
+/// `patch` without the documents `parts` carry, by kind and name.
+pub fn without(patch: &str, parts: &[&str]) -> anyhow::Result<String> {
+    let mut theirs = Vec::new();
+    for p in parts {
+        theirs.extend(parse(p)?.into_iter().map(|(k, _)| k));
+    }
+    let mut docs = parse(patch)?;
+    docs.retain(|(k, _)| !theirs.contains(k));
+    render(&docs)
+}
+
+/// Patches as one; a document two of them carry is refused.
+pub fn join(patches: &[&str]) -> anyhow::Result<String> {
+    let mut docs: Vec<(Key, Value)> = Vec::new();
+    for p in patches {
+        for (k, d) in parse(p)? {
+            ensure!(
+                !docs.iter().any(|(o, _)| *o == k),
+                "two components carry {}",
+                describe(&k)
+            );
+            docs.push((k, d));
+        }
+    }
+    render(&docs)
+}
+
 /// A user volume new to the unit is keyed like the unit's other user volumes.
 fn new_volume_encryption(unit: &[(Key, Value)], k: &Key) -> anyhow::Result<Option<Value>> {
     let Key::Typed(kind, name) = k else {

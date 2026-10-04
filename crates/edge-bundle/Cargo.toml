@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tar.workspace = true
+flate2.workspace = true
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 sha2 = "0.10"
 hex = "0.4"

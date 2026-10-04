@@ -856,6 +856,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "edge-registry",
+ "flate2",
  "hex",
  "nix 0.31.3",
  "serde",
@@ -1131,6 +1132,7 @@ dependencies = [
  "edge-bundle",
  "edge-common",
  "edge-registry",
+ "flate2",
  "futures",
  "hex",
  "k8s-openapi",
@@ -1144,6 +1146,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
