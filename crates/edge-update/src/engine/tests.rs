@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::*;
+use crate::bundle::components::Components;
 use crate::bundle::testkit;
 use crate::judge::CheckState;
 use crate::unit::{Ref, Stack};
@@ -78,6 +79,9 @@ pub(crate) struct World {
     running: BTreeSet<String>,
 
     held: BTreeSet<String>,
+    /// What the registry holds by content: each ref's digest, and blobs.
+    digests: BTreeMap<String, String>,
+    blobs: BTreeMap<String, Vec<u8>>,
     last_installed: String,
     /// The unit already runs the bundle's OS.
     os_current: bool,
@@ -136,6 +140,8 @@ impl World {
             judge_image: String::new(),
             running: BTreeSet::new(),
             held: BTreeSet::new(),
+            digests: BTreeMap::new(),
+            blobs: BTreeMap::new(),
             last_installed: String::new(),
             os_current: false,
             apply_refused: false,
@@ -466,10 +472,11 @@ impl Cluster for FakeCluster {
     async fn applied(&self, _: &Ref) -> anyhow::Result<Option<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
+        let composed = w.digests.get(&stack_ref(&w.tag));
         let digest = if w.verdict == Verdict::WrongDigest && w.tag != OLD_TAG {
             "sha256:evil"
         } else {
-            DIGEST
+            composed.map_or(DIGEST, String::as_str)
         };
         Ok(Some(format!("{}@{digest}", w.tag)))
     }
@@ -530,10 +537,20 @@ impl Cluster for FakeCluster {
 
 impl Registry for FakeRegistry {
     fn import(&self, layout: &Path) -> anyhow::Result<()> {
-        let refs = crate::bundle::layout_refs(layout)?;
+        let images = crate::bundle::layout_images(layout)?;
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        w.held.extend(refs);
+        for e in std::fs::read_dir(layout.join("blobs/sha256"))? {
+            let e = e?;
+            let d = format!("sha256:{}", e.file_name().to_string_lossy());
+            w.blobs.insert(d, std::fs::read(e.path())?);
+        }
+        for (r, d) in images {
+            w.held.insert(r.clone());
+            if d.starts_with("sha256:") {
+                w.digests.insert(r, d);
+            }
+        }
         w.change("import".into())
     }
     fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
@@ -541,6 +558,7 @@ impl Registry for FakeRegistry {
         w.calls += 1;
         let before = w.held.len();
         w.held.retain(|r| keep.contains(r));
+        w.digests.retain(|r, _| keep.contains(r));
         if w.held.len() != before {
             w.change("collect".into())?;
         }
@@ -561,9 +579,19 @@ impl Registry for FakeRegistry {
     }
     fn digest(&self, image: &str) -> Option<String> {
         let w = self.0.lock().unwrap();
-        w.held
-            .contains(image)
-            .then(|| format!("sha256:{}", image.len()))
+        w.held.contains(image).then(|| {
+            w.digests
+                .get(image)
+                .cloned()
+                .unwrap_or_else(|| format!("sha256:{}", image.len()))
+        })
+    }
+    fn read(&self, digest: &str) -> anyhow::Result<Vec<u8>> {
+        let w = self.0.lock().unwrap();
+        w.blobs
+            .get(digest)
+            .cloned()
+            .context("the store holds no such blob")
     }
 }
 
@@ -590,6 +618,8 @@ pub(crate) struct Spec {
     refs: Option<Vec<String>>,
     notes: Option<String>,
     instance: Option<String>,
+    /// What the bundle brings; with a base, a real stack artifact `reg/stack:<tag>`.
+    components: Option<Components>,
 }
 
 impl Spec {
@@ -610,6 +640,48 @@ impl Spec {
             refs: None,
             notes: None,
             instance: None,
+            components: None,
+        }
+    }
+
+    /// The base, with `modules`.
+    fn base(tag: &str, modules: &[&str]) -> Self {
+        let c = Components {
+            base: Some(
+                [
+                    format!("reg/app:{tag}"),
+                    format!("reg/judge:{tag}"),
+                    stack_ref(tag),
+                ]
+                .into(),
+            ),
+            modules: modules.iter().map(|m| (m.to_string(), module(m))).collect(),
+            remove: BTreeSet::new(),
+        };
+        Self {
+            carried: c.refs().into_iter().collect(),
+            components: Some(c),
+            // The unit installs the installer the base names, and runs it after.
+            patch: format!(
+                "{}---\napiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n  image: reg/installer:{tag}@{DIGEST}\n",
+                patch(tag)
+            ),
+            ..Self::new(tag)
+        }
+    }
+
+    /// No base: `modules` brought, and `remove` removed.
+    fn modules(tag: &str, epoch: i64, modules: &[&str], remove: &[&str]) -> Self {
+        let c = Components {
+            base: None,
+            modules: modules.iter().map(|m| (m.to_string(), module(m))).collect(),
+            remove: remove.iter().map(|m| m.to_string()).collect(),
+        };
+        Self {
+            epoch,
+            carried: c.refs().into_iter().collect(),
+            components: Some(c),
+            ..Self::new(tag)
         }
     }
 
@@ -627,6 +699,86 @@ impl Spec {
 }
 
 const BASE: &str = "reg/base@sha256:shared";
+
+fn stack_ref(tag: &str) -> String {
+    format!("reg/stack:{tag}")
+}
+
+fn module(name: &str) -> crate::bundle::components::Module {
+    crate::bundle::components::Module {
+        manifest: [(
+            format!("MODULE_{}", name.to_uppercase()),
+            format!("reg/modules/{name}:1@sha256:{name}"),
+        )]
+        .into(),
+        refs: [format!("reg/{name}:1")].into(),
+        flux: format!("kind: Kustomization\nmetadata: {{name: module-{name}}}\n"),
+        machine: format!("apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: {name}-data\n"),
+    }
+}
+
+fn gzip_tar(files: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut b = tar::Builder::new(Vec::new());
+    for (name, body) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        b.append_data(&mut h, name, body.as_bytes()).unwrap();
+    }
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&b.into_inner().unwrap()).unwrap();
+    gz.finish().unwrap()
+}
+
+/// A Flux artifact in `blobs`; its index entry.
+fn stack_artifact(blobs: &Path, tag: &str) -> serde_json::Value {
+    use sha2::Digest;
+    let put = |b: &[u8]| {
+        let h = hex::encode(sha2::Sha256::digest(b));
+        std::fs::write(blobs.join(&h), b).unwrap();
+        format!("sha256:{h}")
+    };
+    let layer = gzip_tar(&[
+        ("base/kustomization.yaml", "resources:\n  - ../modules\n"),
+        ("base/tag", tag),
+        ("modules/kustomization.yaml", "resources: []\n"),
+    ]);
+    let config = b"{}";
+    let m = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.cncf.flux.config.v1+json", "digest": put(config), "size": 2},
+        "layers": [{"mediaType": "application/vnd.cncf.flux.content.v1.tar+gzip", "digest": put(&layer), "size": layer.len()}],
+    });
+    let bytes = serde_json::to_vec(&m).unwrap();
+    serde_json::json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": put(&bytes),
+        "size": bytes.len(),
+        "annotations": {"io.containerd.image.name": stack_ref(tag)},
+    })
+}
+
+/// The files of the stack the registry holds at `tag`, composed by the unit.
+fn composed_stack(h: &Harness, tag: &str) -> BTreeMap<String, String> {
+    use std::io::Read;
+    let w = h.w();
+    let d = &w.digests[&stack_ref(tag)];
+    let m: serde_json::Value = serde_json::from_slice(&w.blobs[d]).unwrap();
+    let layer = &w.blobs[m["layers"][0]["digest"].as_str().unwrap()];
+    let mut a = tar::Archive::new(flate2::read::GzDecoder::new(layer.as_slice()));
+    let mut out = BTreeMap::new();
+    for e in a.entries().unwrap() {
+        let mut e = e.unwrap();
+        if e.header().entry_type().is_file() {
+            let mut t = String::new();
+            e.read_to_string(&mut t).unwrap();
+            out.insert(e.path().unwrap().display().to_string(), t);
+        }
+    }
+    out
+}
 
 fn seed(tag: &str) -> String {
     format!(
@@ -659,6 +811,7 @@ fn settings(public: &str) -> Settings {
             source: r("stack"),
             lock: r("lock"),
             judge: r("judge"),
+            modules: Some(r("modules")),
         },
     }
 }
@@ -720,14 +873,53 @@ impl Harness {
         let src = self.dir.path().join(format!("src-{}", s.tag));
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(src.join("images/blobs/sha256")).unwrap();
-        let mf = format!(
-            "FORMAT={}\nSTACK_TAG={}\nSTACK_DIGEST={DIGEST}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
-             TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
-            s.format, s.tag, s.tag, s.talos, s.epoch, s.secureboot, s.extra
-        );
+        let base = s.components.as_ref().is_none_or(|c| c.base.is_some());
+        let mut manifests: Vec<serde_json::Value> = Vec::new();
+        let mut stack = DIGEST.to_string();
+        if s.components.is_some() && base {
+            let e = stack_artifact(&src.join("images/blobs/sha256"), &s.tag);
+            stack = e["digest"].as_str().unwrap().into();
+            manifests.push(e);
+        }
+        let mut mf = if base {
+            format!(
+                "FORMAT={}\nSTACK_TAG={}\nSTACK_DIGEST={stack}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
+                 TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
+                s.format, s.tag, s.tag, s.talos, s.epoch, s.secureboot, s.extra
+            )
+        } else {
+            format!(
+                "FORMAT={}\nSTACK_TAG={}\nBUILT_EPOCH={}\nLOCK_PROFILE=edge\n",
+                crate::bundle::FORMAT,
+                s.tag,
+                s.epoch
+            )
+        };
+        if let Some(c) = &s.components {
+            for m in c.modules.values() {
+                for (k, v) in &m.manifest {
+                    mf.push_str(&format!("{k}={v}\n"));
+                }
+            }
+            let names: Vec<&str> = c.modules.keys().map(String::as_str).collect();
+            if !names.is_empty() {
+                mf.push_str(&format!("MODULES={}\n", names.join(" ")));
+            }
+            std::fs::write(
+                src.join(crate::bundle::components::COMPONENTS),
+                serde_json::to_vec(c).unwrap(),
+            )
+            .unwrap();
+        }
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
-        std::fs::write(src.join("config-patch.yaml"), &s.patch).unwrap();
-        std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
+        if base {
+            let mut patch = s.patch.clone();
+            for m in s.components.iter().flat_map(|c| c.modules.values()) {
+                patch.push_str(&format!("---\n{}", m.machine));
+            }
+            std::fs::write(src.join("config-patch.yaml"), patch).unwrap();
+            std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
+        }
         if let Some(n) = &s.notes {
             std::fs::write(src.join(crate::bundle::NOTES), n).unwrap();
         }
@@ -735,16 +927,20 @@ impl Harness {
             std::fs::write(src.join(crate::bundle::INSTANCE), i).unwrap();
         }
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
-        let manifests: Vec<_> = s
-            .carried
-            .iter()
-            .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}}))
-            .collect();
+        manifests.extend(
+            s.carried
+                .iter()
+                .filter(|r| s.components.is_none() || **r != stack_ref(&s.tag))
+                .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}})),
+        );
         let index = serde_json::json!({ "manifests": manifests });
         std::fs::write(src.join("images/index.json"), index.to_string()).unwrap();
         // A bundle of the formats before lists no refs.
         if s.format == crate::bundle::FORMAT {
             let refs = s.refs.as_ref().unwrap_or(&s.carried);
+            let mut refs: Vec<&String> = refs.iter().collect();
+            refs.sort();
+            refs.dedup();
             let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
             std::fs::write(src.join(crate::bundle::REFS), text).unwrap();
         }
@@ -2239,4 +2435,149 @@ async fn serving_rotation_is_turned_on_once_the_stack_is_committed() {
     assert!(w.active.contains("serverTLSBootstrap: true"));
     let at = |what: &str| w.log.iter().rposition(|l| l == what).unwrap();
     assert!(at("repoint update-new") < at("apply"), "{:?}", w.log);
+}
+
+/// A unit given a base with module `a`, without an OS step.
+async fn with_a() -> Harness {
+    let mut h = Harness::new();
+    running_installer(&h, &format!("reg/installer:provisioned@{DIGEST}"));
+    let e = h.update(&Spec::base("update-a", &["a"]), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h
+}
+
+fn manifest_of(e: &Entry) -> Manifest {
+    e.release.as_ref().unwrap().manifest.clone()
+}
+
+#[tokio::test]
+async fn a_bundle_without_a_base_keeps_the_base_and_the_modules_it_does_not_name() {
+    let mut h = with_a().await;
+    h.w().log.clear();
+    let e = h
+        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |h, _| {
+            h.reopen()
+        })
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let m = manifest_of(&e);
+    assert_eq!(m["MODULES"], "a b");
+    assert_eq!(m["MODULE_A"], "reg/modules/a:1@sha256:a");
+    assert_eq!(
+        m["INSTALLER_REF"],
+        format!("reg/installer:update-a@{DIGEST}")
+    );
+    assert_eq!(m["STACK_PATH"], "./base");
+    {
+        let w = h.w();
+        assert!(
+            !w.log.iter().any(|l| l == "install" || l == "reboot"),
+            "{:?}",
+            w.log
+        );
+        assert!(
+            !w.log.iter().any(|l| l == "seed"),
+            "a bundle without a base seeds nothing"
+        );
+        assert_eq!(w.tag, "update-b");
+        for want in [
+            "store:update-a",
+            "name: a-data",
+            "name: b-data",
+            "unit-machine-token",
+        ] {
+            assert!(w.active.contains(want), "the config lacks {want}");
+        }
+        assert!(w.held.contains("reg/a:1") && w.held.contains("reg/app:update-a"));
+    }
+    let stack = composed_stack(&h, "update-b");
+    assert_eq!(
+        stack["base/tag"], "update-a",
+        "the base is the one the unit ran"
+    );
+    assert!(stack["modules/kustomization.yaml"].contains("  - a.yaml\n  - b.yaml\n"));
+    let record: serde_yaml::Value = serde_yaml::from_str(&stack["modules/installed.yaml"]).unwrap();
+    assert_eq!(record["metadata"]["name"], "modules");
+    assert_eq!(record["data"]["MODULES"], "a b");
+}
+
+#[tokio::test]
+async fn a_bundle_with_a_base_keeps_the_modules_it_does_not_name() {
+    let mut h = with_a().await;
+    let mut s = Spec::base("update-b", &[]);
+    s.epoch = 3000;
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert_eq!(manifest_of(&e)["MODULES"], "a");
+    let stack = composed_stack(&h, "update-b");
+    assert_eq!(stack["base/tag"], "update-b");
+    assert!(stack.contains_key("modules/a.yaml"));
+    let w = h.w();
+    assert!(w.active.contains("store:update-b") && w.active.contains("name: a-data"));
+}
+
+#[tokio::test]
+async fn a_module_goes_only_by_an_explicit_remove() {
+    let mut h = with_a().await;
+    let e = h
+        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |_, _| {})
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let e = h
+        .update(&Spec::modules("update-c", 4000, &[], &["a"]), |_, _| {})
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let m = manifest_of(&e);
+    assert_eq!(m["MODULES"], "b");
+    assert!(!m.contains_key("MODULE_A"));
+    let rel = e.release.unwrap();
+    assert!(!rel.refs.contains("reg/a:1") && rel.refs.contains("reg/b:1"));
+    let stack = composed_stack(&h, "update-c");
+    assert!(!stack.contains_key("modules/a.yaml") && stack.contains_key("modules/b.yaml"));
+    let w = h.w();
+    assert!(!w.active.contains("name: a-data") && w.active.contains("name: b-data"));
+}
+
+#[tokio::test]
+async fn a_bundle_without_a_base_needs_a_set_the_unit_installed() {
+    let mut h = Harness::new();
+    refused(
+        &mut h,
+        &Spec::modules("update-b", 3000, &["b"], &[]),
+        "install a bundle with a base first",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_rolled_back_bundle_leaves_the_set_it_was_composed_on() {
+    let mut h = with_a().await;
+    h.w().verdict = Verdict::Bad;
+    let e = h
+        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |_, _| {})
+        .await;
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
+    assert_eq!(h.w().tag, "update-a");
+    h.e().refresh_unit().await;
+    assert_eq!(h.e().unit.manifest["MODULES"], "a");
+
+    h.w().verdict = Verdict::Good;
+    let e = h
+        .update(&Spec::modules("update-c", 4000, &["c"], &[]), |_, _| {})
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert_eq!(manifest_of(&e)["MODULES"], "a c");
+}
+
+#[tokio::test]
+async fn a_set_composed_on_another_stack_is_verified_again() {
+    let mut h = with_a().await;
+    let s = Spec::modules("update-b", 3000, &["b"], &[]);
+    assert!(h.verify(&s).await.is_none());
+    h.w().tag = OLD_TAG.into();
+    h.e().request_apply("update-b", "").await.unwrap();
+    h.run(|_, _| {}).await;
+    let e = &h.e().record.history[0];
+    assert_eq!(e.outcome, Outcome::Refused);
+    assert!(e.detail.contains("verify it again"), "{}", e.detail);
 }

@@ -57,6 +57,17 @@ impl crate::unit::Registry for Registry {
         let reference = r.digest.map(|d| d.to_string()).or(r.tag)?;
         self.0.resolve(&r.repo, &reference).map(|d| d.to_string())
     }
+
+    fn read(&self, digest: &str) -> anyhow::Result<Vec<u8>> {
+        let d: edge_registry::Digest = digest
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("{digest}: {e}"))?;
+        if let Some((_, bytes)) = self.0.manifest(&d)? {
+            return Ok(bytes);
+        }
+        std::fs::read(self.0.blob_path(&d))
+            .map_err(|e| anyhow::anyhow!("the store holds no {digest}: {e}"))
+    }
 }
 
 /// The import left a name it could not parse untagged: nothing to keep by it.

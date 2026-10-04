@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::bundle::components::{self, Components, Installed};
 use crate::bundle::{self, Manifest, Verifier, machineconfig};
 use crate::diff::{self, Component, Diff};
 use crate::judge::{self, Check, CheckState, Judge};
@@ -35,6 +36,9 @@ const SECURE_BOOT: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 const SAVED_CONFIG: &str = "config-before.yaml";
+/// In a release's directory: its stack composed for the merged set, and the set.
+const COMPOSED: &str = "composed";
+const INSTALLED: &str = "installed.json";
 
 const INSTALL: i64 = 30 * 60;
 const SETTLE: i64 = 20 * 60;
@@ -100,6 +104,19 @@ pub struct Release {
     pub checks: Vec<Check>,
     #[serde(default)]
     pub diff: Option<Diff>,
+    /// With components: the stack its set was composed on.
+    #[serde(default)]
+    pub composed_on: Option<String>,
+}
+
+/// A unit's installed set, and the stack composed for it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Composed {
+    stack: String,
+    /// The repository the stack is tagged in.
+    #[serde(default)]
+    repo: String,
+    installed: Installed,
 }
 
 impl Release {
@@ -327,12 +344,20 @@ pub fn unix_now() -> i64 {
 pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
     use anyhow::ensure;
     let get = |k: &str| m.get(k).map(String::as_str).unwrap_or_default();
+    for k in ["STACK_TAG", "BUILT_EPOCH"] {
+        ensure!(!get(k).is_empty(), "the MANIFEST lacks {k}");
+    }
+    get("BUILT_EPOCH")
+        .parse::<i64>()
+        .context("BUILT_EPOCH is not a number")?;
+    // Without a base, the unit's own base says the rest.
+    if !bundle::has_base(m) {
+        return Ok(());
+    }
     for k in [
-        "STACK_TAG",
         "STACK_DIGEST",
         "INSTALLER_REF",
         "TALOS_VERSION",
-        "BUILT_EPOCH",
         "SECUREBOOT",
     ] {
         ensure!(!get(k).is_empty(), "the MANIFEST lacks {k}");
@@ -345,10 +370,12 @@ pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
         get("STACK_DIGEST").starts_with("sha256:"),
         "the MANIFEST's STACK_DIGEST is not a sha256"
     );
-    get("BUILT_EPOCH")
-        .parse::<i64>()
-        .context("BUILT_EPOCH is not a number")?;
     Ok(())
+}
+
+/// `oci://host/repo` as a ref's repository.
+fn stack_repo(url: &str) -> &str {
+    url.strip_prefix("oci://").unwrap_or(url)
 }
 
 /// The bundle installs an OS other than the one the unit runs.
@@ -771,6 +798,124 @@ impl Engine {
                 }
             }
         }
+        // An installed set goes with the last release that names its stack.
+        let u = &self.unit;
+        let tags: BTreeSet<String> = self
+            .record
+            .history
+            .iter()
+            .filter_map(|e| e.release.as_ref())
+            .chain(self.record.release.as_ref())
+            .map(|r| r.tag().to_string())
+            .chain([&u.stack_tag, &u.good, &u.previous].map(String::clone))
+            .collect();
+        if let Ok(files) = std::fs::read_dir(self.dir.join("installed")) {
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                let tag = name.strip_suffix(".json").unwrap_or(&name);
+                if !tags.contains(tag) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+    }
+
+    /// The installed set the unit composed for the stack `tag`, if it did.
+    fn installed(&self, tag: &str) -> anyhow::Result<Option<Composed>> {
+        let file_name = |t: &str| {
+            t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        if tag.is_empty() || tag.starts_with('.') || !file_name(tag) {
+            return Ok(None);
+        }
+        let p = self.dir.join("installed").join(format!("{tag}.json"));
+        match std::fs::read(&p) {
+            Ok(b) => Ok(Some(serde_json::from_slice(&b).with_context(|| {
+                format!("{} is not an installed set", p.display())
+            })?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+        }
+    }
+
+    /// With components, the bundle merged into the unit's installed set: the
+    /// release's MANIFEST and refs become the set's, and its stack the base's
+    /// artifact with the set's modules.
+    async fn compose(&self, rel: &mut Release) -> anyhow::Result<()> {
+        let dir = self.release_dir(&rel.sha256);
+        let Some(c) = Components::read(&dir)? else {
+            return Ok(());
+        };
+        let st = &self.settings.stack;
+        let (_, on) = self.cluster.sync(&st.flux_instance).await?;
+        let current = self.installed(&on)?;
+        let patch = match &c.base {
+            Some(_) => Some(std::fs::read_to_string(dir.join(bundle::PATCH))?),
+            None => None,
+        };
+        let next = Installed::after(
+            current.as_ref().map(|c| &c.installed),
+            &rel.manifest,
+            patch.as_deref(),
+            &c,
+        )?;
+        // The bundle's own stack ref, which the composed one then replaces on import.
+        let images = dir.join(bundle::IMAGES);
+        let brought = bundle::layout_images(&images)?
+            .into_iter()
+            .find(|(_, d)| *d == rel.get("STACK_DIGEST"))
+            .and_then(|(r, _)| r.rsplit_once(':').map(|(repo, _)| repo.to_string()));
+        let repo = match (&c.base, &current) {
+            (Some(_), _) => brought,
+            (None, Some(cur)) => Some(cur.repo.clone()).filter(|r| !r.is_empty()),
+            (None, None) => None,
+        }
+        .unwrap_or_else(|| stack_repo(&st.url).to_string());
+        let name = format!("{repo}:{}", rel.tag());
+        let mut refs = next.refs();
+        let stack = if rel.tag() == on {
+            // The bundle of the stack the unit runs, which already has its modules.
+            match current.as_ref() {
+                Some(c) => c.stack.clone(),
+                None => rel.get("STACK_DIGEST").to_string(),
+            }
+        } else {
+            let base = match (&c.base, &current) {
+                (Some(_), _) => rel.get("STACK_DIGEST").to_string(),
+                (None, Some(cur)) => cur.stack.clone(),
+                (None, None) => anyhow::bail!("the unit's stack {on} has no installed set"),
+            };
+            let record = st
+                .modules
+                .as_ref()
+                .map(|r| (r.namespace.as_str(), r.name.as_str()));
+            let files = components::modules_dir(&next.modules, record)?;
+            let registry = self.registry.clone();
+            let out = dir.join(COMPOSED);
+            let _ = std::fs::remove_dir_all(&out);
+            refs.insert(name.clone());
+            components::compose(
+                |d| components::layout_blob(&images, d).or_else(|_| registry.read(d)),
+                &base,
+                &files,
+                &out,
+                &name,
+            )?
+        };
+        rel.manifest = next.manifest(&rel.manifest, &c);
+        rel.manifest.insert("STACK_DIGEST".into(), stack.clone());
+        rel.refs = refs;
+        rel.composed_on = Some(on);
+        std::fs::write(
+            dir.join(INSTALLED),
+            serde_json::to_vec(&Composed {
+                stack,
+                repo,
+                installed: next,
+            })?,
+        )?;
+        Ok(())
     }
 
     async fn verifying(&mut self, sha: &str) -> anyhow::Result<Tick> {
@@ -809,6 +954,12 @@ impl Engine {
         };
         self.refresh_unit().await;
         let mut release = release;
+        if let Err(e) = self.compose(&mut release).await {
+            let _ = std::fs::remove_dir_all(&dir);
+            self.record.release = None;
+            self.finish(Outcome::Refused, format!("{e:#}"))?;
+            return Ok(Tick::Moved);
+        }
         let refusal = self.refusal(&release).await;
         let (checks, diff, short) = self.assess(&release, refusal.as_deref()).await;
         (release.checks, release.diff) = (checks, Some(diff));
@@ -924,7 +1075,10 @@ impl Engine {
         use anyhow::ensure;
         manifest_check(&rel.manifest)?;
         let dir = self.release_dir(&rel.sha256);
-        let carried = bundle::layout_refs(&dir.join(bundle::IMAGES))?;
+        let mut carried = bundle::layout_refs(&dir.join(bundle::IMAGES))?;
+        if dir.join(COMPOSED).exists() {
+            carried.extend(bundle::layout_refs(&dir.join(COMPOSED))?);
+        }
         let lacking: Vec<&str> = rel
             .refs
             .iter()
@@ -977,7 +1131,20 @@ impl Engine {
             );
         }
         let (_, tag) = self.cluster.sync(&st.flux_instance).await?;
+        if let Some(on) = &rel.composed_on {
+            ensure!(
+                tag == *on || tag == rel.tag(),
+                "the unit's stack moved from {on} to {tag} since the bundle was verified: verify it again"
+            );
+        }
         if tag != rel.tag() {
+            if let Some(cur) = self.installed(&tag)? {
+                ensure!(
+                    epoch > cur.installed.built_epoch,
+                    "REFUSING A DOWNGRADE: the unit's last bundle is version {} and this one is {epoch}",
+                    cur.installed.built_epoch
+                );
+            }
             let unit: i64 = lock
                 .get("built_epoch")
                 .and_then(|e| e.parse().ok())
@@ -1006,7 +1173,14 @@ impl Engine {
     }
 
     async fn merged(&self, rel: &Release) -> anyhow::Result<String> {
-        let patch = std::fs::read_to_string(self.release_dir(&rel.sha256).join(bundle::PATCH))?;
+        let dir = self.release_dir(&rel.sha256);
+        let patch = match std::fs::read(dir.join(INSTALLED)) {
+            Ok(b) => serde_json::from_slice::<Composed>(&b)?.installed.patch()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::read_to_string(dir.join(bundle::PATCH))?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let unit = self
             .talos
             .machine_config()
@@ -1126,15 +1300,25 @@ impl Engine {
         // A partial bundle's release runs on images an older release brought.
         keep.extend(self.release()?.refs.iter().cloned());
         let keep = self.keep(keep).await?;
-        let layout = self
-            .release_dir(&self.release()?.sha256)
-            .join(bundle::IMAGES);
+        let dir = self.release_dir(&self.release()?.sha256);
+        let (layout, composed) = (dir.join(bundle::IMAGES), dir.join(COMPOSED));
         let registry = self.registry.clone();
         tokio::task::spawn_blocking(move || {
             registry.retain(&keep)?;
-            registry.import(&layout)
+            registry.import(&layout)?;
+            if composed.exists() {
+                registry.import(&composed)?;
+            }
+            anyhow::Ok(())
         })
         .await??;
+        if let Ok(set) = std::fs::read(dir.join(INSTALLED)) {
+            let d = self.dir.join("installed");
+            std::fs::create_dir_all(&d)?;
+            let tag = self.release()?.tag().to_string();
+            edge_common::durable_write(&d.join(format!("{tag}.json")), &set)
+                .context("record the installed set")?;
+        }
         Ok(Go(Phase::Snapshotting))
     }
 
@@ -1357,9 +1541,13 @@ impl Engine {
         Ok(Go(Phase::Settling))
     }
 
+    /// A bundle without a base has none.
     fn seed(&self) -> anyhow::Result<String> {
         let dir = self.release_dir(&self.release()?.sha256);
-        Ok(std::fs::read_to_string(dir.join(bundle::SEED))?)
+        match std::fs::read_to_string(dir.join(bundle::SEED)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            r => Ok(r?),
+        }
     }
 
     /// The seed's own workloads are not waited for: seeding replaces them, and
@@ -1383,6 +1571,9 @@ impl Engine {
 
     async fn seeding(&mut self) -> anyhow::Result<Next> {
         let seed = self.seed()?;
+        if seed.trim().is_empty() {
+            return Ok(Go(Phase::AwaitingGood));
+        }
         self.cluster
             .apply(&seed)
             .await

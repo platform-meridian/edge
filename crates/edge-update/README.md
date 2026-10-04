@@ -33,6 +33,23 @@ for other clients. Another's upload of a different bundle is not replaced
 until it has been idle for two minutes; the status's `lock` says who holds
 the unit.
 
+## Installed sets
+
+A bundle with `components.json` (see `edge-bundle`) is a set of components:
+the base or not, and modules. edge-update merges it into the installed set of
+the stack the unit runs: a module it brings is installed or updated, one it
+does not mention stays as it is, one goes only if the bundle names it in
+`remove`, and without a base the unit keeps its own, installer included, so
+there is no OS step. It composes the stack for the result, the base's
+artifact with `modules/` rewritten (one file of Flux objects per module, and
+with `stack.modules` set, a ConfigMap of `MODULES` and each module's MANIFEST
+lines), tags it as the bundle's `STACK_TAG` in the repository `stack.url`
+names, and keeps the set beside that tag. The release's MANIFEST, refs and
+machine config are then the set's, so the judge, rollback and collection
+cover the whole set: rolling back returns to the previous one. A bundle
+without a base on a stack whose set it did not compose is refused, as is one
+applied after the stack moved from the one it was verified on.
+
 ## What runs, and what a release changes
 
 `Unit.components` lists what runs: the images of the release the unit runs,

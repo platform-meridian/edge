@@ -80,6 +80,8 @@ pub trait Registry: Send + Sync {
     fn missing(&self, layout: &Path) -> anyhow::Result<u64>;
     /// The digest the store holds a reference at.
     fn digest(&self, image: &str) -> Option<String>;
+    /// A manifest or blob the store holds, by digest.
+    fn read(&self, digest: &str) -> anyhow::Result<Vec<u8>>;
 }
 
 /// `namespace/name`.
@@ -145,4 +147,7 @@ pub struct Stack {
     /// The judge's record: `good`, `previous`, `trial`, `rolled_back`, and
     /// what it says of a trial (README).
     pub judge: Ref,
+    /// The ConfigMap the stack's `modules/` writes the installed modules to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<Ref>,
 }
