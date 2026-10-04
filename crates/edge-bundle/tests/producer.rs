@@ -113,6 +113,7 @@ impl Build {
             images: &self.images,
             refs: None,
             notes: None,
+            instance: None,
         }
     }
 

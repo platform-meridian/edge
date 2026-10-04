@@ -236,13 +236,21 @@ mod tests {
 
     #[test]
     fn workloads_images_are_resolved_where_they_name_no_digest() {
-        let refs = BTreeSet::from(["reg.io/a:1".to_string(), "reg.io/b@sha256:bb".into()]);
+        let refs = BTreeSet::from([
+            "reg.io/a:1".to_string(),
+            "reg.io/b@sha256:bb".into(),
+            "reg.io/c:v2@sha256:cc".into(),
+        ]);
         let c = of_refs(&refs, |r| (r == "reg.io/a:1").then(|| "sha256:aa".into()));
         assert_eq!(
             c.iter()
                 .map(|c| (c.name.as_str(), c.version.as_str(), c.digest.as_str()))
                 .collect::<Vec<_>>(),
-            [("a", "1", "sha256:aa"), ("b", "", "sha256:bb")]
+            [
+                ("a", "1", "sha256:aa"),
+                ("b", "", "sha256:bb"),
+                ("c", "v2", "sha256:cc")
+            ]
         );
     }
 

@@ -100,6 +100,10 @@ pub(crate) struct World {
     apid_down: bool,
     apiserver_down: bool,
     registry_free: u64,
+    /// Every config staged for a boot.
+    staged_configs: Vec<String>,
+    /// The FluxInstance applied, and the stack it applied on.
+    instance: Option<(String, String)>,
 }
 
 impl World {
@@ -138,6 +142,8 @@ impl World {
             no_store: false,
             install_fails: false,
             log: Vec::new(),
+            staged_configs: Vec::new(),
+            instance: None,
             calls: 0,
             changes: 0,
             crash_at: None,
@@ -349,6 +355,7 @@ impl Talos for FakeTalos {
             return Ok(());
         }
         w.staged = Some(config.into());
+        w.staged_configs.push(config.into());
         w.change("stage".into())
     }
     async fn apply_config(&self, config: &str) -> anyhow::Result<()> {
@@ -469,6 +476,11 @@ impl Cluster for FakeCluster {
     async fn apply(&self, manifests: &str) -> anyhow::Result<()> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
+        if manifests.contains("kind: FluxInstance") {
+            let on = w.tag.clone();
+            w.instance = Some((manifests.into(), on));
+            return w.change("instance".into());
+        }
         assert!(
             w.committed_new(),
             "the judge was updated before the OS was committed"
@@ -577,6 +589,7 @@ pub(crate) struct Spec {
     /// A partial bundle's list of every ref.
     refs: Option<Vec<String>>,
     notes: Option<String>,
+    instance: Option<String>,
 }
 
 impl Spec {
@@ -592,6 +605,7 @@ impl Spec {
             carried: None,
             refs: None,
             notes: None,
+            instance: None,
         }
     }
 
@@ -713,6 +727,9 @@ impl Harness {
         std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
         if let Some(n) = &s.notes {
             std::fs::write(src.join(crate::bundle::NOTES), n).unwrap();
+        }
+        if let Some(i) = &s.instance {
+            std::fs::write(src.join(crate::bundle::INSTANCE), i).unwrap();
         }
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
         let carried = s.carried.clone().unwrap_or_else(|| {
@@ -2173,4 +2190,59 @@ async fn the_same_release_again_changes_no_config() {
             .iter()
             .all(|c| c.change == diff::Change::Unchanged)
     );
+}
+
+const INSTANCE: &str = "apiVersion: fluxcd.controlplane.io/v1\nkind: FluxInstance\nmetadata: {name: flux, namespace: flux-system}\nspec:\n  distribution: {version: 2.9.6}\n";
+
+#[tokio::test]
+async fn the_bundles_flux_instance_is_applied_once_its_stack_is() {
+    let mut h = Harness::new();
+    let s = Spec {
+        instance: Some(INSTANCE.into()),
+        ..Spec::new("update-new")
+    };
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let w = h.w();
+    assert_eq!(w.instance, Some((INSTANCE.into(), "update-new".into())));
+    let at = |what: &str| w.log.iter().position(|l| l == what).unwrap();
+    assert!(at("repoint update-new") < at("instance"), "{:?}", w.log);
+}
+
+#[tokio::test]
+async fn a_flux_instance_waits_for_the_signed_stack() {
+    let mut h = Harness::new();
+    h.w().verdict = Verdict::WrongDigest;
+    let s = Spec {
+        instance: Some(INSTANCE.into()),
+        ..Spec::new("update-new")
+    };
+    let e = h.update(&s, |_, _| {}).await;
+    assert_ne!(e.outcome, Outcome::Committed);
+    assert_eq!(h.w().instance, None);
+}
+
+#[tokio::test]
+async fn serving_rotation_is_turned_on_once_the_stack_is_committed() {
+    let mut h = Harness::new();
+    let s = Spec {
+        patch: format!(
+            "{}---\napiVersion: v1alpha1\nkind: KubeletConfig\nconfig:\n  serverTLSBootstrap: true\n",
+            patch("update-new")
+        ),
+        ..Spec::new("update-new")
+    };
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let w = h.w();
+    assert!(!w.staged_configs.is_empty());
+    assert!(
+        w.staged_configs
+            .iter()
+            .all(|c| !c.contains("serverTLSBootstrap")),
+        "the OS step turned rotation on"
+    );
+    assert!(w.active.contains("serverTLSBootstrap: true"));
+    let at = |what: &str| w.log.iter().rposition(|l| l == what).unwrap();
+    assert!(at("repoint update-new") < at("apply"), "{:?}", w.log);
 }

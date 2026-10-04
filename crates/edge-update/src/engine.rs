@@ -86,6 +86,12 @@ pub struct Release {
     pub notes: Option<String>,
     #[serde(default)]
     pub signer: String,
+    /// The OS step left the kubelet's serving rotation off: its approver comes with the stack.
+    #[serde(default)]
+    pub rotation_held: bool,
+    /// The bundle's FluxInstance is applied.
+    #[serde(default)]
+    pub instance_applied: bool,
     /// Each layout ref and the digest it names.
     #[serde(default)]
     pub images: BTreeMap<String, String>,
@@ -1189,9 +1195,25 @@ impl Engine {
         Ok(Go(Phase::Staging))
     }
 
-    async fn staging(&mut self) -> anyhow::Result<Next> {
+    /// The config the OS step applies: serving rotation stays as the unit runs
+    /// it until the stack that approves its requests is committed.
+    async fn os_config(&mut self) -> anyhow::Result<String> {
         let rel = self.release()?.clone();
-        let merged = match self.merged(&rel).await {
+        let running = self
+            .talos
+            .running_config()
+            .await
+            .context("read the unit's running config")?;
+        let (config, held) =
+            machineconfig::rotation_as_running(&self.merged(&rel).await?, &running)?;
+        if let Some(r) = self.record.release.as_mut() {
+            r.rotation_held |= held;
+        }
+        Ok(config)
+    }
+
+    async fn staging(&mut self) -> anyhow::Result<Next> {
+        let merged = match self.os_config().await {
             Ok(m) => m,
             Err(e) => return Ok(Fail(format!("{e:#}"))),
         };
@@ -1238,7 +1260,8 @@ impl Engine {
             && self.talos.version().await? == rel.get("TALOS_VERSION")
         {
             // The unit runs this OS already: the config alone, and no reboot.
-            match self.talos.apply_config(&self.merged(&rel).await?).await {
+            let config = self.os_config().await?;
+            match self.talos.apply_config(&config).await {
                 Ok(()) => {
                     if let Some(r) = self.record.release.as_mut() {
                         r.os_done = true;
@@ -1443,14 +1466,46 @@ impl Engine {
         Ok(Go(Phase::Judging { rolled_back }))
     }
 
+    /// The bundle's FluxInstance, once Flux has applied the stack that brings
+    /// the operator knowing its version, and while the stack is still this release's.
+    async fn instance(&mut self, applied: Option<&str>) -> anyhow::Result<()> {
+        let rel = self.release()?;
+        let signed = format!("{}@{}", rel.tag(), rel.get("STACK_DIGEST"));
+        if rel.instance_applied || applied != Some(signed.as_str()) {
+            return Ok(());
+        }
+        let Some(instance) = bundle::instance(&self.release_dir(&rel.sha256)) else {
+            return Ok(());
+        };
+        let tag = rel.tag().to_string();
+        let (_, now) = self
+            .cluster
+            .sync(&self.settings.stack.flux_instance)
+            .await?;
+        if now != tag {
+            return Ok(());
+        }
+        self.cluster
+            .apply(&instance)
+            .await
+            .context("apply the release's FluxInstance")?;
+        if let Some(r) = self.record.release.as_mut() {
+            r.instance_applied = true;
+        }
+        self.note("applied the release's FluxInstance");
+        self.save()
+    }
+
     async fn judging(&mut self, rolled_back_before: &str) -> anyhow::Result<Next> {
+        let applied = self
+            .cluster
+            .applied(&self.settings.stack.kustomization)
+            .await?;
+        self.instance(applied.as_deref()).await?;
         let rel = self.release()?;
         let tag = rel.tag().to_string();
         let signed = format!("{tag}@{}", rel.get("STACK_DIGEST"));
-        if let Some(r) = self
-            .cluster
-            .applied(&self.settings.stack.kustomization)
-            .await?
+        if let Some(r) = applied
             && r.starts_with(&format!("{tag}@"))
             && r != signed
         {
@@ -1505,6 +1560,18 @@ impl Engine {
     }
 
     async fn collecting(&mut self) -> anyhow::Result<Next> {
+        if self.release()?.rotation_held {
+            let rel = self.release()?.clone();
+            self.talos
+                .apply_config(&self.merged(&rel).await?)
+                .await
+                .context("turn the kubelet's serving certificate rotation on")?;
+            if let Some(r) = self.record.release.as_mut() {
+                r.rotation_held = false;
+            }
+            self.note("the kubelet's serving certificate rotation is on: the stack approves it");
+            self.save()?;
+        }
         let mut keep = self.release()?.refs.clone();
         keep.extend(self.committed_refs(1));
         self.registry.retain(&self.keep(keep).await?)?;

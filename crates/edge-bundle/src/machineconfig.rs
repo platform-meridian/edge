@@ -340,6 +340,33 @@ fn new_volume_encryption(unit: &[(Key, Value)], k: &Key) -> anyhow::Result<Optio
     Ok(seen.cloned())
 }
 
+const ROTATION: &[&str] = &["config", "serverTLSBootstrap"];
+
+fn kubelet(docs: &mut [(Key, Value)]) -> Option<&mut Value> {
+    docs.iter_mut()
+        .find(|(k, _)| matches!(k, Key::Typed(kind, _) if kind == "KubeletConfig"))
+        .map(|(_, d)| d)
+}
+
+/// The kubelet asks for its serving certificate by CSR, which waits for an approver.
+pub fn serving_rotation(config: &str) -> anyhow::Result<bool> {
+    let mut docs = parse(config)?;
+    Ok(kubelet(&mut docs).is_some_and(|d| get(d, ROTATION) == Some(&Value::Bool(true))))
+}
+
+/// `next` as `running` has it for serving rotation, and whether that held it back:
+/// the approver comes with the stack, so turning it on waits for it.
+pub fn rotation_as_running(next: &str, running: &str) -> anyhow::Result<(String, bool)> {
+    if !serving_rotation(next)? || serving_rotation(running)? {
+        return Ok((next.into(), false));
+    }
+    let mut docs = parse(next)?;
+    if let Some(d) = kubelet(&mut docs) {
+        remove(d, ROTATION);
+    }
+    Ok((render(&docs)?, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +702,27 @@ image: kubelet:new
                 &["encryption"]
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn serving_rotation_waits_for_the_running_config_to_have_it() {
+        let on = "version: v1alpha1\n---\napiVersion: v1alpha1\nkind: KubeletConfig\nconfig:\n  serverTLSBootstrap: true\n  x: 1\n";
+        let off =
+            "version: v1alpha1\n---\napiVersion: v1alpha1\nkind: KubeletConfig\nconfig:\n  x: 1\n";
+        assert!(serving_rotation(on).unwrap());
+        assert!(!serving_rotation(off).unwrap());
+        let (os, held) = rotation_as_running(on, off).unwrap();
+        assert!(held);
+        assert!(!serving_rotation(&os).unwrap());
+        assert!(os.contains("x: 1"));
+        assert_eq!(
+            rotation_as_running(on, on).unwrap(),
+            (on.to_string(), false)
+        );
+        assert_eq!(
+            rotation_as_running(off, on).unwrap(),
+            (off.to_string(), false)
         );
     }
 }

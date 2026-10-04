@@ -15,6 +15,8 @@
 //! - optionally `refs`: every ref the release runs, one per line, when the
 //!   layout carries only those the unit lacks (a partial bundle).
 //! - `NOTES.md`, optional: release notes for a person, at most 64 KiB.
+//! - `fluxinstance.yaml`, optional: the FluxInstance the release runs on,
+//!   applied once the stack has brought the operator that knows it.
 //!
 //! `MANIFEST` may also name the images a person cares about, one
 //! `COMPONENT_<NAME>=<ref> <digest> <version> dirty=<bool>` line each
@@ -48,6 +50,7 @@ pub const SEED: &str = "seed.yaml";
 pub const IMAGES: &str = "images";
 pub const REFS: &str = "refs";
 pub const NOTES: &str = "NOTES.md";
+pub const INSTANCE: &str = "fluxinstance.yaml";
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIG: u64 = 64 << 10;
@@ -401,6 +404,11 @@ fn unpack_into(tar: impl Read, dest: &Path, verifier: &Verifier) -> anyhow::Resu
     parse_manifest(&std::fs::read_to_string(dest.join(MANIFEST))?)
 }
 
+/// An unpacked bundle's FluxInstance, if it carries one.
+pub fn instance(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(INSTANCE)).ok()
+}
+
 /// An unpacked bundle's notes, if it carries any.
 pub fn notes(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join(NOTES)).ok()
@@ -515,6 +523,8 @@ pub struct Contents<'a> {
     pub refs: Option<&'a BTreeSet<String>>,
     /// Release notes for a person: [`NOTES`].
     pub notes: Option<&'a str>,
+    /// The FluxInstance the release runs on: [`INSTANCE`].
+    pub instance: Option<&'a str>,
 }
 
 enum Source {
@@ -569,6 +579,9 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
     if let Some(refs) = contents.refs {
         let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
         files.insert(REFS.into(), Source::Bytes(text.into_bytes()));
+    }
+    if let Some(i) = contents.instance {
+        files.insert(INSTANCE.into(), Source::Bytes(i.as_bytes().into()));
     }
     if let Some(n) = contents.notes {
         files.insert(NOTES.into(), Source::Bytes(n.as_bytes().into()));
