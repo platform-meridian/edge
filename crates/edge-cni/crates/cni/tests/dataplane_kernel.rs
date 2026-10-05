@@ -186,6 +186,19 @@ fn probe(at: fn(Ipv4Addr) -> IpAddr) {
     };
     println!("udp={udp}");
 
+    // Connected, as c-ares does: the reply's source is still checked.
+    let udp = UdpSocket::bind((any, 0)).unwrap();
+    udp.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let connected = match udp
+        .connect((at(VIP), 53))
+        .and_then(|_| udp.send(b"ping"))
+        .and_then(|_| udp.recv_from(&mut b))
+    {
+        Ok((n, from)) => format!("{from} {}", String::from_utf8_lossy(&b[..n])),
+        Err(e) => format!("{:?}", e.kind()),
+    };
+    println!("udp_connected={connected}");
+
     let no_backends =
         match TcpStream::connect_timeout(&SocketAddr::new(at(NO_BACKENDS_VIP), 80), TIMEOUT) {
             Ok(_) => "connected".to_string(),
@@ -232,7 +245,7 @@ fn probe_test(test: &str, cgroup: Option<&Path>) -> BTreeMap<String, String> {
     stdout
         .lines()
         .filter_map(|l| l.split_once('='))
-        .filter(|(k, _)| ["tcp", "udp", "no_backends"].contains(k))
+        .filter(|(k, _)| ["tcp", "udp", "udp_connected", "no_backends"].contains(k))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
@@ -297,6 +310,11 @@ fn services_rewritten_in_cgroup() {
         format!("{VIP}:53 {REPLY}"),
         "the UDP reply comes from the VIP"
     );
+    assert_eq!(
+        inside["udp_connected"],
+        format!("{VIP}:53 {REPLY}"),
+        "a connected socket's UDP reply comes from the VIP"
+    );
     assert_eq!(inside["no_backends"], "ConnectionRefused");
 
     drop((bpf, programmer));
@@ -313,6 +331,7 @@ fn services_rewritten_in_cgroup() {
     for (who, seen) in [("outside the cgroup", outside), ("unpinned", unpinned)] {
         assert_ne!(seen["tcp"], REPLY, "{who}: {seen:?}");
         assert!(!seen["udp"].ends_with(REPLY), "{who}: {seen:?}");
+        assert!(!seen["udp_connected"].ends_with(REPLY), "{who}: {seen:?}");
         assert_ne!(seen["no_backends"], "ConnectionRefused", "{who}: {seen:?}");
     }
 }
@@ -356,11 +375,17 @@ fn services_rewritten_for_dual_stack_sockets() {
         format!("{} {REPLY}", SocketAddr::new(dual_stack(VIP), 53)),
         "the UDP reply comes from the mapped VIP"
     );
+    assert_eq!(
+        inside["udp_connected"],
+        format!("{} {REPLY}", SocketAddr::new(dual_stack(VIP), 53)),
+        "a connected socket's UDP reply comes from the mapped VIP"
+    );
     assert_eq!(inside["no_backends"], "ConnectionRefused");
 
     let outside = probe_test(DUAL_STACK_TEST, None);
     assert_ne!(outside["tcp"], REPLY, "{outside:?}");
     assert!(!outside["udp"].ends_with(REPLY), "{outside:?}");
+    assert!(!outside["udp_connected"].ends_with(REPLY), "{outside:?}");
 }
 
 fn dial_until_stdin_closes() {

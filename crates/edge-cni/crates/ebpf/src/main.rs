@@ -165,6 +165,23 @@ fn refuse() -> i32 {
     0
 }
 
+/// The backend is the source recvmsg will see; it is reported as the service.
+#[inline(always)]
+fn remember(ctx: &SockAddrContext, orig: &ServiceKey, backend: &BackendVal) {
+    let key = RevNatKey {
+        cookie: unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) },
+        addr: backend.addr,
+        port: backend.port,
+        _pad: 0,
+    };
+    let rev = RevNat {
+        addr: orig.addr,
+        port: orig.port,
+        _pad: 0,
+    };
+    let _ = REVNAT.insert(key, rev, 0);
+}
+
 /// Returns the backend for the caller to write in, or None to pass the call.
 #[inline(always)]
 fn connect(ctx: &SockAddrContext, addr: u32) -> Result<Option<u32>, i32> {
@@ -173,7 +190,13 @@ fn connect(ctx: &SockAddrContext, addr: u32) -> Result<Option<u32>, i32> {
         return Ok(None);
     }
     match resolve(ctx, addr, proto, false) {
-        Resolved::Backend(_, backend) => Ok(Some(backend.addr)),
+        Resolved::Backend(orig, backend) => {
+            // A connected UDP socket's reply is checked against the VIP too (c-ares).
+            if proto == IPPROTO_UDP {
+                remember(ctx, &orig, &backend);
+            }
+            Ok(Some(backend.addr))
+        }
         Resolved::NoBackends => Err(refuse()),
         Resolved::NotAService => Ok(None),
     }
@@ -213,20 +236,7 @@ pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
     match resolve(&ctx, sock_addr.user_ip4, IPPROTO_UDP, true) {
         Resolved::Backend(orig, backend) => {
             sock_addr.user_ip4 = backend.addr;
-            let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
-            // The backend is the source recvmsg will see.
-            let key = RevNatKey {
-                cookie,
-                addr: backend.addr,
-                port: backend.port,
-                _pad: 0,
-            };
-            let rev = RevNat {
-                addr: orig.addr,
-                port: orig.port,
-                _pad: 0,
-            };
-            let _ = REVNAT.insert(key, rev, 0);
+            remember(&ctx, &orig, &backend);
             1
         }
         Resolved::NoBackends => refuse(),
