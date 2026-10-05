@@ -1138,13 +1138,10 @@ mod tests {
                 resolved,
             ),
             (
-                "rewrite-host is carried",
+                "the retired rewrite-host annotation does nothing",
                 svc_spec(),
                 json!({ "edge.meridian/rewrite-host": "mesh.name" }),
-                vec![Route {
-                    rewrite_host: Some("mesh.name".into()),
-                    ..served(None, "/", "svc.apps", 80)
-                }],
+                svc(),
                 accepted,
                 resolved,
             ),
@@ -1322,7 +1319,7 @@ mod tests {
                 resolved,
             ),
             (
-                "URLRewrite: prefix and host, which outranks the annotation",
+                "URLRewrite: prefix and host",
                 rule(
                     json!({ "matches": [{ "path": { "value": "/app" } }], "filters": [{ "type": "URLRewrite", "urlRewrite": {
                     "hostname": "Inner.Example", "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": "/a/./b" } } }],
@@ -2177,5 +2174,54 @@ mod tests {
         }
         let c = frontend_cluster(json!({}), vec![], vec![]);
         assert_eq!(gw_resolved(&c), (true, "ResolvedRefs"), "no reference");
+    }
+
+    /// Routes from several HTTPRoutes on one hostname merge, the longest path
+    /// first: the spec's precedence, across routes as within one.
+    #[test]
+    fn routes_on_one_hostname_merge() {
+        let ui = http_route(
+            "lattice",
+            "lattice-ui",
+            T0,
+            json!({}),
+            json!({ "hostnames": ["lattice.example"], "rules": [{ "backendRefs": [{ "name": "envoy", "port": 80 }] }] }),
+        );
+        let basemap = http_route(
+            "lattice",
+            "basemap",
+            "2026-02-01T00:00:00Z",
+            json!({}),
+            json!({ "hostnames": ["lattice.example"], "rules": [{
+                "matches": [{ "path": { "type": "PathPrefix", "value": "/basemap" } }],
+                "filters": [{ "type": "URLRewrite", "urlRewrite": {
+                    "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": "/" } } }],
+                "backendRefs": [{ "name": "martin", "port": 3000 }] }] }),
+        );
+        let mut c = Cluster::basic();
+        c.list(Kind::Route, vec![ui, basemap]);
+        let table = c.table();
+        let first = |path: &str| {
+            table
+                .iter()
+                .find(|r| r.matches(Some("lattice.example"), path))
+                .map(|r| r.backend.clone().unwrap().host)
+        };
+        assert_eq!(
+            first("/basemap/tiles/1"),
+            Some("martin.lattice.svc.cluster.local".into())
+        );
+        assert_eq!(
+            first("/basemap"),
+            Some("martin.lattice.svc.cluster.local".into())
+        );
+        assert_eq!(
+            first("/basemapx"),
+            Some("envoy.lattice.svc.cluster.local".into())
+        );
+        assert_eq!(first("/"), Some("envoy.lattice.svc.cluster.local".into()));
+        for name in ["lattice-ui", "basemap"] {
+            assert!(c.outcome(name).accepted.ok, "{name}");
+        }
     }
 }

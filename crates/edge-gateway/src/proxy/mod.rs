@@ -386,11 +386,13 @@ fn rewrite_for_upstream(
     // The route's edits first: authz's, which decided the request, win.
     modify_headers(&mut parts.headers, &route.filters.request_headers);
     authz::apply_request_edits(&mut parts.headers, remove, ops);
-    // The upstream Host is the route's, never the client's: otherwise it would
-    // differ between h1 (Host forwarded) and h2 (Host synthesised).
+    // The client's, as routed on (h2 `:authority` or h1's Host, one way for
+    // both), unless URLRewrite names another; the backend's address only when
+    // the client named none.
     let upstream_host = route
         .rewrite_host
         .clone()
+        .or_else(|| client_host.clone())
         .unwrap_or_else(|| format!("{}:{}", backend.host, backend.port));
     if let Ok(val) = HeaderValue::try_from(upstream_host) {
         parts.headers.insert(hyper::header::HOST, val);
@@ -536,10 +538,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_host_is_the_routes() {
+    async fn upstream_host_is_the_clients() {
         let b = recorder("b").await;
         for (rewrite, want_host) in [
-            (None, b.addr.to_string()),
+            (None, "headlamp.example.lan:8443".to_string()),
             (Some("mesh.example"), "mesh.example".to_string()),
         ] {
             let mut r = route("/", Authz::Skip, b.addr);

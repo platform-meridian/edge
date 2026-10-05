@@ -10,14 +10,15 @@ matches, a weighted split, an unknown filter) drops that rule and says so in the
 route's `Accepted` condition. The core filters are honoured:
 `RequestHeaderModifier`, `URLRewrite` (hostname, `ReplaceFullPath`,
 `ReplacePrefixMatch`) and `RequestRedirect`. Filters apply after authorization,
-which judges the request as the client sent it.
+which judges the request as the client sent it. Backends get the client's
+`Host`, as routed on; only `URLRewrite`'s `hostname` changes it. HTTPRoutes on
+one hostname merge, the longest path prefix first.
 
 Annotations on an HTTPRoute:
 
 | Annotation | |
 |---|---|
 | `edge.meridian/authz: skip` | Serve without asking the authorization service; any other value, or none, asks. |
-| `edge.meridian/rewrite-host: <name>` | The upstream `Host`; a `URLRewrite` hostname outranks it. |
 | `edge.meridian/client-certificate: request` | The route's hostnames ask the client for a certificate (below). |
 
 ## Client certificates

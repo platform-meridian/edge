@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Absent means authz is required. Stands in for GEP-1494 `ExternalAuth`.
 const AUTHZ_ANNOTATION: &str = "edge.meridian/authz";
-const REWRITE_HOST_ANNOTATION: &str = "edge.meridian/rewrite-host";
 /// `request`: the route's hostnames ask the client for a certificate. Ours: the
 /// API sets validation per port, and a browser asked shows a picker.
 pub(super) const CLIENT_CERT_ANNOTATION: &str = "edge.meridian/client-certificate";
@@ -118,7 +117,6 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
         Some("skip") => Authz::Skip,
         _ => Authz::Required,
     };
-    let rewrite_host = annotation(REWRITE_HOST_ANNOTATION);
     let mut client_cert = annotation(CLIENT_CERT_ANNOTATION).as_deref() == Some("request");
 
     let mut unsupported = Vec::new();
@@ -161,7 +159,8 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
                 }
             }
         };
-        let rewrite_host = host_rewrite.or_else(|| rewrite_host.clone());
+        // Host is the client's unless URLRewrite names another.
+        let rewrite_host = host_rewrite;
         let prefixes = rule_prefixes(i, rule, &mut unsupported);
         for host in &hostnames {
             for prefix in &prefixes {

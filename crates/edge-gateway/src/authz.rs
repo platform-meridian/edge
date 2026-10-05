@@ -477,7 +477,11 @@ mod tests {
             );
         }
         assert_eq!(s.headers_named("x-forwarded-for"), ["127.0.0.1"]);
-        assert_eq!(s.headers_named("host"), [b.addr.to_string().as_str()]);
+        assert_eq!(
+            s.headers_named("host"),
+            ["t.test"],
+            "the client's, not authz's"
+        );
     }
 
     #[tokio::test]

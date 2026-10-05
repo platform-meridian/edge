@@ -247,10 +247,36 @@ mod tests {
             .unwrap();
         assert_eq!(h2_get(gw.addr, req).await.status(), 200);
         let seen = b.last();
-        assert_eq!(seen.header("host"), Some(b.addr.to_string().as_str()));
+        assert_eq!(seen.headers_named("host"), ["headlamp.example.lan:8443"]);
         assert_eq!(
             seen.header("x-forwarded-host"),
             Some("headlamp.example.lan:8443")
+        );
+    }
+
+    /// The Host a backend sees is the one routed on, h1 or h2, whatever else
+    /// the client sent; with none, the backend's own address.
+    #[tokio::test]
+    async fn host_preserved_as_routed() {
+        let b = recorder("b").await;
+        let gw = gateway(insecure_cfg(), vec![route("/", Authz::Skip, b.addr)]).await;
+        raw(
+            gw.addr,
+            "GET http://user@a.test/ HTTP/1.1\r\nHost: b.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(b.last().headers_named("host"), ["a.test"]);
+        let req = Request::builder()
+            .uri("http://a.test/")
+            .header("host", "b.test")
+            .body(Body::default())
+            .unwrap();
+        h2_get(gw.addr, req).await;
+        assert_eq!(b.last().headers_named("host"), ["a.test"]);
+        raw(gw.addr, "GET / HTTP/1.0\r\n\r\n").await;
+        assert_eq!(
+            b.last().headers_named("host"),
+            [b.addr.to_string().as_str()]
         );
     }
 

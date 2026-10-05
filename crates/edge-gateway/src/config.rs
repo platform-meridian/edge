@@ -102,6 +102,7 @@ pub struct Route {
     pub prefix: String,
     #[serde(default)]
     pub authz: Authz,
+    /// The upstream Host in place of the client's: URLRewrite's `hostname`.
     #[serde(default)]
     pub rewrite_host: Option<String>,
     /// Absent only on a redirect, which is answered here.
