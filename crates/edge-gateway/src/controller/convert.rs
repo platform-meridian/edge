@@ -8,13 +8,14 @@ use super::schema::{
 use super::state::Key;
 use super::{GATEWAY_GROUP, GatewayRef};
 use crate::config::{
-    Authz, Backend, Filters, HeaderModifier, PathModifier, Redirect, Route, normalize_host,
+    Authz, Backend, Filters, HeaderModifier, PathModifier, Redirect, Route, UpstreamTls,
+    normalize_host,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::ResourceExt;
 use kube::api::DynamicObject;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Absent means authz is required. Stands in for GEP-1494 `ExternalAuth`.
 const AUTHZ_ANNOTATION: &str = "edge.meridian/authz";
@@ -28,6 +29,7 @@ pub(super) struct Ctx<'a> {
     pub listeners: Option<&'a [Listener]>,
     pub services: Option<&'a BTreeSet<Key>>,
     pub grants: &'a [ReferenceGrant],
+    pub backend_tls: &'a BTreeMap<Key, UpstreamTls>,
     /// No HTTPRoute may claim the config file's hostnames.
     pub static_hosts: &'a HashSet<String>,
 }
@@ -66,6 +68,8 @@ impl Problem {
 
 pub(super) struct Outcome {
     pub routes: Vec<Route>,
+    /// The Services its served rules forward to.
+    pub services: BTreeSet<Key>,
     pub parent: Value,
     pub accepted: Verdict,
     pub resolved: Verdict,
@@ -91,6 +95,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
     if let Err(p) = attach_any(&ours, &ns, ctx) {
         return Some(Outcome {
             routes: vec![],
+            services: BTreeSet::new(),
             parent,
             accepted: p.into_verdict(),
             resolved: Verdict {
@@ -113,6 +118,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
     let mut unresolved = Vec::new();
     let hostnames = hostnames(&spec.hostnames, ctx, &mut unsupported);
     let mut routes = Vec::new();
+    let mut services = BTreeSet::new();
     for (i, rule) in spec.rules.iter().enumerate() {
         let (filters, host_rewrite) = match rule_filters(i, rule, ctx.gateway.bound_port) {
             Ok(f) => f,
@@ -126,7 +132,10 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
             None
         } else {
             match rule_backend(i, rule, &ns, ctx) {
-                Ok(b) => Some(b),
+                Ok((b, service)) => {
+                    services.insert(service);
+                    Some(b)
+                }
                 Err(Skipped::Unsupported(p)) => {
                     unsupported.push(p);
                     continue;
@@ -158,6 +167,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
         accepted: accepted(&unsupported, routes.len()),
         resolved: resolved(&unresolved),
         routes,
+        services,
         parent,
     })
 }
@@ -251,7 +261,12 @@ enum Skipped {
     Unresolved(Problem),
 }
 
-fn rule_backend(i: usize, rule: &Rule, route_ns: &str, ctx: &Ctx) -> Result<Backend, Skipped> {
+fn rule_backend(
+    i: usize,
+    rule: &Rule,
+    route_ns: &str,
+    ctx: &Ctx,
+) -> Result<(Backend, Key), Skipped> {
     let unsupported = |what: String| {
         Skipped::Unsupported(problem("UnsupportedValue", format!("rule {i}: {what}")))
     };
@@ -276,7 +291,7 @@ fn rule_backend(i: usize, rule: &Rule, route_ns: &str, ctx: &Ctx) -> Result<Back
     }
 }
 
-fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<Backend, Problem> {
+fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<(Backend, Key), Problem> {
     let group = b.group.as_deref().unwrap_or("");
     let kind = b.kind.as_deref().unwrap_or("Service");
     if !group.is_empty() || kind != "Service" {
@@ -315,10 +330,15 @@ fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<Backend,
             format!("Service {ns}/{} does not exist", b.name),
         ));
     }
-    Ok(Backend {
-        host: format!("{}.{ns}.svc.cluster.local", b.name),
-        port,
-    })
+    let service = (ns.to_string(), b.name.clone());
+    Ok((
+        Backend {
+            host: format!("{}.{ns}.svc.cluster.local", b.name),
+            port,
+            tls: ctx.backend_tls.get(&service).cloned(),
+        },
+        service,
+    ))
 }
 
 /// Each kind at most once, and never a redirect with a rewrite: the API's own

@@ -3,6 +3,7 @@
 
 mod convert;
 mod frontend;
+mod policy;
 mod report;
 mod run;
 mod schema;

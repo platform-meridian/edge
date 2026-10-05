@@ -65,24 +65,39 @@ pub fn route_parent(parent: &Value, controller: &str, conditions: Vec<Condition>
     })
 }
 
+pub fn policy_ancestor(ancestor: &Value, controller: &str, conditions: Vec<Condition>) -> Value {
+    json!({
+        "ancestorRef": ancestor,
+        "controllerName": controller,
+        "conditions": conditions,
+    })
+}
+
 /// Other implementations report on the same route, so only our entry is replaced.
 pub fn merge_parents(current: Option<&Value>, ours: Value, controller: &str) -> Vec<Value> {
-    let mut out: Vec<Value> = match current {
+    let mut out = others(current, controller);
+    out.push(ours);
+    out
+}
+
+pub fn others(current: Option<&Value>, controller: &str) -> Vec<Value> {
+    match current {
         Some(Value::Array(a)) => a
             .iter()
             .filter(|p| p["controllerName"] != json!(controller))
             .cloned()
             .collect(),
         _ => Vec::new(),
-    };
-    out.push(ours);
-    out
+    }
 }
 
 /// Ignores `lastTransitionTime`, which would otherwise never converge.
 pub fn parents_same(current: Option<&Value>, desired: &[Value]) -> bool {
-    let Some(Value::Array(have)) = current else {
-        return false;
+    let empty = Vec::new();
+    let have = match current {
+        Some(Value::Array(have)) => have,
+        None | Some(Value::Null) if desired.is_empty() => &empty,
+        _ => return false,
     };
     if have.len() != desired.len() {
         return false;
@@ -90,6 +105,7 @@ pub fn parents_same(current: Option<&Value>, desired: &[Value]) -> bool {
     desired.iter().all(|d| {
         have.iter().any(|h| {
             h["parentRef"] == d["parentRef"]
+                && h["ancestorRef"] == d["ancestorRef"]
                 && h["controllerName"] == d["controllerName"]
                 && conditions_equal(&h["conditions"], &d["conditions"])
         })
@@ -179,5 +195,32 @@ mod tests {
             assert!(!parents_same(Some(&published), &differs), "{differs:?}");
         }
         assert!(!parents_same(None, &[entry("Accepted", OURS)]));
+    }
+
+    #[test]
+    fn ancestors_compared_and_removed() {
+        let gw = json!({ "kind": "Gateway", "name": "edge" });
+        let ours = policy_ancestor(&gw, OURS, vec![cond("Accepted", 1)]);
+        let theirs = json!({ "ancestorRef": { "name": "x" }, "controllerName": "someone.else/gateway", "conditions": [] });
+        let published = json!([theirs, ours]);
+        let desired = merge_parents(Some(&published), ours.clone(), OURS);
+        assert!(parents_same(Some(&published), &desired));
+        let elsewhere =
+            policy_ancestor(&json!({ "name": "other" }), OURS, vec![cond("Accepted", 1)]);
+        assert!(!parents_same(
+            Some(&published),
+            &merge_parents(Some(&published), elsewhere, OURS)
+        ));
+        let removed = others(Some(&published), OURS);
+        assert_eq!(removed, [theirs]);
+        assert!(
+            !parents_same(Some(&published), &removed),
+            "a stale entry is removed"
+        );
+        assert!(
+            parents_same(None, &[]),
+            "nothing to remove, nothing written"
+        );
+        assert!(parents_same(Some(&Value::Null), &[]));
     }
 }

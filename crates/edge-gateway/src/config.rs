@@ -22,6 +22,16 @@ pub enum AuthzProtocol {
 pub struct Backend {
     pub host: String,
     pub port: u16,
+    /// From a BackendTLSPolicy; the config file has none.
+    #[serde(skip)]
+    pub tls: Option<UpstreamTls>,
+}
+
+/// An empty `ca_pem` refuses every request: the policy could not be honoured.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UpstreamTls {
+    pub hostname: String,
+    pub ca_pem: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -575,6 +585,7 @@ routes:
             backend: Some(Backend {
                 host: "b".into(),
                 port: 1,
+                tls: None,
             }),
             filters: Filters::default(),
             client_cert: false,

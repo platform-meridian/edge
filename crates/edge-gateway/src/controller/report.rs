@@ -1,4 +1,5 @@
 use super::convert::Outcome;
+use super::policy;
 use super::run::each_ok;
 use super::{CONTROLLER, GATEWAY_GROUP, GatewayRef, api_resource};
 use crate::status;
@@ -35,6 +36,50 @@ pub(super) async fn publish_route_status(
     )
     .await?;
     tracing::info!(route = %o.name_any(), accepted = outcome.accepted.ok, "status written");
+    Ok(())
+}
+
+/// Our ancestor entry while one of our routes uses a Service it targets;
+/// otherwise none, and a stale one is removed.
+pub(super) async fn publish_policy_status(
+    client: &Client,
+    ar: &ApiResource,
+    gateway: &GatewayRef,
+    o: &DynamicObject,
+    outcome: &policy::Outcome,
+    ours: bool,
+) -> anyhow::Result<()> {
+    let generation = o.metadata.generation.unwrap_or(0);
+    let current = o.data.get("status").and_then(|s| s.get("ancestors"));
+    let desired = if ours {
+        let ancestor = json!({
+            "group": GATEWAY_GROUP, "kind": "Gateway",
+            "namespace": gateway.namespace, "name": gateway.name,
+        });
+        let conds = vec![
+            outcome.accepted.condition("Accepted", generation),
+            outcome.resolved.condition("ResolvedRefs", generation),
+        ];
+        status::merge_parents(
+            current,
+            status::policy_ancestor(&ancestor, CONTROLLER, conds),
+            CONTROLLER,
+        )
+    } else {
+        status::others(current, CONTROLLER)
+    };
+    if status::parents_same(current, &desired) {
+        return Ok(());
+    }
+    let ns = o.namespace().unwrap_or_default();
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), &ns, ar);
+    api.patch_status(
+        &o.name_any(),
+        &status::patch_params(),
+        &kube::api::Patch::Merge(json!({ "status": { "ancestors": desired } })),
+    )
+    .await?;
+    tracing::info!(policy = %o.name_any(), accepted = outcome.accepted.ok, resolved = outcome.resolved.ok, "status written");
     Ok(())
 }
 

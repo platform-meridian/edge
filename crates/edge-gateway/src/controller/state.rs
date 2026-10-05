@@ -3,6 +3,7 @@
 use super::GatewayRef;
 use super::convert::{Ctx, Outcome, convert};
 use super::frontend::{Derived, derive};
+use super::policy;
 use super::schema::{Listener, ReferenceGrant};
 use super::trust::{Sources, thin_configmap};
 use crate::config::Route;
@@ -20,6 +21,7 @@ pub(super) enum Kind {
     Grant,
     ConfigMap,
     TrustBundle,
+    Policy,
 }
 
 // Consumed one at a time, never stored; boxing would only allocate.
@@ -92,12 +94,16 @@ pub(super) struct State {
     grants: Store,
     configmaps: Store,
     bundles: Store,
+    policies: Store,
 }
 
 pub(super) struct Built {
     pub table: Vec<Route>,
     pub outcomes: Vec<(DynamicObject, Outcome)>,
     pub frontend: Derived,
+    /// BackendTLSPolicies, and whether one of our routes uses a Service each
+    /// targets: their status is ours to report only then.
+    pub policies: Vec<(DynamicObject, policy::Outcome, bool)>,
 }
 
 impl State {
@@ -109,6 +115,7 @@ impl State {
             Kind::Grant => &mut self.grants,
             Kind::ConfigMap => &mut self.configmaps,
             Kind::TrustBundle => &mut self.bundles,
+            Kind::Policy => &mut self.policies,
         }
     }
 
@@ -136,6 +143,7 @@ impl State {
             && self.grants.phase != Phase::AwaitingFirstList
             && self.configmaps.phase != Phase::AwaitingFirstList
             && self.bundles.phase != Phase::AwaitingFirstList
+            && self.policies.phase != Phase::AwaitingFirstList
     }
 
     fn sources(&self) -> Sources<'_> {
@@ -166,29 +174,44 @@ impl State {
             .collect();
         let static_hosts: HashSet<String> =
             statics.iter().filter_map(|r| r.hostname.clone()).collect();
+        let sources = self.sources();
+        let policies: Vec<&DynamicObject> = self.policies.live.values().collect();
+        let policies = policy::evaluate(&policies, &sources);
         let ctx = Ctx {
             gateway,
             listeners: listeners.as_deref(),
             services: services.as_ref(),
             grants: &grants,
+            backend_tls: &policies.by_service,
             static_hosts: &static_hosts,
         };
 
         let mut outcomes = Vec::new();
         let mut table: Vec<Route> = statics.to_vec();
+        let mut used = BTreeSet::new();
         for o in self.routes_oldest_first() {
             if let Some(out) = convert(o, &ctx) {
                 table.extend(out.routes.iter().cloned());
+                used.extend(out.services.iter().cloned());
                 outcomes.push((o.clone(), out));
             }
         }
+        let policies = policies
+            .outcomes
+            .into_iter()
+            .map(|(o, p)| {
+                let ours = p.targets.iter().any(|t| used.contains(t));
+                (o, p, ours)
+            })
+            .collect();
         // Stable sort: on a tie, statics then the oldest route win.
         table.sort_by(Route::precedence);
-        let frontend = derive(our_gateway, gateway, &self.sources(), &grants, &table);
+        let frontend = derive(our_gateway, gateway, &sources, &grants, &table);
         Built {
             table,
             outcomes,
             frontend,
+            policies,
         }
     }
 
@@ -332,6 +355,7 @@ mod tests {
             backend: Some(Backend {
                 host: backend.into(),
                 port: 1,
+                tls: None,
             }),
             filters: Default::default(),
             client_cert: false,
@@ -347,6 +371,7 @@ mod tests {
             backend: Some(Backend {
                 host: format!("{service}.svc.cluster.local"),
                 port,
+                tls: None,
             }),
             filters: Default::default(),
             client_cert: false,
@@ -388,6 +413,7 @@ mod tests {
             c.fail(Kind::Grant);
             c.fail(Kind::ConfigMap);
             c.fail(Kind::TrustBundle);
+            c.fail(Kind::Policy);
             c
         }
 
@@ -513,6 +539,12 @@ mod tests {
             "ClusterTrustBundles have neither listed nor failed"
         );
         c.fail(Kind::TrustBundle);
+        assert_eq!(
+            c.table(),
+            file,
+            "BackendTLSPolicies have neither listed nor failed"
+        );
+        c.fail(Kind::Policy);
         assert_eq!(c.table().len(), 2);
     }
 
@@ -672,6 +704,7 @@ mod tests {
         c.fail(Kind::Grant);
         c.fail(Kind::ConfigMap);
         c.fail(Kind::TrustBundle);
+        c.fail(Kind::Policy);
         let (t, c) = c.one(svc_spec(), json!({}));
         assert!(t.is_empty());
         assert_eq!(verdicts(c.outcome("t")).0, no_parent, "missing Gateway");
@@ -818,6 +851,7 @@ mod tests {
             c.fail(Kind::Service);
             c.fail(Kind::ConfigMap);
             c.fail(Kind::TrustBundle);
+            c.fail(Kind::Policy);
             c.list(Kind::Grant, grants);
             let (t, c) = c.one(
                 backend_ref(json!({ "name": "db", "namespace": "data", "port": 80 })),
@@ -843,6 +877,7 @@ mod tests {
         c.fail(Kind::Grant);
         c.fail(Kind::ConfigMap);
         c.fail(Kind::TrustBundle);
+        c.fail(Kind::Policy);
         let route = |name, svc| {
             http_route(
                 "apps",
@@ -1417,6 +1452,7 @@ mod tests {
         c.list(Kind::Grant, grants);
         c.list(Kind::ConfigMap, cms);
         c.fail(Kind::TrustBundle);
+        c.fail(Kind::Policy);
         let marked = http_route(
             "apps",
             "elf",
@@ -1618,5 +1654,83 @@ mod tests {
             c.state.configmaps.live[&("edge".to_string(), "y".to_string())].data,
             Value::Null
         );
+    }
+
+    fn btls(name: &str, svc: &str, ca: &str) -> DynamicObject {
+        obj(
+            "gateway.networking.k8s.io/v1",
+            "BackendTLSPolicy",
+            "apps",
+            name,
+            T0,
+            json!({}),
+            json!({ "targetRefs": [{ "group": "", "kind": "Service", "name": svc }],
+                    "validation": { "hostname": format!("{svc}.apps.svc"), "caCertificateRefs": [cm(ca)] } }),
+        )
+    }
+
+    #[test]
+    fn backend_tls_policy_applies_to_its_service() {
+        let pem = ca_pem();
+        let mut c = Cluster::new(vec![]);
+        c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
+        c.fail(Kind::Service);
+        c.fail(Kind::Grant);
+        c.fail(Kind::TrustBundle);
+        c.list(Kind::ConfigMap, vec![configmap("apps", "jel-ca", &pem)]);
+        c.list(
+            Kind::Policy,
+            vec![
+                btls("jel", "jel", "jel-ca"),
+                btls("unused", "nobody", "jel-ca"),
+                btls("broken", "plain", "absent"),
+            ],
+        );
+        c.list(
+            Kind::Route,
+            vec![
+                to_service("a", T0, "a.test", "jel"),
+                to_service("b", T0, "b.test", "other"),
+                to_service("c", T0, "c.test", "plain"),
+            ],
+        );
+        fn tls_of(c: &Cluster, host: &str) -> Option<crate::config::UpstreamTls> {
+            c.table()
+                .into_iter()
+                .find(|r| r.hostname.as_deref() == Some(host))
+                .unwrap()
+                .backend
+                .unwrap()
+                .tls
+        }
+        let jel = tls_of(&c, "a.test").expect("dialled over TLS");
+        assert_eq!(jel.hostname, "jel.apps.svc");
+        assert_eq!(jel.ca_pem.trim(), pem.trim());
+        assert_eq!(tls_of(&c, "b.test"), None, "no policy, plaintext as before");
+        assert_eq!(
+            tls_of(&c, "c.test").unwrap().ca_pem,
+            "",
+            "a broken policy refuses"
+        );
+
+        let policies: Vec<(String, bool, bool, &str)> = c
+            .last
+            .as_ref()
+            .unwrap()
+            .policies
+            .iter()
+            .map(|(o, p, ours)| (o.name_any(), *ours, p.accepted.ok, p.resolved.reason))
+            .collect();
+        assert_eq!(
+            policies,
+            [
+                ("broken".to_string(), true, false, "InvalidCACertificateRef"),
+                ("jel".to_string(), true, true, "ResolvedRefs"),
+                ("unused".to_string(), false, true, "ResolvedRefs"),
+            ]
+        );
+
+        c.delete(Kind::Policy, btls("jel", "jel", "jel-ca"));
+        assert_eq!(tls_of(&c, "a.test"), None);
     }
 }

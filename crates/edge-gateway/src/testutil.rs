@@ -40,6 +40,7 @@ pub fn route(prefix: &str, authz: Authz, backend: SocketAddr) -> Route {
         backend: Some(Backend {
             host: backend.ip().to_string(),
             port: backend.port(),
+            tls: None,
         }),
         filters: Default::default(),
         client_cert: false,
@@ -441,6 +442,29 @@ impl ClientCa {
         }
     }
 
+    /// A serving and client certificate for `dns`, as edge-signer issues one.
+    pub fn issue_for(&self, dns: &str) -> (Issued, ClientCert) {
+        let mut p = rcgen::CertificateParams::new(vec![dns.to_string()]).unwrap();
+        p.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &self.issuer).unwrap();
+        (
+            Issued {
+                cert_pem: cert.pem(),
+                key_pem: key.serialize_pem(),
+                der: cert.der().to_vec(),
+            },
+            ClientCert {
+                chain: vec![cert.der().clone()],
+                key: rustls_pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                der: cert.der().to_vec(),
+            },
+        )
+    }
+
     pub fn issue(&self, cn: &str) -> ClientCert {
         let mut p = rcgen::CertificateParams::default();
         p.distinguished_name.push(rcgen::DnType::CommonName, cn);
@@ -565,4 +589,96 @@ pub async fn tls_get(addr: SocketAddr, target: &str) -> (u16, String, Vec<u8>) {
     let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut buf)).await;
     let (code, body) = parse_status(&String::from_utf8_lossy(&buf));
     (code, body, leaf)
+}
+
+/// An HTTPS backend that requires a client certificate from `clients`, and
+/// records the one each request came with. An `Upgrade` is echoed.
+pub struct TlsBackend {
+    pub addr: SocketAddr,
+    pub peers: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub seen: Recorder,
+}
+
+pub async fn tls_backend(server: &ClientCa, name: &str, clients: &ClientCa) -> TlsBackend {
+    let (_, cert) = server.issue_for(name);
+    let mut roots = rustls::RootCertStore::empty();
+    for c in <rustls_pki_types::CertificateDer as rustls_pki_types::pem::PemObject>::pem_slice_iter(
+        clients.pem.as_bytes(),
+    ) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider.clone())
+            .build()
+            .unwrap();
+    let cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert.chain, cert.key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (p2, s2) = (peers.clone(), seen.clone());
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (acceptor, peers, seen) = (acceptor.clone(), p2.clone(), s2.clone());
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+                let svc = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                    peers.lock().unwrap().push(leaf.clone());
+                    seen.lock().unwrap().push(Seen {
+                        target: req.uri().path().to_string(),
+                        headers: req
+                            .headers()
+                            .iter()
+                            .map(|(k, v)| {
+                                (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into())
+                            })
+                            .collect(),
+                        body: vec![],
+                    });
+                    async move {
+                        if req.headers().get(hyper::header::UPGRADE).is_none() {
+                            return Ok::<_, hyper::Error>(status(StatusCode::OK, "tls"));
+                        }
+                        let on = hyper::upgrade::on(&mut req);
+                        tokio::spawn(async move {
+                            if let Ok(io) = on.await {
+                                let mut io = TokioIo::new(io);
+                                let mut buf = [0u8; 64];
+                                while let Ok(n) = io.read(&mut buf).await {
+                                    if n == 0 || io.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        Ok(hyper::Response::builder()
+                            .status(StatusCode::SWITCHING_PROTOCOLS)
+                            .header(hyper::header::CONNECTION, "upgrade")
+                            .header(hyper::header::UPGRADE, "echo")
+                            .body(crate::proxy::Body::default())
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tls), svc)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+    TlsBackend {
+        addr,
+        peers,
+        seen: Recorder { addr, seen },
+    }
 }

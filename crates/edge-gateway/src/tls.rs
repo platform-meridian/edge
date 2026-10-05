@@ -193,6 +193,23 @@ impl ResolvesServerCert for Reloading {
     }
 }
 
+/// The served certificate, as the client's to a TLS backend.
+impl rustls::client::ResolvesClientCert for Reloading {
+    fn resolve(
+        &self,
+        _root_hints: &[&[u8]],
+        schemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        self.current
+            .load_full()
+            .filter(|k| k.key.choose_scheme(schemes).is_some())
+    }
+
+    fn has_certs(&self) -> bool {
+        self.has_certificate()
+    }
+}
+
 /// Every certificate in `pem` as a trust anchor; none, or any unusable, fails.
 pub fn roots(pem: &str) -> Result<rustls::RootCertStore, String> {
     let mut store = rustls::RootCertStore::empty();
@@ -304,6 +321,10 @@ pub fn acceptor(resolver: Arc<Reloading>) -> Acceptor {
 }
 
 impl Acceptor {
+    pub fn identity(&self) -> Arc<Reloading> {
+        self.resolver.clone()
+    }
+
     /// False when `spec` names no usable CA, which the result then refuses or
     /// stops asking for.
     pub fn set_frontend(&self, spec: Option<Frontend>) -> bool {

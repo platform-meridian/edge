@@ -979,6 +979,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "tower-service",
  "tracing",
  "x509-parser",
 ]

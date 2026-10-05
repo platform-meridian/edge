@@ -1,5 +1,5 @@
 use super::frontend::Derived;
-use super::report::{publish_route_status, run_gateway_status};
+use super::report::{publish_policy_status, publish_route_status, run_gateway_status};
 use super::state::{Built, Kind, Msg, State};
 use super::trust::BUNDLE_GROUP;
 use super::{GATEWAY_GROUP, GatewayRef, Routes, api_resource};
@@ -112,7 +112,9 @@ async fn run(
         watch_all(GATEWAY_GROUP, "v1beta1", "ReferenceGrant", Kind::Grant),
         watch_all("", "v1", "ConfigMap", Kind::ConfigMap),
         watch_all(BUNDLE_GROUP, "v1", "ClusterTrustBundle", Kind::TrustBundle),
+        watch_all(GATEWAY_GROUP, "v1", "BackendTLSPolicy", Kind::Policy),
     ]);
+    let policy_ar = api_resource(GATEWAY_GROUP, "v1", "BackendTLSPolicy");
 
     let mut state = State::default();
     let mut frontend = None;
@@ -129,6 +131,13 @@ async fn run(
         for (o, outcome) in &built.outcomes {
             if let Err(e) = publish_route_status(&client, &route_ar, o, outcome).await {
                 tracing::warn!(route = %o.name_any(), error = %e, "status not written");
+            }
+        }
+        for (o, outcome, ours) in &built.policies {
+            if let Err(e) =
+                publish_policy_status(&client, &policy_ar, &gateway, o, outcome, *ours).await
+            {
+                tracing::warn!(policy = %o.name_any(), error = %e, "status not written");
             }
         }
     }

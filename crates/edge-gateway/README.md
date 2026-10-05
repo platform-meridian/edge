@@ -44,3 +44,19 @@ A route annotated `request` receives the verified certificate as Envoy's
 PEM), `Subject` (RFC 4514, as OpenSSL's `XN_FLAG_RFC2253` and nginx's
 `$ssl_client_s_dn` print it, in double quotes), then each `URI` and `DNS` name.
 No other route receives it, and a client's own copy never reaches a backend.
+
+## TLS to backends
+
+A Service named in a BackendTLSPolicy's `targetRefs` is dialled over TLS: SNI
+and the verified name are `validation.hostname`, and the trust anchors are
+`validation.caCertificateRefs`, ConfigMaps (`ca.crt`) or, as an extension,
+ClusterTrustBundles (`group: certificates.k8s.io`), so a policy can trust the
+node CA without a copy. The gateway presents its own pod certificate as the
+client's; `Gateway.spec.tls.backend.clientCertificateRef` is not supported.
+
+A policy that cannot be honoured (a reference that does not resolve, a
+`sectionName`, `subjectAltNames`, `wellKnownCACertificates`) still claims its
+Service, whose requests then fail with 502: never plaintext instead. Its
+`Accepted` and `ResolvedRefs` conditions say why, on the Gateway as ancestor,
+while one of the Gateway's routes uses the Service. On a shared target the
+older policy wins; the other is `Conflicted`.

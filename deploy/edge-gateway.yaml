@@ -108,9 +108,13 @@ rules:
   - apiGroups: ["certificates.k8s.io"]
     resources: ["clustertrustbundles"]
     verbs: ["list", "watch"]
+  # Without these a Service a BackendTLSPolicy names is dialled in plaintext.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["backendtlspolicies"]
+    verbs: ["list", "watch"]
   # Without these a rejected route is absent and nothing says why.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]
+    resources: ["httproutes/status", "gateways/status", "gatewayclasses/status", "backendtlspolicies/status"]
     verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

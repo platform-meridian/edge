@@ -3,6 +3,7 @@
 mod filters;
 mod headers;
 mod tunnel;
+mod upstream;
 
 use crate::authz::{self, Allowed, Authorizer, CheckInput, Decision};
 use crate::config::{Authz, Backend, Config, Route};
@@ -21,6 +22,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use std::time::Duration;
 use tunnel::tunnel;
+use upstream::Upstreams;
 
 pub use headers::ConnInfo;
 
@@ -35,7 +37,11 @@ pub struct Gateway {
     authorizer: Option<Authorizer>,
     strip: Arc<StripSet>,
     frontend: Option<crate::tls::Acceptor>,
+    upstreams: Upstreams,
 }
+
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 pub(super) struct Target {
     path: String,
@@ -60,7 +66,9 @@ impl Gateway {
         )));
         let authorizer = Authorizer::from_config(&cfg)?;
         let strip = Arc::new(StripSet::new(&cfg.strip_request_headers));
+        let connect = Duration::from_millis(cfg.limits.upstream_connect_timeout_ms);
         Ok(Self {
+            upstreams: Upstreams::new(None, connect),
             cfg,
             routes,
             client: Client::builder(TokioExecutor::new()).build(connector),
@@ -70,7 +78,10 @@ impl Gateway {
         })
     }
 
+    /// The pod certificate it serves is also the client's to TLS backends.
     pub fn with_tls(mut self, acceptor: crate::tls::Acceptor) -> Self {
+        let connect = Duration::from_millis(self.cfg.limits.upstream_connect_timeout_ms);
+        self.upstreams = Upstreams::new(Some(acceptor.identity()), connect);
         self.frontend = Some(acceptor);
         self
     }
@@ -227,7 +238,14 @@ impl Gateway {
 
     async fn forward(&self, req: Request<Body>, backend: &Backend) -> Response<Body> {
         let limit = Duration::from_millis(self.cfg.limits.upstream_response_timeout_ms);
-        match tokio::time::timeout(limit, self.client.request(req)).await {
+        let sent = match &backend.tls {
+            None => self.client.request(req),
+            Some(t) => match self.upstreams.client(t) {
+                Some(c) => c.request(req),
+                None => return status(StatusCode::BAD_GATEWAY, "upstream TLS unusable"),
+            },
+        };
+        match tokio::time::timeout(limit, sent).await {
             Ok(Ok(resp)) => resp.map(|b| b.boxed()),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, backend = %backend.host, "upstream failed");
@@ -262,19 +280,30 @@ impl Gateway {
         req.headers_mut().insert(hyper::header::UPGRADE, protocol);
 
         let addr = format!("{}:{}", backend.host, backend.port);
-        let stream =
-            match tokio::time::timeout(connect, tokio::net::TcpStream::connect(&addr)).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, backend = %addr, "upgrade dial failed");
-                    return status(StatusCode::BAD_GATEWAY, "upstream unavailable");
-                }
-                Err(_) => {
-                    tracing::warn!(backend = %addr, "upgrade dial timed out");
-                    return status(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");
-                }
-            };
-        let _ = stream.set_nodelay(true);
+        let dialled: std::io::Result<Box<dyn Io>> = match &backend.tls {
+            None => tokio::time::timeout(connect, tokio::net::TcpStream::connect(&addr))
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+                .map(|s| {
+                    let _ = s.set_nodelay(true);
+                    Box::new(s) as Box<dyn Io>
+                }),
+            Some(t) => match self.upstreams.connector(t) {
+                Some(c) => c.dial(&addr).await.map(|s| Box::new(s) as Box<dyn Io>),
+                None => return status(StatusCode::BAD_GATEWAY, "upstream TLS unusable"),
+            },
+        };
+        let stream = match dialled {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                tracing::warn!(backend = %addr, "upgrade dial timed out");
+                return status(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, backend = %addr, "upgrade dial failed");
+                return status(StatusCode::BAD_GATEWAY, "upstream unavailable");
+            }
+        };
 
         let handshake = hyper::client::conn::http1::handshake(TokioIo::new(stream));
         let (mut sender, conn) = match tokio::time::timeout(respond, handshake).await {
