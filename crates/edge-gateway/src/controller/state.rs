@@ -239,7 +239,8 @@ impl State {
             statics.iter().filter_map(|r| r.hostname.clone()).collect();
         let sources = self.sources();
         let policies: Vec<&DynamicObject> = self.policies.live.values().collect();
-        let mut policies = policy::evaluate(&policies, &sources);
+        let listed_services = (self.services.phase == Phase::Listed).then_some(&self.services.live);
+        let mut policies = policy::evaluate(&policies, &sources, listed_services);
         for t in policies.by_service.values_mut() {
             t.identity = "pod".into();
             t.dialer = settings.dialers.build(t);
@@ -294,9 +295,19 @@ impl State {
     }
 }
 
-/// Only a Service's existence matters; drop the rest to save memory.
+/// A Service's existence and its ports' names (for `sectionName`); the rest
+/// is dropped to save memory.
 pub(super) fn thin(ev: Event<DynamicObject>) -> Event<DynamicObject> {
-    thin_with(ev, |o| o.data = Value::Null)
+    thin_with(ev, |o| {
+        let ports: Vec<Value> = o.data["spec"]["ports"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| serde_json::json!({ "name": p["name"], "port": p["port"] }))
+            .collect();
+        o.data = serde_json::json!({ "spec": { "ports": ports } });
+    })
 }
 
 fn thin_with(ev: Event<DynamicObject>, keep: fn(&mut DynamicObject)) -> Event<DynamicObject> {
@@ -1825,10 +1836,7 @@ mod tests {
             RefKind::ConfigMap,
             ("apps".to_string(), "jel-ca".to_string()),
         );
-        assert_eq!(
-            c.state.ref_keys().collect::<Vec<_>>(),
-            [&wanted]
-        );
+        assert_eq!(c.state.ref_keys().collect::<Vec<_>>(), [&wanted]);
         assert!(!c.state.ready(), "built before its CA answered");
         c.feed(Msg::Ref(
             RefKind::ConfigMap,
@@ -1986,5 +1994,59 @@ mod tests {
         let a = &c.outcome("t").accepted;
         assert_eq!((a.ok, a.reason), (false, "UnsupportedValue"));
         assert!(a.message.contains("needs a hostname"), "{}", a.message);
+    }
+
+    /// A policy on a Service port (`sectionName`) applies to routes to that
+    /// port, a whole-Service one to the rest.
+    #[test]
+    fn section_name_policy_applies_to_its_port() {
+        let pem = ca_pem();
+        let mut c = Cluster::new(vec![]);
+        c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
+        c.list(
+            Kind::Service,
+            vec![obj(
+                "v1",
+                "Service",
+                "apps",
+                "jel",
+                T0,
+                json!({}),
+                json!({ "ports": [
+                { "name": "https", "port": 8443 }, { "name": "http", "port": 80 }] }),
+            )],
+        );
+        c.fail(Kind::Grant);
+        c.fail(Kind::TrustBundle);
+        c.cms(vec![configmap("apps", "jel-ca", &pem)]);
+        let mut port = btls("port", "jel", "jel-ca");
+        port.data["spec"]["targetRefs"][0]["sectionName"] = json!("https");
+        port.data["spec"]["validation"]["hostname"] = json!("port.apps.svc");
+        c.list(Kind::Policy, vec![port]);
+        let to_port = |name: &str, host: &str, p: u16| {
+            http_route(
+                "apps",
+                name,
+                T0,
+                json!({}),
+                json!({ "hostnames": [host], "rules": [{ "backendRefs": [{ "name": "jel", "port": p }] }] }),
+            )
+        };
+        c.list(
+            Kind::Route,
+            vec![to_port("a", "a.test", 8443), to_port("b", "b.test", 80)],
+        );
+        let tls = |host: &str| {
+            c.table()
+                .into_iter()
+                .find(|r| r.hostname.as_deref() == Some(host))
+                .unwrap()
+                .backend
+                .unwrap()
+                .tls
+                .map(|t| t.hostname)
+        };
+        assert_eq!(tls("a.test"), Some("port.apps.svc".into()));
+        assert_eq!(tls("b.test"), None, "another port: plaintext");
     }
 }

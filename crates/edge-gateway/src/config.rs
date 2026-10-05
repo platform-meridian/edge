@@ -33,17 +33,48 @@ pub struct Backend {
 /// refused: the policy could not be honoured.
 #[derive(Clone, Default)]
 pub struct UpstreamTls {
+    /// The SNI, and the name verified unless `sans` are given.
     pub hostname: String,
     pub ca_pem: String,
+    /// The compiled-in Mozilla roots (`wellKnownCACertificates: System`).
+    pub system: bool,
+    pub sans: Vec<San>,
+    pub refused: bool,
     /// What the gateway presents as the client, by fingerprint.
     pub identity: String,
     pub dialer: Option<std::sync::Arc<crate::proxy::Dialer>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum San {
+    Hostname(String),
+    Uri(String),
+}
+
+impl UpstreamTls {
+    pub fn refused() -> Self {
+        Self {
+            refused: true,
+            ..Self::default()
+        }
+    }
+
+    fn said(&self) -> impl PartialEq + '_ {
+        (
+            &self.hostname,
+            &self.ca_pem,
+            self.system,
+            &self.sans,
+            self.refused,
+            &self.identity,
+            self.dialer.is_some(),
+        )
+    }
+}
+
 impl PartialEq for UpstreamTls {
     fn eq(&self, o: &Self) -> bool {
-        (&self.hostname, &self.ca_pem, &self.identity) == (&o.hostname, &o.ca_pem, &o.identity)
-            && self.dialer.is_some() == o.dialer.is_some()
+        self.said() == o.said()
     }
 }
 
@@ -53,6 +84,9 @@ impl std::fmt::Debug for UpstreamTls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamTls")
             .field("hostname", &self.hostname)
+            .field("system", &self.system)
+            .field("sans", &self.sans)
+            .field("refused", &self.refused)
             .field("identity", &self.identity)
             .field("usable", &self.dialer.is_some())
             .finish()

@@ -443,8 +443,16 @@ impl ClientCa {
     }
 
     /// A serving and client certificate for `dns`, as edge-signer issues one.
+    /// A name with `://` is a URI SAN, else a DNS one; `dns` may list both.
     pub fn issue_for(&self, dns: &str) -> (Issued, ClientCert) {
-        let mut p = rcgen::CertificateParams::new(vec![dns.to_string()]).unwrap();
+        let mut p = rcgen::CertificateParams::default();
+        p.subject_alt_names = dns
+            .split(',')
+            .map(|n| match n.contains("://") {
+                true => rcgen::SanType::URI(n.try_into().unwrap()),
+                false => rcgen::SanType::DnsName(n.try_into().unwrap()),
+            })
+            .collect();
         p.extended_key_usages = vec![
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,

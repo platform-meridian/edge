@@ -4,6 +4,7 @@ mod filters;
 mod headers;
 mod tunnel;
 mod upstream;
+mod verify;
 
 use crate::authz::{self, Allowed, Authorizer, CheckInput, Decision};
 use crate::config::{Authz, Backend, Config, Route};

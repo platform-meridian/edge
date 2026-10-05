@@ -5,7 +5,7 @@
 use super::convert::Verdict;
 use super::state::{Key, key};
 use super::trust::{RefError, Sources};
-use crate::config::UpstreamTls;
+use crate::config::{San, UpstreamTls};
 use kube::ResourceExt;
 use kube::api::DynamicObject;
 use serde::Deserialize;
@@ -52,8 +52,11 @@ pub(super) struct Outcome {
     pub resolved: Verdict,
 }
 
+/// A whole Service, or one port of it (`sectionName`), which outranks it.
+pub(super) type Target = (Key, Option<u16>);
+
 pub(super) struct Policies {
-    pub by_service: BTreeMap<Key, UpstreamTls>,
+    pub by_service: BTreeMap<Target, UpstreamTls>,
     pub outcomes: Vec<(DynamicObject, Outcome)>,
 }
 
@@ -66,7 +69,12 @@ fn verdict(ok: bool, reason: &'static str, message: impl Into<String>) -> Verdic
 }
 
 /// Oldest first: on a shared target the older policy wins (the API's rule).
-pub(super) fn evaluate(policies: &[&DynamicObject], sources: &Sources) -> Policies {
+/// `services` carry their ports, for `sectionName`; `None` when unlisted.
+pub(super) fn evaluate(
+    policies: &[&DynamicObject],
+    sources: &Sources,
+    services: Option<&BTreeMap<Key, DynamicObject>>,
+) -> Policies {
     let mut ordered = policies.to_vec();
     ordered.sort_by_key(|o| {
         let created = o.metadata.creation_timestamp.as_ref().map(|t| t.0);
@@ -76,45 +84,73 @@ pub(super) fn evaluate(policies: &[&DynamicObject], sources: &Sources) -> Polici
     let mut outcomes = Vec::new();
     for o in ordered {
         let ns = o.namespace().unwrap_or_default();
-        let (names, tls, accepted, resolved) =
+        let (targets, tls, accepted, resolved) =
             match serde_json::from_value::<Spec>(o.data["spec"].clone()) {
                 Ok(spec) => {
-                    let services: Vec<&TargetRef> = spec
+                    let refs: Vec<&TargetRef> = spec
                         .target_refs
                         .iter()
                         .filter(|t| t.group.is_empty() && t.kind == "Service")
                         .collect();
-                    let (tls, a, r) = judge(&spec.validation, &services, &ns, sources);
-                    (services.iter().map(|t| t.name.clone()).collect(), tls, a, r)
+                    let (tls, a, r) = judge(&spec.validation, &ns, sources);
+                    (
+                        refs.iter()
+                            .map(|t| (t.name.clone(), t.section_name.clone()))
+                            .collect(),
+                        tls,
+                        a,
+                        r,
+                    )
                 }
                 Err(e) => unparseable(&o.data["spec"], &e),
             };
-        if names.is_empty() {
+        if targets.is_empty() {
             continue;
         }
+        let mut accepted = accepted;
         let mut claimed = Vec::new();
         let mut conflicted = Vec::new();
-        for name in &names {
-            let k = (ns.clone(), name.clone());
-            if by_service.contains_key(&k) {
-                conflicted.push(name.as_str());
-            } else {
-                by_service.insert(k.clone(), tls.clone());
-                claimed.push(k);
+        let mut missing = Vec::new();
+        for (name, section) in &targets {
+            let svc = (ns.clone(), name.clone());
+            let (target, tls) = match section {
+                None => ((svc.clone(), None), tls.clone()),
+                Some(section) => match port_named(services, &svc, section) {
+                    Ok(port) => ((svc.clone(), Some(port)), tls.clone()),
+                    Err(None) => {
+                        missing.push(format!("Service {name} has no port {section}"));
+                        continue;
+                    }
+                    // Its port unknown, the whole Service is refused.
+                    Err(Some(why)) => {
+                        accepted =
+                            verdict(false, "Invalid", format!("{why}; its Services are refused"));
+                        ((svc.clone(), None), UpstreamTls::refused())
+                    }
+                },
+            };
+            match by_service.entry(target) {
+                std::collections::btree_map::Entry::Occupied(_) => conflicted.push(name.as_str()),
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(tls);
+                    if !claimed.contains(&svc) {
+                        claimed.push(svc);
+                    }
+                }
             }
         }
-        let accepted = if conflicted.is_empty() {
-            accepted
-        } else {
-            verdict(
+        if !conflicted.is_empty() {
+            accepted = verdict(
                 false,
                 "Conflicted",
                 format!(
                     "an older policy already targets Service {}",
                     conflicted.join(", ")
                 ),
-            )
-        };
+            );
+        } else if !missing.is_empty() && accepted.ok {
+            accepted = verdict(false, "TargetNotFound", missing.join("; "));
+        }
         outcomes.push((
             o.clone(),
             Outcome {
@@ -130,11 +166,36 @@ pub(super) fn evaluate(policies: &[&DynamicObject], sources: &Sources) -> Polici
     }
 }
 
+/// `Err(None)`: no such port; `Err(Some(why))`: it cannot be known.
+fn port_named(
+    services: Option<&BTreeMap<Key, DynamicObject>>,
+    svc: &Key,
+    section: &str,
+) -> Result<u16, Option<String>> {
+    let Some(services) = services else {
+        return Err(Some(format!(
+            "sectionName {section}: Services cannot be listed"
+        )));
+    };
+    services
+        .get(svc)
+        .and_then(|o| o.data["spec"]["ports"].as_array())
+        .and_then(|ports| {
+            ports
+                .iter()
+                .find(|p| p["name"].as_str() == Some(section))
+                .and_then(|p| p["port"].as_u64())
+                .and_then(|p| u16::try_from(p).ok())
+        })
+        .ok_or(None)
+}
+
 /// Its Services, read as leniently as they can be, are still claimed: refused.
+#[allow(clippy::type_complexity)]
 fn unparseable(
     spec: &serde_json::Value,
     e: &serde_json::Error,
-) -> (Vec<String>, UpstreamTls, Verdict, Verdict) {
+) -> (Vec<(String, Option<String>)>, UpstreamTls, Verdict, Verdict) {
     let names = spec["targetRefs"]
         .as_array()
         .map(Vec::as_slice)
@@ -144,11 +205,11 @@ fn unparseable(
             t["group"].as_str().unwrap_or_default().is_empty()
                 && t["kind"].as_str() == Some("Service")
         })
-        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .filter_map(|t| t["name"].as_str().map(|n| (n.to_string(), None)))
         .collect();
     (
         names,
-        UpstreamTls::default(),
+        UpstreamTls::refused(),
         verdict(
             false,
             "Invalid",
@@ -162,12 +223,23 @@ fn unparseable(
     )
 }
 
-fn judge(
-    v: &Validation,
-    targets: &[&TargetRef],
-    ns: &str,
-    sources: &Sources,
-) -> (UpstreamTls, Verdict, Verdict) {
+fn sans(v: &[serde_json::Value]) -> Result<Vec<San>, String> {
+    v.iter()
+        .map(|s| {
+            match (
+                s["type"].as_str(),
+                s["hostname"].as_str(),
+                s["uri"].as_str(),
+            ) {
+                (Some("Hostname"), Some(h), _) => Ok(San::Hostname(h.to_string())),
+                (Some("URI"), _, Some(u)) => Ok(San::Uri(u.to_string())),
+                _ => Err(format!("subjectAltName {s} is not supported")),
+            }
+        })
+        .collect()
+}
+
+fn judge(v: &Validation, ns: &str, sources: &Sources) -> (UpstreamTls, Verdict, Verdict) {
     let mut pem = String::new();
     let mut bad_kind = Vec::new();
     let mut bad_ref = Vec::new();
@@ -190,21 +262,22 @@ fn judge(
         ),
         (true, false) => verdict(false, "InvalidCACertificateRef", bad_ref.join("; ")),
     };
-    let unsupported = if targets.iter().any(|t| t.section_name.is_some()) {
-        Some("a targetRef sectionName is not supported")
-    } else if !v.subject_alt_names.is_empty() {
-        Some("subjectAltNames is not supported")
-    } else if v.well_known_ca_certificates.is_some() {
-        Some("wellKnownCACertificates is not supported")
-    } else if v.hostname.is_empty() {
-        Some("no validation.hostname")
-    } else {
-        None
+    let system = match v.well_known_ca_certificates.as_deref() {
+        None => Ok(false),
+        Some("System") => Ok(true),
+        Some(other) => Err(format!("wellKnownCACertificates {other} is not supported")),
     };
-    let accepted = match unsupported {
-        Some(why) => verdict(false, "Invalid", format!("{why}; its Services are refused")),
-        None if v.ca_certificate_refs.is_empty()
-            || bad_kind.len() + bad_ref.len() == v.ca_certificate_refs.len() =>
+    let checked = system.and_then(|system| Ok((system, sans(&v.subject_alt_names)?)));
+    let accepted = match &checked {
+        Err(why) => verdict(false, "Invalid", format!("{why}; its Services are refused")),
+        Ok(_) if v.hostname.is_empty() => verdict(
+            false,
+            "Invalid",
+            "no validation.hostname; its Services are refused",
+        ),
+        Ok((false, _))
+            if v.ca_certificate_refs.is_empty()
+                || bad_kind.len() + bad_ref.len() == v.ca_certificate_refs.len() =>
         {
             verdict(
                 false,
@@ -212,19 +285,20 @@ fn judge(
                 "no caCertificateRef is usable; its Services are refused",
             )
         }
-        None => verdict(true, "Accepted", "Services are dialled over TLS"),
+        Ok(_) => verdict(true, "Accepted", "Services are dialled over TLS"),
     };
     // Any bad reference fails every connection, as the API requires.
-    let usable = accepted.ok && resolved.ok;
-    (
-        UpstreamTls {
+    let tls = match checked {
+        Ok((system, sans)) if accepted.ok && resolved.ok => UpstreamTls {
             hostname: v.hostname.clone(),
-            ca_pem: if usable { pem } else { String::new() },
+            ca_pem: pem,
+            system,
+            sans,
             ..UpstreamTls::default()
         },
-        accepted,
-        resolved,
-    )
+        _ => UpstreamTls::refused(),
+    };
+    (tls, accepted, resolved)
 }
 
 #[cfg(test)]
@@ -323,6 +397,7 @@ mod tests {
                     refs: &self.cms,
                     bundles: Some(&self.bundles),
                 },
+                None,
             )
         }
     }
@@ -342,7 +417,11 @@ mod tests {
             .collect()
     }
 
-    fn key(s: &str) -> Key {
+    fn key(s: &str) -> Target {
+        (svc_key(s), None)
+    }
+
+    fn svc_key(s: &str) -> Key {
         ("apps".into(), s.into())
     }
 
@@ -421,22 +500,22 @@ mod tests {
                 (false, "InvalidKind"),
             ),
             (
-                "well-known CAs",
+                "an unknown well-known set",
                 svc("s"),
-                json!({ "hostname": "h", "wellKnownCACertificates": "System" }),
+                json!({ "hostname": "h", "wellKnownCACertificates": "example.com/mine" }),
                 (false, "Invalid"),
                 (true, "ResolvedRefs"),
             ),
             (
-                "subjectAltNames",
+                "an unknown subjectAltName type",
                 svc("s"),
                 json!({ "hostname": "h", "caCertificateRefs": [cm_ref("ca")],
-                "subjectAltNames": [{ "type": "Hostname", "hostname": "x" }] }),
+                "subjectAltNames": [{ "type": "IP", "ip": "1.2.3.4" }] }),
                 (false, "Invalid"),
                 (true, "ResolvedRefs"),
             ),
             (
-                "sectionName",
+                "a sectionName while Services cannot be listed",
                 json!([{ "group": "", "kind": "Service", "name": "s", "sectionName": "https" }]),
                 json!({ "hostname": "h", "caCertificateRefs": [cm_ref("ca")] }),
                 (false, "Invalid"),
@@ -447,7 +526,7 @@ mod tests {
             let s = summary(&p);
             assert_eq!((s[0].1, s[0].2), (accepted, resolved), "{what}");
             let t = &p.by_service[&key("s")];
-            assert!(t.ca_pem.is_empty(), "{what}: served with a CA");
+            assert!(t.refused, "{what}: served");
             assert!(!p.outcomes[0].1.accepted.message.is_empty(), "{what}");
         }
     }
@@ -515,8 +594,15 @@ mod tests {
                 refs: &w.cms,
                 bundles: Some(&w.bundles),
             },
+            None,
         );
-        assert!(p.by_service[&key("s")].ca_pem.is_empty());
+        assert!(p.by_service[&key("s")].refused);
+        let resolved = &p.outcomes[0].1.resolved;
+        assert!(
+            resolved.message.contains("cannot be listed"),
+            "{}",
+            resolved.message
+        );
     }
 
     #[test]
@@ -539,7 +625,101 @@ mod tests {
         );
         assert!(p.outcomes[0].1.accepted.message.contains("does not parse"));
         assert_eq!(p.by_service.keys().collect::<Vec<_>>(), [&key("s")]);
-        assert!(p.by_service[&key("s")].ca_pem.is_empty());
-        assert_eq!(p.outcomes[0].1.targets, [key("s")]);
+        assert!(p.by_service[&key("s")].refused);
+        assert_eq!(p.outcomes[0].1.targets, [svc_key("s")]);
+    }
+
+    #[test]
+    fn standard_validation_fields() {
+        let w = World::new();
+        let p = w.eval(&[
+            policy("sys", T0, svc("sys"), json!({ "hostname": "api.example.com", "wellKnownCACertificates": "System" })),
+            policy(
+                "sans",
+                T0,
+                svc("sans"),
+                json!({ "hostname": "h", "caCertificateRefs": [cm_ref("ca")], "subjectAltNames": [
+                    { "type": "Hostname", "hostname": "*.apps.svc" }, { "type": "URI", "uri": "spiffe://x/ns/apps/sa/jel" }] }),
+            ),
+        ]);
+        assert_eq!(
+            summary(&p),
+            [
+                ("sans".into(), (true, "Accepted"), (true, "ResolvedRefs")),
+                ("sys".into(), (true, "Accepted"), (true, "ResolvedRefs")),
+            ]
+        );
+        let sys = &p.by_service[&key("sys")];
+        assert!(sys.system && !sys.refused && sys.ca_pem.is_empty());
+        assert_eq!(
+            p.by_service[&key("sans")].sans,
+            [
+                San::Hostname("*.apps.svc".into()),
+                San::Uri("spiffe://x/ns/apps/sa/jel".into())
+            ]
+        );
+    }
+
+    /// `sectionName` names a Service port; that port's policy outranks one on
+    /// the whole Service.
+    #[test]
+    fn section_name_is_a_service_port() {
+        let w = World::new();
+        let mut services = BTreeMap::new();
+        services.insert(
+            svc_key("s"),
+            obj(
+                "Service",
+                Some("apps"),
+                "s",
+                T0,
+                json!({ "spec": { "ports": [
+                { "name": "https", "port": 8443 }, { "name": "http", "port": 80 }] } }),
+            ),
+        );
+        let ps = [
+            policy(
+                "port",
+                T1,
+                json!([{ "group": "", "kind": "Service", "name": "s", "sectionName": "https" }]),
+                json!({ "hostname": "port", "caCertificateRefs": [cm_ref("ca")] }),
+            ),
+            policy(
+                "whole",
+                T0,
+                svc("s"),
+                json!({ "hostname": "whole", "caCertificateRefs": [cm_ref("ca")] }),
+            ),
+            policy(
+                "nowhere",
+                T0,
+                json!([{ "group": "", "kind": "Service", "name": "s", "sectionName": "grpc" }]),
+                json!({ "hostname": "x", "caCertificateRefs": [cm_ref("ca")] }),
+            ),
+        ];
+        let refs: Vec<&DynamicObject> = ps.iter().collect();
+        let p = evaluate(
+            &refs,
+            &Sources {
+                refs: &w.cms,
+                bundles: Some(&w.bundles),
+            },
+            Some(&services),
+        );
+        assert_eq!(p.by_service[&(svc_key("s"), Some(8443))].hostname, "port");
+        assert_eq!(p.by_service[&key("s")].hostname, "whole");
+        assert_eq!(p.by_service.len(), 2);
+        assert_eq!(
+            summary(&p),
+            [
+                (
+                    "nowhere".into(),
+                    (false, "TargetNotFound"),
+                    (true, "ResolvedRefs")
+                ),
+                ("whole".into(), (true, "Accepted"), (true, "ResolvedRefs")),
+                ("port".into(), (true, "Accepted"), (true, "ResolvedRefs")),
+            ]
+        );
     }
 }

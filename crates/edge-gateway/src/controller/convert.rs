@@ -29,7 +29,7 @@ pub(super) struct Ctx<'a> {
     pub listeners: Option<&'a [Listener]>,
     pub services: Option<&'a BTreeSet<Key>>,
     pub grants: &'a [ReferenceGrant],
-    pub backend_tls: &'a BTreeMap<Key, UpstreamTls>,
+    pub backend_tls: &'a BTreeMap<super::policy::Target, UpstreamTls>,
     pub strip: &'a [String],
     /// No HTTPRoute may claim the config file's hostnames.
     pub static_hosts: &'a HashSet<String>,
@@ -344,7 +344,11 @@ fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<(Backend
         Backend {
             host: format!("{}.{ns}.svc.cluster.local", b.name),
             port,
-            tls: ctx.backend_tls.get(&service).cloned(),
+            tls: ctx
+                .backend_tls
+                .get(&(service.clone(), Some(port)))
+                .or_else(|| ctx.backend_tls.get(&(service.clone(), None)))
+                .cloned(),
         },
         service,
     ))

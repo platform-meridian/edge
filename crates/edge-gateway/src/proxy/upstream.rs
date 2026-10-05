@@ -47,12 +47,33 @@ impl Dialers {
     }
 
     fn connector(&self, t: &UpstreamTls) -> Option<Connector> {
-        let roots = crate::tls::roots(&t.ca_pem).ok()?;
+        if t.refused {
+            return None;
+        }
+        let mut roots = match t.ca_pem.trim() {
+            "" => rustls::RootCertStore::empty(),
+            pem => crate::tls::roots(pem).ok()?,
+        };
+        if t.system {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        if roots.is_empty() {
+            return None;
+        }
         let name = ServerName::try_from(t.hostname.clone()).ok()?;
         let builder = rustls::ClientConfig::builder_with_provider(crate::tls::provider())
             .with_safe_default_protocol_versions()
-            .ok()?
-            .with_root_certificates(roots);
+            .ok()?;
+        let builder = if t.sans.is_empty() {
+            builder.with_root_certificates(roots)
+        } else {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(super::verify::SanVerifier::new(
+                    Arc::new(roots),
+                    t.sans.clone(),
+                )))
+        };
         let mut cfg = match &self.identity {
             Some(id) => builder.with_client_cert_resolver(id.clone()),
             None => builder.with_no_client_auth(),
@@ -164,7 +185,12 @@ mod tests {
         let (pod, _) = node.issue_for("gw.example");
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = install(dir.path(), &pod);
-        let backend = tls_backend(&backend_ca, "jel.apps.svc", &node).await;
+        let backend = tls_backend(
+            &backend_ca,
+            "jel.apps.svc,spiffe://unit/ns/apps/sa/jel",
+            &node,
+        )
+        .await;
         let cfg = crate::config::Config::parse_plaintext(&format!(
             "listen: '127.0.0.1:0'\ntls: {{ cert: {cert}, key: {key} }}\nroutes: []\n"
         ))
@@ -186,12 +212,18 @@ mod tests {
     }
 
     fn to(s: &Setup, hostname: &str, ca_pem: &str) -> crate::config::Route {
+        to_with(
+            s,
+            UpstreamTls {
+                hostname: hostname.into(),
+                ca_pem: ca_pem.into(),
+                ..UpstreamTls::default()
+            },
+        )
+    }
+
+    fn to_with(s: &Setup, mut t: UpstreamTls) -> crate::config::Route {
         let mut r = route("/", Authz::Skip, s.backend.addr);
-        let mut t = UpstreamTls {
-            hostname: hostname.into(),
-            ca_pem: ca_pem.into(),
-            ..UpstreamTls::default()
-        };
         t.dialer = s.dialers.build(&t);
         r.backend.as_mut().unwrap().tls = Some(t);
         r
@@ -212,6 +244,66 @@ mod tests {
         assert_eq!(s.backend.seen.last().target, "/x");
         let peers = s.backend.peers.lock().unwrap().clone();
         assert_eq!(peers, [s.pod_leaf.clone(), s.pod_leaf.clone()]);
+    }
+
+    /// `subjectAltNames` verify the server in place of the hostname, which is
+    /// still the SNI; the compiled-in roots trust no private CA.
+    #[tokio::test]
+    async fn subject_alt_names_and_system_roots() {
+        use crate::config::San;
+        let s = setup().await;
+        let sans = |sans: Vec<San>| UpstreamTls {
+            hostname: "elsewhere.example".into(),
+            ca_pem: s.backend_ca.pem.clone(),
+            sans,
+            ..UpstreamTls::default()
+        };
+        for (what, t, want) in [
+            (
+                "a DNS SAN",
+                sans(vec![San::Hostname("jel.apps.svc".into())]),
+                200,
+            ),
+            (
+                "a wildcard",
+                sans(vec![San::Hostname("*.apps.svc".into())]),
+                200,
+            ),
+            (
+                "a URI SAN",
+                sans(vec![San::Uri("spiffe://unit/ns/apps/sa/jel".into())]),
+                200,
+            ),
+            (
+                "neither",
+                sans(vec![
+                    San::Hostname("other.apps.svc".into()),
+                    San::Uri("spiffe://unit/ns/apps/sa/other".into()),
+                ]),
+                502,
+            ),
+            ("the hostname alone", sans(vec![]), 502),
+            (
+                "system roots",
+                UpstreamTls {
+                    hostname: "jel.apps.svc".into(),
+                    system: true,
+                    ..UpstreamTls::default()
+                },
+                502,
+            ),
+        ] {
+            s.gw.routes.store(std::sync::Arc::new(vec![to_with(&s, t)]));
+            let (code, ..) = tls_get(s.gw.addr, "/").await;
+            assert_eq!(code, want, "{what}");
+        }
+        let system = UpstreamTls {
+            hostname: "jel.apps.svc".into(),
+            system: true,
+            ..UpstreamTls::default()
+        };
+        assert!(s.dialers.build(&system).is_some(), "system roots are roots");
+        assert!(s.dialers.build(&UpstreamTls::refused()).is_none());
     }
 
     #[tokio::test]
