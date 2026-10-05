@@ -76,28 +76,28 @@ pub(super) fn evaluate(policies: &[&DynamicObject], sources: &Sources) -> Polici
     let mut outcomes = Vec::new();
     for o in ordered {
         let ns = o.namespace().unwrap_or_default();
-        let spec: Spec = match serde_json::from_value(o.data["spec"].clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(policy = %o.name_any(), error = %e, "unparseable BackendTLSPolicy; ignored");
-                continue;
-            }
-        };
-        let services: Vec<&TargetRef> = spec
-            .target_refs
-            .iter()
-            .filter(|t| t.group.is_empty() && t.kind == "Service")
-            .collect();
-        if services.is_empty() {
+        let (names, tls, accepted, resolved) =
+            match serde_json::from_value::<Spec>(o.data["spec"].clone()) {
+                Ok(spec) => {
+                    let services: Vec<&TargetRef> = spec
+                        .target_refs
+                        .iter()
+                        .filter(|t| t.group.is_empty() && t.kind == "Service")
+                        .collect();
+                    let (tls, a, r) = judge(&spec.validation, &services, &ns, sources);
+                    (services.iter().map(|t| t.name.clone()).collect(), tls, a, r)
+                }
+                Err(e) => unparseable(&o.data["spec"], &e),
+            };
+        if names.is_empty() {
             continue;
         }
-        let (tls, accepted, resolved) = judge(&spec.validation, &services, &ns, sources);
         let mut claimed = Vec::new();
         let mut conflicted = Vec::new();
-        for t in &services {
-            let k = (ns.clone(), t.name.clone());
+        for name in &names {
+            let k = (ns.clone(), name.clone());
             if by_service.contains_key(&k) {
-                conflicted.push(t.name.as_str());
+                conflicted.push(name.as_str());
             } else {
                 by_service.insert(k.clone(), tls.clone());
                 claimed.push(k);
@@ -128,6 +128,41 @@ pub(super) fn evaluate(policies: &[&DynamicObject], sources: &Sources) -> Polici
         by_service,
         outcomes,
     }
+}
+
+/// Its Services, read as leniently as they can be, are still claimed: refused.
+fn unparseable(
+    spec: &serde_json::Value,
+    e: &serde_json::Error,
+) -> (Vec<String>, UpstreamTls, Verdict, Verdict) {
+    let names = spec["targetRefs"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| {
+            t["group"].as_str().unwrap_or_default().is_empty()
+                && t["kind"].as_str() == Some("Service")
+        })
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    (
+        names,
+        UpstreamTls {
+            hostname: String::new(),
+            ca_pem: String::new(),
+        },
+        verdict(
+            false,
+            "Invalid",
+            format!("the spec does not parse ({e}); its Services are refused"),
+        ),
+        verdict(
+            false,
+            "InvalidCACertificateRef",
+            "caCertificateRefs not evaluated: the spec does not parse",
+        ),
+    )
 }
 
 fn judge(
@@ -471,5 +506,29 @@ mod tests {
             },
         );
         assert!(p.by_service[&key("s")].ca_pem.is_empty());
+    }
+
+    #[test]
+    fn unparseable_policy_still_claims_its_service() {
+        let w = World::new();
+        let bad = policy(
+            "bad",
+            T0,
+            json!([{ "kind": "Service", "name": "s" }, { "group": "x.io", "kind": "Service", "name": "other" }]),
+            json!({ "hostname": 5, "caCertificateRefs": [cm_ref("ca")] }),
+        );
+        let p = w.eval(&[bad]);
+        assert_eq!(
+            summary(&p),
+            [(
+                "bad".into(),
+                (false, "Invalid"),
+                (false, "InvalidCACertificateRef")
+            )]
+        );
+        assert!(p.outcomes[0].1.accepted.message.contains("does not parse"));
+        assert_eq!(p.by_service.keys().collect::<Vec<_>>(), [&key("s")]);
+        assert!(p.by_service[&key("s")].ca_pem.is_empty());
+        assert_eq!(p.outcomes[0].1.targets, [key("s")]);
     }
 }

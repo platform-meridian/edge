@@ -28,7 +28,8 @@ pub(super) enum Kind {
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Msg {
     Event(Kind, Event<DynamicObject>),
-    Error(Kind),
+    /// `absent`: the kind is not served (404), so no such object can exist.
+    Error(Kind, bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,7 +133,10 @@ impl State {
                 self.store(k).event(ev);
                 changes
             }
-            Msg::Error(k) => self.store(k).fail_pending_first_list(),
+            // Unlisted policies could name any Service: until they list, or are
+            // known not to exist, no table is built that could dial one in plaintext.
+            Msg::Error(Kind::Policy, false) => false,
+            Msg::Error(k, _) => self.store(k).fail_pending_first_list(),
         }
     }
 
@@ -415,7 +419,7 @@ mod tests {
             c.fail(Kind::Grant);
             c.fail(Kind::ConfigMap);
             c.fail(Kind::TrustBundle);
-            c.fail(Kind::Policy);
+            c.absent(Kind::Policy);
             c
         }
 
@@ -445,7 +449,10 @@ mod tests {
             self.feed(Msg::Event(k, Event::Delete(o)));
         }
         fn fail(&mut self, k: Kind) {
-            self.feed(Msg::Error(k));
+            self.feed(Msg::Error(k, false));
+        }
+        fn absent(&mut self, k: Kind) {
+            self.feed(Msg::Error(k, true));
         }
         fn table(&self) -> Vec<Route> {
             (**self.routes.load()).clone()
@@ -554,7 +561,46 @@ mod tests {
             "BackendTLSPolicies have neither listed nor failed"
         );
         c.fail(Kind::Policy);
-        assert_eq!(c.table().len(), 2);
+        assert_eq!(
+            c.table(),
+            file,
+            "a failed policy list could hide a policy: no table"
+        );
+        c.absent(Kind::Policy);
+        assert_eq!(
+            c.table().len(),
+            2,
+            "no BackendTLSPolicy kind, so none exists"
+        );
+    }
+
+    /// A Service a policy names is never dialled in plaintext because the
+    /// policies could not be listed; once they list, it is dialled as they say.
+    #[test]
+    fn failed_policy_list_serves_no_plaintext() {
+        let pem = ca_pem();
+        let mut c = Cluster::new(vec![]);
+        c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
+        c.fail(Kind::Service);
+        c.fail(Kind::Grant);
+        c.fail(Kind::TrustBundle);
+        c.list(Kind::ConfigMap, vec![configmap("apps", "jel-ca", &pem)]);
+        c.list(Kind::Route, vec![to_service("a", T0, "a.test", "jel")]);
+        for _ in 0..3 {
+            c.fail(Kind::Policy);
+        }
+        assert!(c.table().is_empty(), "served before policies listed");
+        c.list(Kind::Policy, vec![btls("jel", "jel", "jel-ca")]);
+        let tls = c.table()[0].backend.clone().unwrap().tls.unwrap();
+        assert_eq!(tls.hostname, "jel.apps.svc");
+        // A later failure keeps what was listed.
+        c.fail(Kind::Policy);
+        c.apply(Kind::Route, to_service("b", T0, "b.test", "jel"));
+        assert!(
+            c.table()
+                .iter()
+                .all(|r| r.backend.as_ref().unwrap().tls.is_some())
+        );
     }
 
     #[test]
@@ -566,7 +612,7 @@ mod tests {
             Kind::Route,
             Event::InitApply(to_service("b", T0, "b.test", "svc-b")),
         ));
-        c.feed(Msg::Error(Kind::Route));
+        c.feed(Msg::Error(Kind::Route, false));
         assert_eq!(c.backends(), ["svc-a.apps.svc.cluster.local"]);
     }
 
@@ -713,7 +759,7 @@ mod tests {
         c.fail(Kind::Grant);
         c.fail(Kind::ConfigMap);
         c.fail(Kind::TrustBundle);
-        c.fail(Kind::Policy);
+        c.absent(Kind::Policy);
         let (t, c) = c.one(svc_spec(), json!({}));
         assert!(t.is_empty());
         assert_eq!(verdicts(c.outcome("t")).0, no_parent, "missing Gateway");
@@ -860,7 +906,7 @@ mod tests {
             c.fail(Kind::Service);
             c.fail(Kind::ConfigMap);
             c.fail(Kind::TrustBundle);
-            c.fail(Kind::Policy);
+            c.absent(Kind::Policy);
             c.list(Kind::Grant, grants);
             let (t, c) = c.one(
                 backend_ref(json!({ "name": "db", "namespace": "data", "port": 80 })),
@@ -886,7 +932,7 @@ mod tests {
         c.fail(Kind::Grant);
         c.fail(Kind::ConfigMap);
         c.fail(Kind::TrustBundle);
-        c.fail(Kind::Policy);
+        c.absent(Kind::Policy);
         let route = |name, svc| {
             http_route(
                 "apps",
@@ -1461,7 +1507,7 @@ mod tests {
         c.list(Kind::Grant, grants);
         c.list(Kind::ConfigMap, cms);
         c.fail(Kind::TrustBundle);
-        c.fail(Kind::Policy);
+        c.absent(Kind::Policy);
         let marked = http_route(
             "apps",
             "elf",

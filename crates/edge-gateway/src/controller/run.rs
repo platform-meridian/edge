@@ -164,8 +164,18 @@ fn watch(api: Api<DynamicObject>, kind: Kind) -> impl Stream<Item = Msg> {
         .inspect(move |r| outage.observe(&what, r))
         .map(move |r| match r {
             Ok(ev) => Msg::Event(kind, ev),
-            Err(_) => Msg::Error(kind),
+            Err(e) => Msg::Error(kind, not_served(&e)),
         })
+}
+
+fn not_served(e: &watcher::Error) -> bool {
+    match e {
+        watcher::Error::InitialListFailed(kube::Error::Api(s))
+        | watcher::Error::WatchStartFailed(kube::Error::Api(s))
+        | watcher::Error::WatchFailed(kube::Error::Api(s)) => s.is_not_found(),
+        watcher::Error::WatchError(s) => s.is_not_found(),
+        _ => false,
+    }
 }
 
 /// The watcher reports its own retried failures as items, so an `Err` is not
