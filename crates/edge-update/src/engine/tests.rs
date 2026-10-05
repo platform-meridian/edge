@@ -69,6 +69,8 @@ pub(crate) struct World {
     url: String,
     tag: String,
     lock: BTreeMap<String, String>,
+    /// The running stack's record of its modules.
+    modules: BTreeMap<String, String>,
     pub(crate) judge: BTreeMap<String, String>,
     judge_ticks: u32,
     verdict: Verdict,
@@ -133,6 +135,7 @@ impl World {
                 ("built_epoch".into(), "1000".into()),
                 ("PROFILE".into(), "edge".into()),
             ]),
+            modules: BTreeMap::from([("MODULES".into(), String::new())]),
             judge: BTreeMap::from([("good".into(), OLD_TAG.into())]),
             judge_ticks: 0,
             verdict: Verdict::Good,
@@ -424,6 +427,7 @@ impl Cluster for FakeCluster {
         w.calls += 1;
         Ok(match at.name.as_str() {
             "lock" => Some(w.lock.clone()),
+            "modules" => Some(w.modules.clone()),
             "judge" => {
                 w.tick_judge();
                 Some(w.judge.clone())
@@ -2544,7 +2548,7 @@ async fn a_bundle_without_a_base_needs_a_set_the_unit_installed() {
     refused(
         &mut h,
         &Spec::modules("update-b", 3000, &["b"], &[]),
-        "install a bundle with a base first",
+        "bring a base and every module it runs",
     )
     .await;
 }
@@ -2580,4 +2584,49 @@ async fn a_set_composed_on_another_stack_is_verified_again() {
     let e = &h.e().record.history[0];
     assert_eq!(e.outcome, Outcome::Refused);
     assert!(e.detail.contains("verify it again"), "{}", e.detail);
+}
+
+#[tokio::test]
+async fn with_no_recorded_set_a_bundle_brings_a_base_and_every_module_the_unit_runs() {
+    let mut h = with_a().await;
+    // As an engine before installed sets leaves the unit: no record of its set.
+    std::fs::remove_dir_all(h.state().join("installed")).unwrap();
+    h.reopen();
+    h.w().log.clear();
+    let partial = Spec {
+        epoch: 3000,
+        ..Spec::base("update-b", &["b"])
+    };
+    refused(
+        &mut h,
+        &partial,
+        "bring a base and every module it runs (this bundle lacks a)",
+    )
+    .await;
+    refused(
+        &mut h,
+        &Spec::modules("update-b", 3000, &["a", "b"], &[]),
+        "bring a base and every module it runs",
+    )
+    .await;
+
+    let whole = Spec {
+        epoch: 3000,
+        ..Spec::base("update-b", &["a", "b"])
+    };
+    let e = h.update(&whole, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert_eq!(e.release.unwrap().manifest["MODULES"], "a b");
+}
+
+#[tokio::test]
+async fn a_unit_with_no_record_of_what_it_runs_takes_no_bundle_of_components() {
+    let mut h = Harness::new();
+    h.w().modules.clear();
+    refused(
+        &mut h,
+        &Spec::base("update-a", &["a"]),
+        "this unit's installed modules are unknown",
+    )
+    .await;
 }

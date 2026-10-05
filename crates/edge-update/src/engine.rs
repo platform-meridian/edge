@@ -839,6 +839,45 @@ impl Engine {
         }
     }
 
+    /// With no recorded set, a bundle stands for the whole of it: it brings a
+    /// base and every module the unit runs, as the release it runs or its
+    /// stack's record of modules says.
+    async fn covers_what_runs(&self, on: &str, c: &Components) -> anyhow::Result<()> {
+        let said = match self.record.running(on) {
+            Some(r) => r.manifest.get(components::MODULES_KEY).cloned(),
+            None => match &self.settings.stack.modules {
+                Some(at) => self
+                    .cluster
+                    .config_map(at)
+                    .await?
+                    .and_then(|m| m.get(components::MODULES_KEY).cloned()),
+                None => None,
+            },
+        };
+        let runs: BTreeSet<&str> = said
+            .as_deref()
+            .context(
+                "this unit's installed modules are unknown: bring a base and every module it runs",
+            )?
+            .split_whitespace()
+            .collect();
+        let missing: Vec<&str> = runs
+            .iter()
+            .filter(|m| !c.modules.contains_key(**m) && !c.remove.contains(**m))
+            .copied()
+            .collect();
+        anyhow::ensure!(
+            c.base.is_some() && missing.is_empty(),
+            "this unit's installed modules are unknown to this engine: bring a base and every module it runs{}",
+            if missing.is_empty() {
+                String::new()
+            } else {
+                format!(" (this bundle lacks {})", missing.join(", "))
+            }
+        );
+        Ok(())
+    }
+
     /// With components, the bundle merged into the unit's installed set: the
     /// release's MANIFEST and refs become the set's, and its stack the base's
     /// artifact with the set's modules.
@@ -850,6 +889,9 @@ impl Engine {
         let st = &self.settings.stack;
         let (_, on) = self.cluster.sync(&st.flux_instance).await?;
         let current = self.installed(&on)?;
+        if current.is_none() && rel.tag() != on {
+            self.covers_what_runs(&on, &c).await?;
+        }
         let patch = match &c.base {
             Some(_) => Some(std::fs::read_to_string(dir.join(bundle::PATCH))?),
             None => None,

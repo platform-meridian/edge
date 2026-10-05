@@ -62,6 +62,9 @@ const HELD_KINDS: &[&str] = &[
     "RoutingRuleConfig",
 ];
 
+/// Volumes a merge drops whole, keys and all, when the build stops rendering them.
+const DROPPED_WHOLE: &[&str] = &["UserVolumeConfig", "RawVolumeConfig", "SwapVolumeConfig"];
+
 /// Fields the unit keeps inside documents the build owns.
 const HELD_FIELDS: &[(&str, &str)] = &[
     ("VolumeConfig", "encryption"),
@@ -281,6 +284,13 @@ pub fn merge(unit: &str, patch: &str) -> anyhow::Result<String> {
         }
         if held_kind(k) {
             out.push((k.clone(), doc.clone()));
+            continue;
+        }
+        // A volume the build no longer renders goes whole: Talos takes none
+        // without its provisioning, and its data stays on the disk.
+        if matches!(k, Key::Typed(kind, _) if DROPPED_WHOLE.contains(&kind.as_str())) {
+            let gone = describe(k);
+            expected.retain(|(f, _)| !f.strip_prefix(&gone).is_some_and(|r| r.starts_with('.')));
             continue;
         }
         // A document the build no longer renders goes, unless it holds the unit's.
@@ -579,6 +589,20 @@ image: kubelet:new
     fn build_drops_what_it_stopped_rendering() {
         let out = parse(&merge(UNIT, PATCH).unwrap()).unwrap();
         assert!(doc(&out, "KubePrismConfig", "").is_none());
+    }
+
+    #[test]
+    fn a_volume_the_build_stopped_rendering_goes_whole() {
+        let unit = parse(UNIT).unwrap();
+        let patch: Vec<_> = parse(PATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| *k != Key::Typed("UserVolumeConfig".into(), "data".into()))
+            .collect();
+        assert!(doc(&unit, "UserVolumeConfig", "data").is_some());
+        let out = parse(&merge(UNIT, &render(&patch).unwrap()).unwrap()).unwrap();
+        assert!(doc(&out, "UserVolumeConfig", "data").is_none());
+        assert!(doc(&out, "VolumeConfig", "STATE").is_some());
     }
 
     #[test]
