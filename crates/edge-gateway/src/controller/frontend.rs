@@ -32,16 +32,7 @@ pub(super) fn derive(
                 .into(),
         );
     }
-    let frontend = &tls["frontend"];
-    let per_port = frontend["perPort"].as_array().and_then(|ports| {
-        ports
-            .iter()
-            .find(|p| p["port"].as_u64() == Some(u64::from(gw.bound_port)))
-    });
-    let validation = match per_port {
-        Some(p) => &p["tls"]["validation"],
-        None => &frontend["default"]["validation"],
-    };
+    let validation = validation(gateway.expect("checked above"), gw);
     if validation.is_null() {
         return Derived {
             frontend: None,
@@ -92,6 +83,20 @@ pub(super) fn derive(
             names,
         }),
         problems,
+    }
+}
+
+/// The `perPort` entry for the bound port, or else the default.
+pub(super) fn validation<'a>(gateway: &'a DynamicObject, gw: &GatewayRef) -> &'a Value {
+    let frontend = &gateway.data["spec"]["tls"]["frontend"];
+    let per_port = frontend["perPort"].as_array().and_then(|ports| {
+        ports
+            .iter()
+            .find(|p| p["port"].as_u64() == Some(u64::from(gw.bound_port)))
+    });
+    match per_port {
+        Some(p) => &p["tls"]["validation"],
+        None => &frontend["default"]["validation"],
     }
 }
 

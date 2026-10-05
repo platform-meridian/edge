@@ -4,7 +4,7 @@ use super::convert::{Ctx, Outcome, convert};
 use super::frontend::{Derived, derive};
 use super::policy;
 use super::schema::{Listener, ReferenceGrant};
-use super::trust::{Sources, thin_configmap};
+use super::trust::{RefKind, RefState, Refs, Sources, referenced};
 use super::{GatewayRef, Settings};
 use crate::config::Route;
 use kube::ResourceExt;
@@ -19,7 +19,6 @@ pub(super) enum Kind {
     Gateway,
     Service,
     Grant,
-    ConfigMap,
     TrustBundle,
     Policy,
 }
@@ -30,6 +29,16 @@ pub(super) enum Msg {
     Event(Kind, Event<DynamicObject>),
     /// `absent`: the kind is not served (404), so no such object can exist.
     Error(Kind, bool),
+    /// From a referenced object's own watch.
+    Ref(RefKind, Key, RefEvent),
+}
+
+pub(super) enum RefEvent {
+    /// The first listing; `None` when it does not exist.
+    Listed(Option<DynamicObject>),
+    Applied(DynamicObject),
+    Deleted,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,7 +102,7 @@ pub(super) struct State {
     gateways: Store,
     services: Store,
     grants: Store,
-    configmaps: Store,
+    refs: Refs,
     bundles: Store,
     policies: Store,
 }
@@ -114,7 +123,6 @@ impl State {
             Kind::Gateway => &mut self.gateways,
             Kind::Service => &mut self.services,
             Kind::Grant => &mut self.grants,
-            Kind::ConfigMap => &mut self.configmaps,
             Kind::TrustBundle => &mut self.bundles,
             Kind::Policy => &mut self.policies,
         }
@@ -126,7 +134,6 @@ impl State {
             Msg::Event(k, ev) => {
                 let ev = match k {
                     Kind::Service => thin(ev),
-                    Kind::ConfigMap => thin_with(ev, thin_configmap),
                     _ => ev,
                 };
                 let changes = !matches!(ev, Event::Init | Event::InitApply(_));
@@ -137,7 +144,58 @@ impl State {
             // known not to exist, no table is built that could dial one in plaintext.
             Msg::Error(Kind::Policy, false) => false,
             Msg::Error(k, _) => self.store(k).fail_pending_first_list(),
+            Msg::Ref(kind, key, ev) => {
+                let Some(r) = self.refs.get_mut(&(kind, key)) else {
+                    return false;
+                };
+                let thinned = |mut o: DynamicObject| {
+                    kind.thin(&mut o);
+                    o
+                };
+                match ev {
+                    RefEvent::Listed(o) => {
+                        *r = RefState {
+                            listed: Some(true),
+                            object: o.map(thinned),
+                        }
+                    }
+                    RefEvent::Applied(o) => {
+                        *r = RefState {
+                            listed: Some(true),
+                            object: Some(thinned(o)),
+                        }
+                    }
+                    RefEvent::Deleted => r.object = None,
+                    RefEvent::Failed if r.listed.is_none() => r.listed = Some(false),
+                    RefEvent::Failed => return false,
+                }
+                true
+            }
         }
+    }
+
+    /// Follows what the Gateway and the policies reference; true when that set
+    /// changed.
+    pub fn sync_refs(&mut self, gateway: &GatewayRef) -> bool {
+        let ours = self
+            .gateways
+            .live
+            .get(&(gateway.namespace.clone(), gateway.name.clone()));
+        let wanted = referenced(ours, gateway, self.policies.live.values().cloned());
+        let before = self.refs.len();
+        self.refs.retain(|k, _| wanted.contains(k));
+        let mut changed = self.refs.len() != before;
+        for k in wanted {
+            if let std::collections::btree_map::Entry::Vacant(e) = self.refs.entry(k) {
+                e.insert(RefState::default());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn ref_keys(&self) -> impl Iterator<Item = &(RefKind, Key)> {
+        self.refs.keys()
     }
 
     pub fn ready(&self) -> bool {
@@ -145,7 +203,7 @@ impl State {
             && self.gateways.phase == Phase::Listed
             && self.services.phase != Phase::AwaitingFirstList
             && self.grants.phase != Phase::AwaitingFirstList
-            && self.configmaps.phase != Phase::AwaitingFirstList
+            && self.refs.values().all(|r| r.listed.is_some())
             && self.bundles.phase != Phase::AwaitingFirstList
             && self.policies.phase != Phase::AwaitingFirstList
     }
@@ -155,7 +213,7 @@ impl State {
             (s.phase == Phase::Listed).then_some(&s.live)
         }
         Sources {
-            configmaps: listed(&self.configmaps),
+            refs: &self.refs,
             bundles: listed(&self.bundles),
         }
     }
@@ -396,6 +454,10 @@ mod tests {
         routes: Routes,
         statics: Vec<Route>,
         last: Option<Built>,
+        /// The ConfigMaps that exist, which a referenced one's watch lists.
+        world: BTreeMap<Key, DynamicObject>,
+        /// Leaves referenced ConfigMaps unanswered, as a slow watch would.
+        hold: bool,
     }
 
     impl Cluster {
@@ -405,6 +467,8 @@ mod tests {
                 routes: Arc::new(ArcSwap::from_pointee(statics.clone())),
                 statics,
                 last: None,
+                world: BTreeMap::new(),
+                hold: false,
             }
         }
 
@@ -417,7 +481,6 @@ mod tests {
             c.list(Kind::Gateway, vec![gateway_obj(listeners)]);
             c.fail(Kind::Service);
             c.fail(Kind::Grant);
-            c.fail(Kind::ConfigMap);
             c.fail(Kind::TrustBundle);
             c.absent(Kind::Policy);
             c
@@ -434,6 +497,35 @@ mod tests {
             if let Some(b) = step(&mut self.state, msg, &gw(), &settings, &self.routes) {
                 self.last = Some(b);
             }
+            if self.hold {
+                return;
+            }
+            let pending: Vec<Key> = self
+                .state
+                .refs
+                .iter()
+                .filter(|(_, r)| r.listed.is_none())
+                .map(|((_, k), _)| k.clone())
+                .collect();
+            for k in pending {
+                let o = self.world.get(&k).cloned();
+                self.feed(Msg::Ref(RefKind::ConfigMap, k, RefEvent::Listed(o)));
+            }
+        }
+        fn cms(&mut self, objs: Vec<DynamicObject>) {
+            for o in objs {
+                self.cm_apply(o);
+            }
+        }
+        fn cm_apply(&mut self, o: DynamicObject) {
+            let k = key(&o);
+            self.world.insert(k.clone(), o.clone());
+            self.feed(Msg::Ref(RefKind::ConfigMap, k, RefEvent::Applied(o)));
+        }
+        fn cm_delete(&mut self, o: DynamicObject) {
+            let k = key(&o);
+            self.world.remove(&k);
+            self.feed(Msg::Ref(RefKind::ConfigMap, k, RefEvent::Deleted));
         }
         fn list(&mut self, k: Kind, objs: Vec<DynamicObject>) {
             self.feed(Msg::Event(k, Event::Init));
@@ -548,7 +640,6 @@ mod tests {
             "ReferenceGrants have neither listed nor failed"
         );
         c.fail(Kind::Grant);
-        c.fail(Kind::ConfigMap);
         assert_eq!(
             c.table(),
             file,
@@ -584,7 +675,7 @@ mod tests {
         c.fail(Kind::Service);
         c.fail(Kind::Grant);
         c.fail(Kind::TrustBundle);
-        c.list(Kind::ConfigMap, vec![configmap("apps", "jel-ca", &pem)]);
+        c.cms(vec![configmap("apps", "jel-ca", &pem)]);
         c.list(Kind::Route, vec![to_service("a", T0, "a.test", "jel")]);
         for _ in 0..3 {
             c.fail(Kind::Policy);
@@ -757,7 +848,6 @@ mod tests {
         c.list(Kind::Gateway, vec![]);
         c.fail(Kind::Service);
         c.fail(Kind::Grant);
-        c.fail(Kind::ConfigMap);
         c.fail(Kind::TrustBundle);
         c.absent(Kind::Policy);
         let (t, c) = c.one(svc_spec(), json!({}));
@@ -904,7 +994,6 @@ mod tests {
             let mut c = Cluster::new(vec![]);
             c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
             c.fail(Kind::Service);
-            c.fail(Kind::ConfigMap);
             c.fail(Kind::TrustBundle);
             c.absent(Kind::Policy);
             c.list(Kind::Grant, grants);
@@ -930,7 +1019,6 @@ mod tests {
         c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
         c.list(Kind::Service, vec![service("apps", "present")]);
         c.fail(Kind::Grant);
-        c.fail(Kind::ConfigMap);
         c.fail(Kind::TrustBundle);
         c.absent(Kind::Policy);
         let route = |name, svc| {
@@ -1505,7 +1593,7 @@ mod tests {
         c.list(Kind::Gateway, vec![gateway_with_tls(tls)]);
         c.fail(Kind::Service);
         c.list(Kind::Grant, grants);
-        c.list(Kind::ConfigMap, cms);
+        c.cms(cms);
         c.fail(Kind::TrustBundle);
         c.absent(Kind::Policy);
         let marked = http_route(
@@ -1604,11 +1692,11 @@ mod tests {
         let pem = |c: &Cluster| derived(c).frontend.clone().unwrap().ca_pem;
         assert_eq!(pem(&c), "");
         assert_eq!(derived(&c).problems.len(), 2, "{:?}", derived(&c).problems);
-        c.apply(Kind::ConfigMap, configmap("edge", "operators", &a));
+        c.cm_apply(configmap("edge", "operators", &a));
         assert_eq!(pem(&c).trim(), a.trim());
-        c.apply(Kind::ConfigMap, configmap("edge", "operators", &b));
+        c.cm_apply(configmap("edge", "operators", &b));
         assert_eq!(pem(&c).trim(), b.trim(), "a changed ConfigMap reloads");
-        c.delete(Kind::ConfigMap, configmap("edge", "operators", &b));
+        c.cm_delete(configmap("edge", "operators", &b));
         assert_eq!(pem(&c), "");
     }
 
@@ -1697,18 +1785,53 @@ mod tests {
 
     #[test]
     fn configmaps_kept_to_ca_crt() {
+        let c = frontend_cluster(
+            json!({ "frontend": { "default": validation("AllowInsecureFallback", json!([cm("x")])) } }),
+            vec![configmap("edge", "x", "pem"), configmap("edge", "y", "pem")],
+            vec![],
+        );
+        let x = &c.state.refs[&(RefKind::ConfigMap, ("edge".to_string(), "x".to_string()))];
+        assert_eq!(
+            x.object.as_ref().unwrap().data,
+            json!({ "data": { "ca.crt": "pem" } })
+        );
+        let watched: Vec<_> = c.state.ref_keys().cloned().collect();
+        assert_eq!(
+            watched,
+            [(RefKind::ConfigMap, ("edge".to_string(), "x".to_string()))],
+            "only a referenced ConfigMap is watched"
+        );
+    }
+
+    /// The watched set follows the Gateway and the policies, and no table is
+    /// built while a newly referenced ConfigMap has not answered.
+    #[test]
+    fn referenced_configmaps_watched_and_awaited() {
+        let pem = ca_pem();
         let mut c = frontend_cluster(json!({}), vec![], vec![]);
-        c.apply(Kind::ConfigMap, configmap("edge", "x", "pem"));
-        let kept = &c.state.configmaps.live[&("edge".to_string(), "x".to_string())];
-        assert_eq!(kept.data, json!({ "data": { "ca.crt": "pem" } }));
-        c.apply(
-            Kind::ConfigMap,
-            obj("v1", "ConfigMap", "edge", "y", T0, json!({}), json!(null)),
+        assert_eq!(c.state.ref_keys().count(), 0);
+        c.hold = true;
+        c.cms(vec![configmap("apps", "jel-ca", &pem)]);
+        c.list(Kind::Policy, vec![btls("jel", "jel", "jel-ca")]);
+        let wanted = (
+            RefKind::ConfigMap,
+            ("apps".to_string(), "jel-ca".to_string()),
         );
         assert_eq!(
-            c.state.configmaps.live[&("edge".to_string(), "y".to_string())].data,
-            Value::Null
+            c.state.ref_keys().collect::<Vec<_>>(),
+            [&wanted]
         );
+        assert!(!c.state.ready(), "built before its CA answered");
+        c.feed(Msg::Ref(
+            RefKind::ConfigMap,
+            wanted.1.clone(),
+            RefEvent::Listed(Some(configmap("apps", "jel-ca", &pem))),
+        ));
+        assert!(c.state.ready());
+        c.list(Kind::Policy, vec![]);
+        assert_eq!(c.state.ref_keys().count(), 0, "dropped with its policy");
+        c.feed(Msg::Ref(RefKind::ConfigMap, wanted.1, RefEvent::Failed));
+        assert!(c.state.ready(), "a stale watch's message is ignored");
     }
 
     fn btls(name: &str, svc: &str, ca: &str) -> DynamicObject {
@@ -1732,7 +1855,7 @@ mod tests {
         c.fail(Kind::Service);
         c.fail(Kind::Grant);
         c.fail(Kind::TrustBundle);
-        c.list(Kind::ConfigMap, vec![configmap("apps", "jel-ca", &pem)]);
+        c.cms(vec![configmap("apps", "jel-ca", &pem)]);
         c.list(
             Kind::Policy,
             vec![

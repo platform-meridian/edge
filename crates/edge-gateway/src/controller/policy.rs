@@ -232,6 +232,7 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller::trust::{RefKind, RefState, Refs};
     use serde_json::{Value, json};
 
     pub(crate) fn ca_pem() -> String {
@@ -275,7 +276,7 @@ mod tests {
     const T1: &str = "2026-01-02T00:00:00Z";
 
     struct World {
-        cms: BTreeMap<Key, DynamicObject>,
+        cms: Refs,
         bundles: BTreeMap<Key, DynamicObject>,
         pem: String,
     }
@@ -293,8 +294,14 @@ mod tests {
                 ),
             ] {
                 let mut o = obj("ConfigMap", Some("apps"), name, T0, json!({ "data": data }));
-                super::super::trust::thin_configmap(&mut o);
-                cms.insert(("apps".into(), name.into()), o);
+                RefKind::ConfigMap.thin(&mut o);
+                cms.insert(
+                    (RefKind::ConfigMap, ("apps".into(), name.into())),
+                    RefState {
+                        listed: Some(true),
+                        object: Some(o),
+                    },
+                );
             }
             let mut bundles = BTreeMap::new();
             bundles.insert(
@@ -315,7 +322,7 @@ mod tests {
             evaluate(
                 &refs,
                 &Sources {
-                    configmaps: Some(&self.cms),
+                    refs: &self.cms,
                     bundles: Some(&self.bundles),
                 },
             )
@@ -490,7 +497,13 @@ mod tests {
 
     #[test]
     fn unlisted_configmaps_fail_closed() {
-        let w = World::new();
+        let mut w = World::new();
+        for r in w.cms.values_mut() {
+            *r = RefState {
+                listed: Some(false),
+                object: None,
+            };
+        }
         let ps = [policy(
             "p",
             T0,
@@ -501,7 +514,7 @@ mod tests {
         let p = evaluate(
             &refs,
             &Sources {
-                configmaps: None,
+                refs: &w.cms,
                 bundles: Some(&w.bundles),
             },
         );
