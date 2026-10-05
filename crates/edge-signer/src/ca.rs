@@ -163,7 +163,11 @@ impl Ca {
             .chain(ips.iter().map(|ip| Ok(SanType::IpAddress(*ip))))
             .collect::<Result<_, rcgen::Error>>()?;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        // A workload identity, used in both directions.
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
         params.use_authority_key_identifier_extension = true;
         params.not_before = datetime(now)?;
         params.not_after = datetime(not_after)?;
@@ -752,6 +756,91 @@ pub(crate) mod tests {
         assert_ne!(Ca::ephemeral(NOW).unwrap().root(), ca.root());
     }
 
+    fn issued_with_key(ca: &Ca, dns: &str, now: i64) -> (Vec<CertificateDer<'static>>, KeyPair) {
+        let (key, csr) = csr(&PKCS_ECDSA_P256_SHA256);
+        let leaf = ca
+            .issue(
+                &requested_key(&csr).unwrap(),
+                &[dns.into()],
+                &[],
+                now,
+                864_000,
+            )
+            .unwrap();
+        (ders(&leaf.chain), key)
+    }
+
+    /// A pod certificate as the client of a server that requires one and
+    /// trusts the node CA, as Java's and OpenSSL's clients check it.
+    #[test]
+    fn leaf_authenticates_as_a_tls_client() {
+        use rustls::pki_types::PrivateKeyDer;
+        // The handshake checks validity on the wall clock.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let r = root("unit CA", now - 60, now + 10 * YEAR);
+        let i = intermediate(&r);
+        let ca = Ca::parse(file(&i, &[&i, &r]).as_bytes(), now).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ders(ca.root()).remove(0)).unwrap();
+        let roots = std::sync::Arc::new(roots);
+        let key = |k: &KeyPair| PrivateKeyDer::try_from(k.serialize_der()).unwrap();
+
+        let (server_chain, server_key) = issued_with_key(&ca, "broker.example.lan", now - 60);
+        let (client_chain, client_key) = issued_with_key(&ca, "client.example.lan", now - 60);
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            roots.clone(),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let server_cfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(server_chain, key(&server_key))
+            .unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(client_chain.clone(), key(&client_key))
+            .unwrap();
+        let mut server = rustls::ServerConnection::new(server_cfg.into()).unwrap();
+        let mut client = rustls::ClientConnection::new(
+            client_cfg.into(),
+            rustls_pki_types::ServerName::try_from("broker.example.lan").unwrap(),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        for _ in 0..10 {
+            buf.clear();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut buf.as_slice()).unwrap();
+            server
+                .process_new_packets()
+                .expect("server rejected the client");
+            buf.clear();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut buf.as_slice()).unwrap();
+            client
+                .process_new_packets()
+                .expect("client rejected the server");
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!server.is_handshaking(), "handshake did not finish");
+        assert_eq!(
+            server.peer_certificates().unwrap()[0],
+            client_chain[0],
+            "the server saw the pod certificate"
+        );
+    }
+
     #[test]
     fn leaf_carries_names_and_key() {
         let r = root("r", NOW - 60, NOW + 10 * YEAR);
@@ -800,7 +889,8 @@ pub(crate) mod tests {
             .map(str::to_string)
         );
         let eku = x.extended_key_usage().unwrap().unwrap().value;
-        assert!(eku.server_auth && !eku.client_auth);
+        assert!(eku.server_auth && eku.client_auth);
+        assert!(!eku.any && !eku.code_signing && !eku.email_protection);
         let ku = x.key_usage().unwrap().unwrap().value;
         assert!(ku.digital_signature() && !ku.key_cert_sign());
     }
