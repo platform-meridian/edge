@@ -245,7 +245,7 @@ async fn run(
                 cmd = rx.recv() => {
                     match cmd {
                         Some(Command::Verify(sha, reply)) => {
-                            let r = engine.request_verify(&sha);
+                            let r = engine.request_verify(&sha).await;
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
                         }

@@ -16,6 +16,12 @@ pub struct Component {
     pub digest: String,
     #[serde(default)]
     pub dirty: bool,
+    /// The release's bundle carries it; else the unit holds it already.
+    #[serde(default)]
+    pub carried: bool,
+    /// What it belongs to: `base`, a module's name, or empty if unknown.
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// The repository without its registry, tag or digest: what stays the same
@@ -50,11 +56,12 @@ fn without_digest(image: &str) -> &str {
 /// A release's images: every ref it runs, not only those its bundle carries,
 /// named and versioned by its `COMPONENT_` lines where they say. `images`
 /// maps each carried ref to its digest; another ref's digest is its own, else
-/// its component line's.
+/// its component line's. `owners` names what each ref belongs to.
 pub fn of_release(
     manifest: &Manifest,
     refs: &BTreeSet<String>,
     images: &BTreeMap<String, String>,
+    owners: &BTreeMap<String, String>,
 ) -> Vec<Component> {
     let named: BTreeMap<String, bundle::Component> = bundle::components(manifest)
         .into_iter()
@@ -70,6 +77,10 @@ pub fn of_release(
             .or_else(|| image.split_once('@').map(|(_, d)| d.to_string()))
             .or_else(|| c.map(|c| c.digest.clone()))
             .unwrap_or_default();
+        let (carried, owner) = (
+            images.contains_key(image),
+            owners.get(image).cloned().unwrap_or_default(),
+        );
         let c = match c {
             Some(c) => Component {
                 name: c.name.clone(),
@@ -81,13 +92,17 @@ pub fn of_release(
                 },
                 digest,
                 dirty: c.dirty == Some(true),
+                carried,
+                owner,
             },
             None => Component {
                 name: k.clone(),
                 image: without_digest(image).into(),
                 version: tag(image).into(),
                 digest,
-                dirty: false,
+                carried,
+                owner,
+                ..Component::default()
             },
         };
         out.insert(k, c);
@@ -111,7 +126,7 @@ pub fn of_refs(refs: &BTreeSet<String>, digest: impl Fn(&str) -> Option<String>)
                     .map(|(_, d)| d.to_string())
                     .or_else(|| digest(r))
                     .unwrap_or_default(),
-                dirty: false,
+                ..Component::default()
             },
         );
     }
@@ -227,7 +242,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            of_release(&m, &BTreeSet::new(), &images),
+            of_release(&m, &BTreeSet::new(), &images, &BTreeMap::new()),
             [
                 Component {
                     name: "edge-cni".into(),
@@ -235,13 +250,16 @@ mod tests {
                     version: "v0.3-4-gabc".into(),
                     digest: "sha256:aa".into(),
                     dirty: true,
+                    carried: true,
+                    owner: String::new(),
                 },
                 Component {
                     name: "maplibre/martin".into(),
                     image: "ghcr.io/maplibre/martin".into(),
                     version: "".into(),
                     digest: "sha256:bb".into(),
-                    dirty: false,
+                    carried: true,
+                    ..Component::default()
                 },
             ]
         );
@@ -257,16 +275,26 @@ mod tests {
             "reg.io/kube:1".into(),
         ]);
         let carried = BTreeMap::from([("reg.io/gateway:2".to_string(), "sha256:g2".to_string())]);
-        let got = of_release(&m, &refs, &carried);
+        let owners = BTreeMap::from([
+            ("reg.io/gateway:2".to_string(), "gateway".to_string()),
+            ("reg.io/etcd:3.6".into(), "base".into()),
+        ]);
+        let got = of_release(&m, &refs, &carried, &owners);
         assert_eq!(
             got.iter()
-                .map(|c| (c.name.as_str(), c.version.as_str(), c.digest.as_str()))
+                .map(|c| (
+                    c.name.as_str(),
+                    c.version.as_str(),
+                    c.digest.as_str(),
+                    c.carried,
+                    c.owner.as_str()
+                ))
                 .collect::<Vec<_>>(),
             [
-                ("etcd", "3.6.1", "sha256:ee"),
-                ("flux", "", "sha256:ff"),
-                ("gateway", "2", "sha256:g2"),
-                ("kube", "1", ""),
+                ("etcd", "3.6.1", "sha256:ee", false, "base"),
+                ("flux", "", "sha256:ff", false, ""),
+                ("gateway", "2", "sha256:g2", true, "gateway"),
+                ("kube", "1", "", false, ""),
             ]
         );
         let before = [
@@ -316,7 +344,7 @@ mod tests {
             image: image.into(),
             version: version.into(),
             digest: digest.into(),
-            dirty: false,
+            ..Component::default()
         }
     }
 

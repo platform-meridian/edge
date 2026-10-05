@@ -8,6 +8,7 @@ use connectrpc::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::bundle::components::{MODULES_KEY, REMOVE_KEY};
 use crate::diff::{Change, Component, Diff};
 use crate::engine::{self, Entry, Outcome, Phase, Power, Record, Release, Storage, Unit};
 use crate::judge::{Check, CheckState};
@@ -57,8 +58,12 @@ impl Service {
         }
     }
 
+    /// Idle, or on a stack trial a new bundle may take over.
     fn idle(&self) -> Result<(), ConnectError> {
         let s = self.status.borrow();
+        if engine::stuck_trial(&s.record, &s.unit.stack_tag, &s.unit.judge).is_some() {
+            return Ok(());
+        }
         match s.record.phase {
             Phase::Idle => Ok(()),
             _ if s.record.by.is_empty() => Err(ConnectError::failed_precondition(
@@ -150,6 +155,9 @@ fn upload(u: &Upload) -> pb::Upload {
                     .collect(),
                 notes: h.notes.clone().unwrap_or_default(),
                 signer: h.signer.clone(),
+                brings_base: crate::bundle::has_base(&h.manifest),
+                modules: listed(&h.manifest, MODULES_KEY),
+                removes: listed(&h.manifest, REMOVE_KEY),
                 ..Default::default()
             })
             .into(),
@@ -180,8 +188,16 @@ fn component(c: &Component) -> pb::Component {
         version: c.version.clone(),
         digest: c.digest.clone(),
         dirty: c.dirty,
+        carried: c.carried,
+        owner: c.owner.clone(),
         ..Default::default()
     }
+}
+
+fn listed(m: &crate::bundle::Manifest, key: &str) -> Vec<String> {
+    m.get(key)
+        .map(|v| v.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
 }
 
 fn diff(d: &Diff) -> pb::Diff {
@@ -233,6 +249,9 @@ fn release(r: &Release) -> pb::Release {
         checks: r.checks.iter().map(check).collect(),
         diff: r.diff.as_ref().map(diff).into(),
         components: r.components().iter().map(component).collect(),
+        brings_base: r.brings_base,
+        modules: r.modules.iter().cloned().collect(),
+        removes: r.removes.iter().cloned().collect(),
         ..Default::default()
     }
 }
@@ -273,6 +292,7 @@ fn unit(u: &Unit) -> pb::Unit {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        modules: u.modules.iter().cloned().collect(),
         ..Default::default()
     }
 }
@@ -776,6 +796,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uploads_wait_for_an_update_unless_its_trial_is_stuck() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, publish, _rx) = serve(d.path()).await;
+        let begin = pb::BeginUploadRequest {
+            size: 10,
+            sha256: vec![1; 32],
+            ..Default::default()
+        };
+        let judging = |checks: &str, good: &str| {
+            let mut s = Snapshot::default();
+            s.record.phase = Phase::Judging {
+                rolled_back: String::new(),
+            };
+            s.record.release = Some(Release {
+                manifest: [("STACK_TAG".to_string(), "s1".to_string())].into(),
+                ..Release::default()
+            });
+            s.unit.stack_tag = "s1".into();
+            s.unit.judge = crate::judge::Judge::read(
+                &[("trial", "s1"), ("good", good), ("checks", checks)]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+            s
+        };
+        for (checks, good) in [("pass ready", ""), ("fail ready: x", "s0")] {
+            publish.send_replace(judging(checks, good));
+            let e = c.begin_upload(begin.clone()).await.unwrap_err();
+            assert!(
+                e.to_string().contains("in progress"),
+                "{checks} {good}: {e}"
+            );
+        }
+        publish.send_replace(judging("fail ready: x", ""));
+        c.begin_upload(begin).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn commands_reach_the_engine_and_its_status_comes_back() {
         let d = tempfile::tempdir().unwrap();
         let (c, publish, mut rx) = serve(d.path()).await;
@@ -1118,7 +1177,25 @@ mod tests {
         u.refused = "not ours".into();
         u.head.as_mut().unwrap().notes = Some("# 2".into());
         u.head.as_mut().unwrap().signer = "SHA256:x k".into();
+        let m = &mut u.head.as_mut().unwrap().manifest;
+        m.insert("MODULES".into(), "gw esm".into());
+        m.insert("REMOVE".into(), "old".into());
         let p = upload(&u);
+        let h = p.head.as_option().unwrap();
+        assert_eq!(
+            (h.brings_base, h.modules.clone(), h.removes.clone()),
+            (
+                false,
+                vec!["gw".to_string(), "esm".into()],
+                vec!["old".into()]
+            )
+        );
+        u.head
+            .as_mut()
+            .unwrap()
+            .manifest
+            .insert("STACK_DIGEST".into(), "sha256:s".into());
+        assert!(upload(&u).head.as_option().unwrap().brings_base);
         assert_eq!(
             (
                 p.sha256.clone(),
@@ -1159,6 +1236,8 @@ mod tests {
             version: v.into(),
             digest: format!("sha256:{v}"),
             dirty: v == "2",
+            carried: v == "2",
+            owner: "gw".into(),
         };
         let r = Release {
             sha256: "bb".repeat(32),
@@ -1174,6 +1253,10 @@ mod tests {
             notes: Some("notes".into()),
             signer: "SHA256:k s".into(),
             images: [("r.io/app:2".to_string(), "sha256:2".to_string())].into(),
+            owners: [("r.io/app:2".to_string(), "gw".to_string())].into(),
+            brings_base: true,
+            modules: ["gw".to_string()].into(),
+            removes: ["old".to_string()].into(),
             checks: vec![
                 Check::new("space", CheckState::Fail, "full"),
                 Check::new("reboot", CheckState::Note, "needed"),
@@ -1262,13 +1345,29 @@ mod tests {
             ),
             ("1", "2", "sha256:2", "r.io/app:2", true, false)
         );
+        assert_eq!(
+            (to.carried, from.carried, to.owner.as_str()),
+            (true, false, "gw")
+        );
+        assert_eq!(
+            (p.brings_base, p.modules.clone(), p.removes.clone()),
+            (true, vec!["gw".to_string()], vec!["old".to_string()])
+        );
         assert_eq!(to.kind, pb::ComponentKind::COMPONENT_KIND_IMAGE);
         let comps: Vec<_> = p
             .components
             .iter()
-            .map(|c| (c.name.as_str(), c.version.as_str(), c.dirty))
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.version.as_str(),
+                    c.dirty,
+                    c.carried,
+                    c.owner.as_str(),
+                )
+            })
             .collect();
-        assert_eq!(comps, [("app", "2", true)]);
+        assert_eq!(comps, [("app", "2", true, true, "gw")]);
         for (ch, want) in [
             (Change::Unchanged, pb::Change::CHANGE_UNCHANGED),
             (Change::Added, pb::Change::CHANGE_ADDED),
@@ -1297,8 +1396,10 @@ mod tests {
                 ..Component::default()
             }],
             manifest: [("GIT_REV".to_string(), "abc".to_string())].into(),
+            modules: ["esm".to_string(), "gw".into()].into(),
             ..Unit::default()
         });
+        assert_eq!(u.modules, ["esm", "gw"]);
         assert_eq!(
             (
                 u.installer.as_str(),

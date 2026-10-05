@@ -9,7 +9,10 @@ service UpdateService {
   rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
   // Stores one chunk. A chunk already held is accepted again.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
-  // Checks a complete upload against the pinned key and this unit, changing nothing.
+  // Checks a complete upload against the pinned key and this unit, changing
+  // nothing. Refused while an update runs, except on a stack trial that is
+  // unhealthy with no good release to roll back to: that trial is ended as
+  // failed, and Apply then moves the stack off it. Uploads are taken then too.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
   // Applies the verified bundle. Refused while the OS the unit booted is on
   // trial, since the update's own trial falls back to a blessed one.
@@ -77,6 +80,10 @@ message Head {
   string notes = 2;
   // The key it verified against: "SHA256:<fingerprint> <comment>".
   string signer = 3;
+  // What its MANIFEST says it brings: a base or none, its modules, and those it removes.
+  bool brings_base = 4;
+  repeated string modules = 5;
+  repeated string removes = 6;
 }
 
 message PutChunkRequest {
@@ -342,6 +349,10 @@ message Component {
   string digest = 5;
   // Built from a tree with uncommitted changes.
   bool dirty = 6;
+  // The release's bundle carries it; else the unit holds it already.
+  bool carried = 7;
+  // What it belongs to: "base", a module's name, or empty if unknown.
+  string owner = 8;
 }
 
 enum Change {
@@ -399,6 +410,8 @@ message Unit {
   repeated Component components = 10;
   // The MANIFEST of the release the unit runs, if this engine applied it.
   map<string, string> manifest = 11;
+  // The modules installed: the running release's, else as the stack records them.
+  repeated string modules = 12;
 }
 
 message Release {
@@ -415,6 +428,11 @@ message Release {
   repeated Check checks = 8;
   Diff diff = 9;
   repeated Component components = 10;
+  // What the bundle itself brought, before it was merged into the unit's set:
+  // a base or none, the modules it brought, and those it removed.
+  bool brings_base = 11;
+  repeated string modules = 12;
+  repeated string removes = 13;
 }
 
 enum Outcome {

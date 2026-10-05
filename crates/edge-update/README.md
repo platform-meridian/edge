@@ -46,14 +46,19 @@ with `stack.modules` set, a ConfigMap of `MODULES` and each module's MANIFEST
 lines), tags it as the bundle's `STACK_TAG` in the repository `stack.url`
 names, and keeps the set beside that tag. The release's MANIFEST, refs and
 machine config are then the set's, so the judge, rollback and collection
-cover the whole set: rolling back returns to the previous one. A bundle
+cover the whole set: rolling back returns to the previous one. The release
+still says what the bundle itself did: `brings_base`, the `modules` it
+brought and those it `removes`, and each of its components names its `owner`
+(`base` or a module) and whether the bundle `carried` it. A bundle
 without a base on a stack whose set it did not compose is refused, as is one
 applied after the stack moved from the one it was verified on.
 
 ## What runs, and what a release changes
 
 `Unit.components` lists what runs: the images of the release the unit runs,
-if this engine applied it, else the images its workloads name. On
+if this engine applied it, else the images its workloads name. `Unit.modules`
+lists the modules installed: the running release's, else as `stack.modules`
+records them. On
 verification, `Release.diff` compares that with the release, image by image
 (an image is its repository without registry, tag or digest), and says
 whether the OS changes and so the unit reboots, whether the machine config
@@ -94,6 +99,13 @@ itself.
 
 With nothing on trial, `RollBack` points the stack at the judge's `previous`
 release, which the judge then takes on trial like any other. The OS stays.
+
+A stack trial with no `good` release has nothing to roll back to, so one that
+never comes up healthy would hold the unit until someone commits it. While
+the judge's checks fail on such a trial, an upload and `Verify` are taken
+anyway: the trial is ended as failed, with the reason in the history, and
+`Apply` moves the stack off it without waiting for a good release. A healthy
+trial, or one with a release to roll back to, is never taken over.
 
 ## Storage
 

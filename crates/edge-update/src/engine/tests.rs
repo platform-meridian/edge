@@ -460,8 +460,11 @@ impl Cluster for FakeCluster {
                 "the stack moved before the OS was committed"
             );
             assert!(w.seeded, "the stack moved before the judge was updated");
-            assert_eq!(
-                w.judge["good"], w.tag,
+            // Off a trial that cannot pass and has nothing to return to, nothing is lost.
+            let stuck = w.judge["good"].is_empty()
+                && w.judge.get("checks").is_some_and(|c| c.starts_with("fail"));
+            assert!(
+                w.judge["good"] == w.tag || stuck,
                 "the stack moved with nothing to roll back to"
             );
         }
@@ -992,7 +995,7 @@ impl Harness {
 
     pub(crate) async fn verify(&mut self, s: &Spec) -> Option<Entry> {
         let sha = self.upload(s);
-        self.e().request_verify(&sha).unwrap();
+        self.e().request_verify(&sha).await.unwrap();
         self.run(|_, _| {}).await;
         let r = &self.e().record;
         (r.release.is_none()).then(|| r.history[0].clone())
@@ -1438,7 +1441,7 @@ async fn a_bundle_of_an_old_format_is_refused_as_it_arrives() {
         let up = h.e().uploads().current().unwrap();
         let want = format!("the bundle is format {f}, and only format 4 is read: rebuild it");
         assert!(up.refused.contains(&want), "{}", up.refused);
-        assert!(h.e().request_verify(&sha).is_err());
+        assert!(h.e().request_verify(&sha).await.is_err());
         assert!(h.w().log.is_empty());
     }
 }
@@ -1597,7 +1600,7 @@ async fn a_bundle_signed_by_another_key_is_refused_before_any_call() {
     let sha = h.upload_signed(&Spec::new("update-new"), &other);
     let up = h.e().uploads().current().unwrap();
     assert!(up.refused.contains("pinned update key"), "{}", up.refused);
-    assert!(h.e().request_verify(&sha).is_err());
+    assert!(h.e().request_verify(&sha).await.is_err());
     assert!(h.e().record.history.is_empty());
     assert_eq!(
         h.w().calls,
@@ -1806,7 +1809,7 @@ async fn nothing_else_is_taken_while_an_update_runs() {
                 let sha = h.e().record.release.clone().unwrap().sha256;
                 refused = futures::executor::block_on(h.e().request_apply("update-new", ""))
                     .is_err()
-                    && h.e().request_verify(&sha).is_err();
+                    && futures::executor::block_on(h.e().request_verify(&sha)).is_err();
             }
         })
         .await;
@@ -2312,12 +2315,12 @@ async fn storage_counts_what_a_collection_frees() {
 async fn only_a_whole_upload_of_that_bundle_is_verified() {
     let mut h = Harness::new();
     let sha = h.upload(&Spec::new("update-new"));
-    let e = h.e().request_verify(&"0".repeat(64)).unwrap_err();
+    let e = h.e().request_verify(&"0".repeat(64)).await.unwrap_err();
     assert!(e.to_string().contains("no complete upload"), "{e}");
     // The same bundle begun again, nothing held yet.
     h.e().uploads().discard();
     h.e().uploads().begin(10_000, &sha, "").unwrap();
-    assert!(h.e().request_verify(&sha).is_err());
+    assert!(h.e().request_verify(&sha).await.is_err());
 }
 
 #[tokio::test]
@@ -2629,4 +2632,184 @@ async fn a_unit_with_no_record_of_what_it_runs_takes_no_bundle_of_components() {
         "this unit's installed modules are unknown",
     )
     .await;
+}
+
+/// The judge's trial of the stack the unit runs, unhealthy, and `good` its last good release.
+fn stuck_on(h: &Harness, tag: &str, good: &str) {
+    let mut w = h.w();
+    w.judge_idle = true;
+    w.tag = tag.into();
+    for (k, v) in [
+        ("good", good),
+        ("trial", tag),
+        ("checks", "fail workloads: deployment app/web"),
+    ] {
+        w.judge.insert(k.into(), v.into());
+    }
+}
+
+/// A unit's first release, by this engine, on trial: there is nothing before it.
+async fn first_on_trial(h: &mut Harness) {
+    {
+        let mut w = h.w();
+        w.tag = String::new();
+        w.judge = BTreeMap::from([("good".into(), String::new())]);
+        w.judge_idle = true;
+    }
+    applied(h, &Spec::new("update-new")).await;
+    step_until(h, |p| matches!(p, Phase::Judging { .. })).await;
+}
+
+fn ended_entries(h: &mut Harness, tag: &str) -> usize {
+    h.e()
+        .record
+        .history
+        .iter()
+        .filter(|e| e.outcome == Outcome::Failed && e.detail == ended(tag))
+        .count()
+}
+
+#[tokio::test]
+async fn a_first_trial_that_cannot_pass_is_taken_over_by_a_new_bundle() {
+    let mut h = Harness::new();
+    first_on_trial(&mut h).await;
+    stuck_on(&h, "update-new", "");
+    let sha = h.upload(&newer());
+    h.e().request_verify(&sha).await.unwrap();
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Failed);
+    assert_eq!(e.release.unwrap().tag(), "update-new");
+    assert_eq!(e.detail, ended("update-new"));
+    assert!(
+        e.detail
+            .starts_with("update-new stayed unhealthy with no good release to roll back to"),
+        "{}",
+        e.detail
+    );
+    h.run(|_, _| {}).await;
+    assert_eq!(h.e().release().unwrap().tag(), "update-newer");
+
+    h.e().request_apply("update-newer", "ann").await.unwrap();
+    assert_eq!(ended_entries(&mut h, "update-new"), 1, "ended twice");
+    h.w().judge_idle = false;
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-newer");
+    assert!(h.e().record.took_over.is_empty());
+}
+
+#[tokio::test]
+async fn a_stuck_trial_the_engine_did_not_start_is_ended_by_an_apply() {
+    let mut h = Harness::new();
+    stuck_on(&h, "update-first", "");
+    assert!(h.verify(&Spec::new("update-new")).await.is_none());
+    h.e().request_apply("update-new", "ann").await.unwrap();
+    let e = h.e().record.history[0].clone();
+    assert_eq!(
+        (e.outcome, e.release.unwrap().tag(), e.by.as_str()),
+        (Outcome::Failed, "update-first", "ann")
+    );
+    assert_eq!(e.detail, ended("update-first"));
+    h.w().judge_idle = false;
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+}
+
+#[tokio::test]
+async fn a_trial_that_can_pass_or_roll_back_is_not_taken_over() {
+    // Healthy, with nothing to return to.
+    let mut h = Harness::new();
+    first_on_trial(&mut h).await;
+    {
+        let mut w = h.w();
+        w.judge.insert("trial".into(), "update-new".into());
+        w.judge.insert("checks".into(), "pass workloads".into());
+    }
+    let sha = h.upload(&newer());
+    let e = h.e().request_verify(&sha).await.unwrap_err();
+    assert!(e.to_string().contains("in progress"), "{e}");
+    assert!(matches!(h.e().record.phase, Phase::Judging { .. }));
+    assert!(h.e().record.history.is_empty());
+
+    // Unhealthy, with a good release to roll back to.
+    let mut h = Harness::new();
+    h.w().judge_idle = true;
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
+    stuck_on(&h, "update-new", OLD_TAG);
+    let sha = h.upload(&newer());
+    assert!(h.e().request_verify(&sha).await.is_err());
+    assert!(matches!(h.e().record.phase, Phase::Judging { .. }));
+    assert!(h.e().record.history.is_empty());
+}
+
+#[tokio::test]
+async fn an_apply_onto_a_trial_that_can_pass_waits_for_it() {
+    let mut h = Harness::new();
+    stuck_on(&h, "update-first", "");
+    h.w().judge.insert("checks".into(), "pass workloads".into());
+    assert!(h.verify(&Spec::new("update-new")).await.is_none());
+    h.e().request_apply("update-new", "ann").await.unwrap();
+    assert!(h.e().record.history.is_empty());
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert!(e.detail.contains("never recorded"), "{}", e.detail);
+    assert_eq!(h.w().tag, "update-first");
+}
+
+#[tokio::test]
+async fn a_release_says_what_its_bundle_brought_and_who_owns_each_image() {
+    let mut h = with_a().await;
+    let base = h.e().record.history[0].release.clone().unwrap();
+    assert!(base.brings_base && base.removes.is_empty());
+    assert_eq!(base.modules, BTreeSet::from(["a".to_string()]));
+
+    let s = Spec::modules("update-b", 3000, &["b"], &["a"]);
+    assert!(h.verify(&s).await.is_none());
+    let r = h.e().release().unwrap().clone();
+    assert!(!r.brings_base);
+    assert_eq!(
+        (r.modules.clone(), r.removes.clone()),
+        (
+            BTreeSet::from(["b".to_string()]),
+            BTreeSet::from(["a".to_string()])
+        )
+    );
+    let of = |name: &str| {
+        r.components()
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let (b, app) = (of("reg/b"), of("reg/app"));
+    assert_eq!((b.owner.as_str(), b.carried), ("b", true));
+    assert_eq!((app.owner.as_str(), app.carried), ("base", false));
+    let to = |name: &str| {
+        let d = r.diff.as_ref().unwrap();
+        d.components
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.to.clone())
+            .unwrap()
+    };
+    assert!(to("reg/b").carried && !to("reg/app").carried);
+}
+
+#[tokio::test]
+async fn the_units_modules_are_its_releases_else_as_its_stack_records_them() {
+    let mut h = Harness::new();
+    h.w().modules = BTreeMap::from([("MODULES".into(), "x y".into())]);
+    h.e().refresh_unit().await;
+    assert_eq!(
+        h.e().unit.modules,
+        BTreeSet::from(["x".to_string(), "y".into()])
+    );
+    let mut h = with_a().await;
+    h.w().modules = BTreeMap::from([("MODULES".into(), "stale".into())]);
+    h.e().refresh_unit().await;
+    assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
 }

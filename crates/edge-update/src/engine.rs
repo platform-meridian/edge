@@ -107,6 +107,16 @@ pub struct Release {
     /// With components: the stack its set was composed on.
     #[serde(default)]
     pub composed_on: Option<String>,
+    /// What the bundle itself brought: a base or not, its modules, and those it removed.
+    #[serde(default)]
+    pub brings_base: bool,
+    #[serde(default)]
+    pub modules: BTreeSet<String>,
+    #[serde(default)]
+    pub removes: BTreeSet<String>,
+    /// Each ref of the installed set and what it belongs to: `base` or a module.
+    #[serde(default)]
+    pub owners: BTreeMap<String, String>,
 }
 
 /// A unit's installed set, and the stack composed for it.
@@ -127,7 +137,7 @@ impl Release {
         self.get("STACK_TAG")
     }
     pub fn components(&self) -> Vec<Component> {
-        diff::of_release(&self.manifest, &self.refs, &self.images)
+        diff::of_release(&self.manifest, &self.refs, &self.images, &self.owners)
     }
 }
 
@@ -201,6 +211,9 @@ pub struct Record {
     /// Who started the update.
     #[serde(default)]
     pub by: String,
+    /// The stack trial this update ended, with nothing to roll back to.
+    #[serde(default)]
+    pub took_over: String,
 }
 
 impl Record {
@@ -256,6 +269,8 @@ pub struct Unit {
     pub components: Vec<Component>,
     /// The running release's MANIFEST, if this engine applied it.
     pub manifest: Manifest,
+    /// The modules installed: the running release's, else as the stack records them.
+    pub modules: BTreeSet<String>,
     pub judge: Judge,
 }
 
@@ -491,8 +506,18 @@ impl Engine {
         self.record.phase == Phase::Idle
     }
 
-    pub fn request_verify(&mut self, sha256: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(self.idle(), "an update is in progress");
+    /// While idle, or on a stack trial that cannot end by itself, which it ends.
+    pub async fn request_verify(&mut self, sha256: &str) -> anyhow::Result<()> {
+        let stuck = match self.idle() {
+            true => None,
+            false => Some(
+                self.stuck()
+                    .await
+                    .ok()
+                    .flatten()
+                    .context("an update is in progress")?,
+            ),
+        };
         let up = self
             .uploads()
             .current()
@@ -503,6 +528,9 @@ impl Engine {
             "the bundle is refused: {}",
             up.refused
         );
+        if let Some(trial) = stuck {
+            self.finish(Outcome::Failed, ended(&trial))?;
+        }
         self.record.steps = vec![Taken {
             step: Step::Upload,
             state: State::Done,
@@ -544,6 +572,7 @@ impl Engine {
             "the unit is on trial of {}: wait for it to be blessed or to fall back",
             boot.selected
         );
+        let stuck = self.stuck().await?;
         self.record.error.clear();
         self.record.by = by.into();
         self.record.steps.retain(|t| t.step <= Step::Verify);
@@ -553,7 +582,60 @@ impl Engine {
             format!(" by {by}")
         };
         self.note(format!("applying {tag}{who}"));
+        if let Some(trial) = &stuck {
+            self.end_stuck(trial, by);
+            self.note(ended(trial));
+        }
+        self.record.took_over = stuck.unwrap_or_default();
         self.go(Phase::Starting)
+    }
+
+    /// The stack trial a new bundle may end, read afresh.
+    async fn stuck(&self) -> anyhow::Result<Option<String>> {
+        let (_, on) = self
+            .cluster
+            .sync(&self.settings.stack.flux_instance)
+            .await?;
+        Ok(stuck_trial(&self.record, &on, &self.judge_now().await?))
+    }
+
+    /// Records the stuck trial ended, unless its last entry already does.
+    fn end_stuck(&mut self, trial: &str, by: &str) {
+        let detail = ended(trial);
+        let last = self
+            .record
+            .history
+            .iter()
+            .find(|e| e.release.as_ref().is_some_and(|r| r.tag() == trial));
+        if last.is_some_and(|e| e.outcome == Outcome::Failed && e.detail == detail) {
+            return;
+        }
+        let release = last
+            .and_then(|e| e.release.clone())
+            .unwrap_or_else(|| Release {
+                manifest: [("STACK_TAG".to_string(), trial.to_string())].into(),
+                ..Release::default()
+            });
+        let now = (self.now)();
+        self.record.history.insert(
+            0,
+            Entry {
+                release: Some(release),
+                outcome: Outcome::Failed,
+                detail: detail.clone(),
+                started: now,
+                finished: now,
+                snapshot: None,
+                steps: Vec::new(),
+                log: vec![LogLine {
+                    unix: now,
+                    text: detail,
+                }],
+                by: by.into(),
+                rollback_reason: String::new(),
+            },
+        );
+        self.record.history.truncate(HISTORY);
     }
 
     /// Rereads the unit, a part that cannot be read keeping its last reading;
@@ -599,19 +681,31 @@ impl Engine {
         }
         match self.record.running(&self.unit.stack_tag) {
             Some(r) => {
-                (self.unit.components, self.unit.manifest) = (r.components(), r.manifest.clone())
+                let modules = words(r.manifest.get(components::MODULES_KEY));
+                let u = &mut self.unit;
+                (u.components, u.manifest, u.modules) =
+                    (r.components(), r.manifest.clone(), modules);
             }
-            None => match self.cluster.images_in_use().await {
-                Ok(refs) => {
-                    let registry = &self.registry;
-                    self.unit.components = diff::of_refs(&refs, |r| registry.digest(r));
-                    self.unit.manifest.clear();
+            None => {
+                match self.cluster.images_in_use().await {
+                    Ok(refs) => {
+                        let registry = &self.registry;
+                        self.unit.components = diff::of_refs(&refs, |r| registry.digest(r));
+                        self.unit.manifest.clear();
+                    }
+                    Err(e) => tracing::debug!(
+                        error = format!("{e:#}"),
+                        "could not read what the unit runs"
+                    ),
                 }
-                Err(e) => tracing::debug!(
-                    error = format!("{e:#}"),
-                    "could not read what the unit runs"
-                ),
-            },
+                match self.recorded_modules().await {
+                    Ok(m) => self.unit.modules = words(m.as_ref()),
+                    Err(e) => tracing::debug!(
+                        error = format!("{e:#}"),
+                        "could not read the stack's record of its modules"
+                    ),
+                }
+            }
         }
         self.unit != was
     }
@@ -750,6 +844,7 @@ impl Engine {
         );
         self.note(detail.clone());
         self.progress.stop();
+        self.record.took_over.clear();
         let b = self.record.before.take();
         let first = self.record.steps.iter().find(|t| t.step > Step::Verify);
         self.record.history.insert(
@@ -845,14 +940,7 @@ impl Engine {
     async fn covers_what_runs(&self, on: &str, c: &Components) -> anyhow::Result<()> {
         let said = match self.record.running(on) {
             Some(r) => r.manifest.get(components::MODULES_KEY).cloned(),
-            None => match &self.settings.stack.modules {
-                Some(at) => self
-                    .cluster
-                    .config_map(at)
-                    .await?
-                    .and_then(|m| m.get(components::MODULES_KEY).cloned()),
-                None => None,
-            },
+            None => self.recorded_modules().await?,
         };
         let runs: BTreeSet<&str> = said
             .as_deref()
@@ -876,6 +964,18 @@ impl Engine {
             }
         );
         Ok(())
+    }
+
+    /// The stack's record of its installed modules, if it keeps one.
+    async fn recorded_modules(&self) -> anyhow::Result<Option<String>> {
+        let Some(at) = &self.settings.stack.modules else {
+            return Ok(None);
+        };
+        Ok(self
+            .cluster
+            .config_map(at)
+            .await?
+            .and_then(|m| m.get(components::MODULES_KEY).cloned()))
     }
 
     /// With components, the bundle merged into the unit's installed set: the
@@ -947,8 +1047,13 @@ impl Engine {
         };
         rel.manifest = next.manifest(&rel.manifest, &c);
         rel.manifest.insert("STACK_DIGEST".into(), stack.clone());
+        rel.owners = owners(&next);
+        rel.owners.insert(name, "base".into());
         rel.refs = refs;
         rel.composed_on = Some(on);
+        rel.brings_base = c.base.is_some();
+        rel.modules = c.modules.keys().cloned().collect();
+        rel.removes = c.remove.clone();
         std::fs::write(
             dir.join(INSTALLED),
             serde_json::to_vec(&Composed {
@@ -978,6 +1083,7 @@ impl Engine {
             let images = bundle::layout_images(&dir.join(bundle::IMAGES))?;
             Ok(Release {
                 sha256: sha.into(),
+                brings_base: bundle::has_base(&manifest),
                 manifest,
                 refs,
                 notes: bundle::notes(&dir),
@@ -1654,7 +1760,9 @@ impl Engine {
             return Ok(Go(Phase::Judging { rolled_back }));
         }
         let prev = self.before()?.tag.clone();
-        if good == prev {
+        // A trial taken over had nothing to roll back to, and never will.
+        let ended = good.is_empty() && self.record.took_over == prev;
+        if good == prev || ended {
             return Ok(Go(Phase::Repointing { rolled_back }));
         }
         if (self.now)() - self.record.since > GOOD {
@@ -2026,6 +2134,52 @@ impl Engine {
         let registry = self.registry.clone();
         tokio::task::spawn_blocking(move || registry.retain(&keep)).await?
     }
+}
+
+/// Each ref of `set` and what it belongs to: a module's own, else the base's.
+fn owners(set: &Installed) -> BTreeMap<String, String> {
+    let base = set
+        .base
+        .refs
+        .iter()
+        .map(|r| (r.clone(), "base".to_string()));
+    let modules = set
+        .modules
+        .iter()
+        .flat_map(|(name, m)| m.refs.iter().map(|r| (r.clone(), name.clone())));
+    base.chain(modules).collect()
+}
+
+/// The stack trial the unit follows that nothing ends by itself: unhealthy,
+/// with no good release for its judge, or this engine, to roll back to.
+pub fn stuck_trial(r: &Record, on: &str, j: &Judge) -> Option<String> {
+    let trial = j.trial.as_str();
+    if trial.is_empty() || trial != on || !j.good.is_empty() {
+        return None;
+    }
+    match &r.phase {
+        Phase::Idle => {}
+        Phase::Judging { .. } => {
+            let back = r.before.as_ref().map_or("", |b| b.tag.as_str());
+            let ours = r.release.as_ref().is_some_and(|rel| rel.tag() == trial);
+            if !ours || !(back.is_empty() || back == trial) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let unhealthy = j.healthy_since == 0 && j.checks.iter().any(|c| c.state == CheckState::Fail);
+    unhealthy.then(|| trial.to_string())
+}
+
+fn ended(trial: &str) -> String {
+    format!("{trial} stayed unhealthy with no good release to roll back to; a new bundle took over")
+}
+
+fn words(s: Option<&String>) -> BTreeSet<String> {
+    s.map_or(BTreeSet::new(), |s| {
+        s.split_whitespace().map(String::from).collect()
+    })
 }
 
 fn who(by: &str) -> &str {
