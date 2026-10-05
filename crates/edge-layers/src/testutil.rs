@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::layers::{Entry, Layer};
 use crate::snapshots::{OnDisk, Snapshot};
@@ -95,3 +95,73 @@ pub fn fixture_root() -> tempfile::TempDir {
 }
 
 pub const CA: &str = "etc/ssl/certs/ca-certificates.crt";
+
+fn json(p: &Path) -> Option<serde_json::Value> {
+    let b = std::fs::read(p).ok()?;
+    (b.first() == Some(&b'{')).then(|| serde_json::from_slice(&b).ok())?
+}
+
+/// The layer digests (hex) of each image manifest in the content store, by
+/// manifest hex digest.
+pub fn images(root: &Path) -> Vec<(String, Vec<String>)> {
+    let cs = root.join(BLOBS);
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&cs).unwrap().flatten() {
+        let Some(m) = json(&e.path()) else { continue };
+        let Some(layers) = m.get("layers").and_then(|l| l.as_array()) else {
+            continue;
+        };
+        let hex = |d: &serde_json::Value| d["digest"].as_str().unwrap()[7..].to_string();
+        out.push((
+            e.file_name().into_string().unwrap(),
+            layers.iter().map(hex).collect(),
+        ));
+    }
+    out.sort();
+    out
+}
+
+/// Imports the content store's images that `keep` picks, by their layer digests,
+/// into an edge-registry store at `registry`, through edge-registry itself.
+pub fn registry_from(root: &Path, registry: &Path, keep: impl Fn(&[String]) -> bool) -> usize {
+    let cs = root.join(BLOBS);
+    let layout = root.join("layout");
+    std::fs::create_dir_all(layout.join("blobs")).unwrap();
+    std::os::unix::fs::symlink(&cs, layout.join("blobs/sha256")).unwrap();
+    std::fs::write(
+        layout.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+    let picked: Vec<serde_json::Value> = images(root)
+        .into_iter()
+        .filter(|(_, layers)| keep(layers) && layers.iter().all(|l| cs.join(l).is_file()))
+        .enumerate()
+        .map(|(i, (m, _))| {
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:{m}"),
+                "size": std::fs::metadata(cs.join(&m)).unwrap().len(),
+                "annotations": {"io.containerd.image.name": format!("example.test/img{i}:v1")},
+            })
+        })
+        .collect();
+    let n = picked.len();
+    let index = serde_json::json!({"schemaVersion": 2, "manifests": picked});
+    std::fs::write(layout.join("index.json"), index.to_string()).unwrap();
+    edge_registry::Store::open(registry)
+        .unwrap()
+        .import_layout(&layout)
+        .unwrap();
+    std::fs::remove_dir_all(&layout).unwrap();
+    n
+}
+
+/// What `discard_unpacked_layers` leaves of the content store: manifests and configs.
+pub fn discard_layers(root: &Path) {
+    for e in std::fs::read_dir(root.join(BLOBS)).unwrap().flatten() {
+        if json(&e.path()).is_none() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+}

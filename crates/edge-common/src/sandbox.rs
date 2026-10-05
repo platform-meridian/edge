@@ -275,13 +275,13 @@ pub fn signer(health: &str) -> Rules {
 
 /// The parents, not the directories: containerd may not have created its root
 /// yet, and creating it here would race it.
-pub fn layers(root: &Path, state: &Path, image_caches: &Path) -> Rules {
+pub fn layers(root: &Path, state: &Path, image_caches: &Path, registry: &Path) -> Rules {
     Rules {
         bind_tcp: Some(vec![]),
         connect_tcp: Some(vec![]),
         ..Rules::default()
             .with(Access::Write, [dir_of(root), dir_of(state)])
-            .with(Access::Read, [image_caches])
+            .with(Access::Read, [image_caches, registry])
     }
 }
 
@@ -826,16 +826,25 @@ mod tests {
         std::fs::create_dir_all(d.join("lib")).unwrap();
         std::fs::create_dir_all(d.join("imagecache/disk")).unwrap();
         std::fs::write(d.join("imagecache/disk/blob"), b"b").unwrap();
+        let registry = d.join("mnt/edge-registry");
+        std::fs::create_dir_all(registry.join("blobs")).unwrap();
+        std::fs::write(registry.join("blobs/layer"), b"l").unwrap();
         let (root, state) = (d.join("lib/containerd"), d.join("lib/edge-layers"));
         let (_tcp, tcp) = listening();
         let port = free_port();
         sandboxed(
-            || layers(&root, &state, &d.join("imagecache")),
+            || layers(&root, &state, &d.join("imagecache"), &registry),
             || {
                 allowed("containerd creates its root", std::fs::create_dir(&root))?;
                 allowed("repair a file in the root", write_in(&root))?;
                 allowed("read the image cache", read(d.join("imagecache/disk/blob")))?;
                 denied("write the image cache", write_in(d.join("imagecache/disk")))?;
+                allowed(
+                    "read the registry's blobs",
+                    read(registry.join("blobs/layer")),
+                )?;
+                denied("write the registry", write_in(registry.join("blobs")))?;
+                denied("read beside the registry", read(d.join("mnt")))?;
                 denied("read outside", read(&secret))?;
                 denied("bind", bind(port))?;
                 denied("dial", dial(tcp))

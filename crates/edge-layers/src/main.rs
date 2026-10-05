@@ -1,6 +1,7 @@
-//! Rewrites unpacked image files a power cut truncated, from the intact layer blob.
-//! containerd treats "a snapshot exists for this chainID" as "unpacked" and never
-//! re-checks, so a torn snapshot survives re-pulls and GC.
+//! Rewrites unpacked image files a power cut truncated, from the intact layer blob:
+//! edge-registry's copy, else containerd's or the image cache's. containerd treats
+//! "a snapshot exists for this chainID" as "unpacked" and never re-checks, so a torn
+//! snapshot survives re-pulls and GC.
 
 mod blobs;
 mod bolt;
@@ -17,13 +18,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::blobs::Blobs;
+use crate::blobs::{Blobs, Kind};
 use crate::budget::Halt;
 use crate::cache::IndexCache;
 use crate::snapshots::Unverifiable;
 
 const DEFAULT_ROOT: &str = "/var/lib/containerd";
 const DEFAULT_STATE: &str = "/var/lib/edge-layers";
+/// edge-registry's own default root.
+const DEFAULT_REGISTRY: &str = "/var/lib/edge-registry";
 const IMAGE_CACHES: [&str; 2] = [
     "/system/imagecache/disk",
     "/system/imagecache/iso/imagecache",
@@ -114,6 +117,7 @@ fn wait_for_dir(what: &str, p: &Path, until: Instant) -> anyhow::Result<()> {
 struct Paths {
     containerd_root: PathBuf,
     state: PathBuf,
+    registry: PathBuf,
     image_caches: Vec<PathBuf>,
 }
 
@@ -122,12 +126,14 @@ fn run() -> (bool, anyhow::Result<()>) {
     let paths = Paths {
         containerd_root: env_or("EDGE_LAYERS_ROOT", DEFAULT_ROOT),
         state: env_or("EDGE_LAYERS_STATE_DIR", DEFAULT_STATE),
+        registry: env_or("EDGE_LAYERS_REGISTRY", DEFAULT_REGISTRY),
         image_caches: IMAGE_CACHES.iter().map(PathBuf::from).collect(),
     };
     edge_common::sandbox::restrict(&edge_common::sandbox::layers(
         &paths.containerd_root,
         &paths.state,
         Path::new("/system/imagecache"),
+        &paths.registry,
     ));
     let until = Instant::now()
         + deadline_or_default(std::env::var("EDGE_LAYERS_DEADLINE_SECS").ok().as_deref());
@@ -220,8 +226,8 @@ fn index_or_empty(
 }
 
 /// Unreadable metadata is not fatal: matching falls back to path sets.
-fn provenance(snapshotter: &Path, blobs: &Path) -> Option<meta::Provenance> {
-    match meta::read(snapshotter, blobs) {
+fn provenance(snapshotter: &Path, indexes: &[meta::Index]) -> Option<meta::Provenance> {
+    match meta::read(snapshotter, indexes) {
         Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(
@@ -255,17 +261,25 @@ fn blobs_to_index(
 /// Snapshots whose blob is in no source, while no image cache is mounted yet: the
 /// host's own images keep their blobs only there.
 fn awaiting_image_cache(cov: &snapshots::Coverage, blobs: &Blobs) -> bool {
-    blobs.has_image_caches()
-        && blobs.image_caches_present() == 0
-        && cov
-            .unmatched
-            .iter()
-            .any(|u| u.why == Unverifiable::NoLayerBlob)
+    blobs.has(Kind::ImageCache)
+        && blobs.present(Kind::ImageCache) == 0
+        && !no_layer_blob(cov).is_empty()
+}
+
+/// Snapshots of images no source holds, such as one pulled from outside a release
+/// once containerd discarded its layers: unverifiable, never repaired from nowhere.
+fn no_layer_blob(cov: &snapshots::Coverage) -> Vec<&str> {
+    cov.unmatched
+        .iter()
+        .filter(|u| u.why == Unverifiable::NoLayerBlob)
+        .map(|u| u.id.as_str())
+        .collect()
 }
 
 fn one_pass(paths: &Paths, repair_mode: bool, until: Instant) -> anyhow::Result<()> {
     let root = &paths.containerd_root;
     let blobs = Blobs::content_store(root.join("io.containerd.content.v1.content/blobs/sha256"))
+        .with_registry(&paths.registry)
         .with_image_caches(&paths.image_caches);
     let snapshotter = root.join("io.containerd.snapshotter.v1.overlayfs");
     let snaps = snapshotter.join("snapshots");
@@ -302,7 +316,11 @@ fn one_pass(paths: &Paths, repair_mode: bool, until: Instant) -> anyhow::Result<
         return Ok(());
     }
 
-    let prov = provenance(&snapshotter, blobs.content_store_dir());
+    let indexes = [
+        meta::Index::registry(&paths.registry),
+        meta::Index::content_store(blobs.content_store_dir()),
+    ];
+    let prov = provenance(&snapshotter, &indexes);
     let only = blobs_to_index(&snapshot_set, prov.as_ref());
     if only.as_ref().is_some_and(HashSet::is_empty) {
         tracing::info!(
@@ -326,25 +344,37 @@ fn one_pass(paths: &Paths, repair_mode: bool, until: Instant) -> anyhow::Result<
         tracing::info!("content store filled while waiting");
     }
 
-    // With `discard_unpacked_layers` only manifests and configs remain: nothing to verify
-    // against is not a clean pass.
+    // Nothing to verify against is not a clean pass.
     anyhow::ensure!(
         !index.is_empty(),
-        "no layers under {} or an image cache to verify against: set \
-         `discard_unpacked_layers = false` or point EDGE_LAYERS_ROOT at a store that has them",
+        "no layers in the registry at {}, under {} or in an image cache to verify against: \
+         point EDGE_LAYERS_REGISTRY at edge-registry's store, or set `discard_unpacked_layers = false`",
+        paths.registry.display(),
         blobs.content_store_dir().display()
     );
 
     let (mut torn, mut cov) = snapshots::find_torn(&snapshot_set, &index, prov.as_ref());
-    if awaiting_image_cache(&cov, &blobs) && poll(until, || Ok(blobs.image_caches_present() > 0))? {
+    if awaiting_image_cache(&cov, &blobs)
+        && poll(until, || Ok(blobs.present(Kind::ImageCache) > 0))?
+    {
         tracing::info!("image cache appeared while waiting");
         (index, from_cache) = index_or_empty(&blobs, until, only.as_ref(), &cache)?;
         (torn, cov) = snapshots::find_torn(&snapshot_set, &index, prov.as_ref());
     }
+    let held_by = |k| {
+        index
+            .iter()
+            .filter(|l| blobs.find(&l.digest).is_some_and(|(_, at)| at == k))
+            .count()
+    };
     tracing::info!(
         layers = index.len(),
         from_cache,
-        image_caches = blobs.image_caches_present(),
+        in_registry = held_by(Kind::Registry),
+        in_content_store = held_by(Kind::ContentStore),
+        in_image_cache = held_by(Kind::ImageCache),
+        registry = blobs.present(Kind::Registry) > 0,
+        image_caches = blobs.present(Kind::ImageCache),
         "indexed"
     );
 
@@ -366,6 +396,14 @@ fn one_pass(paths: &Paths, repair_mode: bool, until: Instant) -> anyhow::Result<
         tracing::info!(
             unaccounted = cov.layers_indexed - cov.layers_verified,
             "layers with no snapshot to compare against; usually not unpacked yet"
+        );
+    }
+
+    let unheld = no_layer_blob(&cov);
+    if !unheld.is_empty() {
+        tracing::warn!(
+            snapshots = ?unheld,
+            "unverifiable: no layer blob in the registry, the content store or an image cache"
         );
     }
 
@@ -441,7 +479,10 @@ fn one_pass(paths: &Paths, repair_mode: bool, until: Instant) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{BLOBS, CA, IMAGECACHE, SNAPS, SNAPSHOTTER, fixture_root, layer_blob};
+    use crate::testutil::{
+        BLOBS, CA, IMAGECACHE, SNAPS, SNAPSHOTTER, discard_layers, fixture_root, images,
+        layer_blob, registry_from,
+    };
     use std::os::unix::fs::PermissionsExt;
 
     fn root_with(content: &[u8], on_disk: &[u8]) -> (tempfile::TempDir, PathBuf) {
@@ -459,7 +500,16 @@ mod tests {
         Paths {
             containerd_root: d.to_path_buf(),
             state: d.join("edge-layers-state"),
+            registry: d.join(REGISTRY),
             image_caches: vec![d.join(IMAGECACHE)],
+        }
+    }
+
+    /// No image cache: the fixture's holds every layer, a unit's only Talos's own.
+    fn uncached(d: &Path) -> Paths {
+        Paths {
+            image_caches: vec![],
+            ..at(d)
         }
     }
 
@@ -468,6 +518,7 @@ mod tests {
     }
 
     const CA_SNAPSHOTS: [&str; 3] = ["2", "4", "6"];
+    const REGISTRY: &str = "registry";
 
     fn in_snapshot(root: &Path, id: &str, path: &str) -> PathBuf {
         root.join(SNAPS).join(id).join("fs").join(path)
@@ -521,7 +572,8 @@ mod tests {
         truncate_every_ca(d.path());
         let walked_torn = snapshots::walk(&d.path().join(SNAPS)).unwrap();
 
-        let prov = provenance(&snapshotter, &blobs);
+        let cs = [meta::Index::content_store(&blobs)];
+        let prov = provenance(&snapshotter, &cs);
         assert!(prov.is_some());
         let (torn, cov) = snapshots::find_torn(&walked_torn, &index, prov.as_ref());
         assert_eq!(
@@ -542,7 +594,7 @@ mod tests {
         assert_eq!(only.len(), 8);
 
         std::fs::write(snapshotter.join("metadata.db"), b"torn").unwrap();
-        let prov = provenance(&snapshotter, &blobs);
+        let prov = provenance(&snapshotter, &cs);
         assert!(prov.is_none());
         assert_eq!(blobs_to_index(&walked, None), None);
         let (torn, cov) = snapshots::find_torn(&walked_torn, &index, None);
@@ -558,6 +610,121 @@ mod tests {
                 .all(|u| u.why == snapshots::Unverifiable::NoUniquePathSet)
         );
         execute(&at(d.path()), true, far(), Duration::ZERO).unwrap();
+    }
+
+    /// The layer blob each ca snapshot was unpacked from.
+    fn ca_blobs(root: &Path) -> Vec<String> {
+        let p = provenance(
+            &root.join(SNAPSHOTTER),
+            &[meta::Index::content_store(&root.join(BLOBS))],
+        )
+        .unwrap();
+        CA_SNAPSHOTS
+            .iter()
+            .map(|id| match &p[*id] {
+                meta::Origin::Layer { blobs, .. } => blobs[0].clone(),
+                o => panic!("{id}: {o:?}"),
+            })
+            .collect()
+    }
+
+    fn assert_restored(root: &Path, originals: &[Vec<u8>]) {
+        for (id, want) in CA_SNAPSHOTS.iter().zip(originals) {
+            assert!(
+                std::fs::read(in_snapshot(root, id, CA)).unwrap() == *want,
+                "snapshot {id} does not hold its own layer's bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn repairs_from_registry_once_layers_discarded() {
+        let d = fixture_root();
+        assert_eq!(
+            registry_from(d.path(), &d.path().join(REGISTRY), |_| true),
+            3
+        );
+        discard_layers(d.path());
+        let originals = truncate_every_ca(d.path());
+
+        let e = execute(&uncached(d.path()), false, far(), Duration::ZERO).unwrap_err();
+        assert!(format!("{e:#}").contains("3 torn file"), "{e:#}");
+        execute(&uncached(d.path()), true, far(), Duration::ZERO).unwrap();
+        assert_restored(d.path(), &originals);
+        execute(&uncached(d.path()), false, far(), Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn registry_index_alone_names_the_layer() {
+        let d = fixture_root();
+        registry_from(d.path(), &d.path().join(REGISTRY), |_| true);
+        for e in std::fs::read_dir(d.path().join(BLOBS)).unwrap().flatten() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        let originals = truncate_every_ca(d.path());
+
+        execute(&uncached(d.path()), true, far(), Duration::ZERO).unwrap();
+        assert_restored(d.path(), &originals);
+    }
+
+    #[test]
+    fn content_store_covers_images_the_registry_lacks() {
+        let d = fixture_root();
+        let first = ca_blobs(d.path()).remove(0);
+        let released = |layers: &[String]| layers.contains(&first);
+        assert_eq!(
+            registry_from(d.path(), &d.path().join(REGISTRY), released),
+            1
+        );
+        for (_, layers) in images(d.path()).iter().filter(|(_, l)| released(l)) {
+            for l in layers {
+                std::fs::remove_file(d.path().join(BLOBS).join(l)).unwrap();
+            }
+        }
+        let originals = truncate_every_ca(d.path());
+
+        let e = execute(&uncached(d.path()), false, far(), Duration::ZERO).unwrap_err();
+        assert!(format!("{e:#}").contains("3 torn file"), "{e:#}");
+        execute(&uncached(d.path()), true, far(), Duration::ZERO).unwrap();
+        assert_restored(d.path(), &originals);
+    }
+
+    #[test]
+    fn unverifiable_when_no_source_holds_the_layer() {
+        let d = fixture_root();
+        let first = ca_blobs(d.path()).remove(0);
+        let reg = d.path().join(REGISTRY);
+        registry_from(d.path(), &reg, |l| l.contains(&first));
+        discard_layers(d.path());
+        let originals = truncate_every_ca(d.path());
+
+        let e = execute(&uncached(d.path()), false, far(), Duration::ZERO).unwrap_err();
+        assert!(format!("{e:#}").contains("1 torn file"), "{e:#}");
+        execute(&uncached(d.path()), true, far(), Duration::ZERO).unwrap();
+        assert_restored(d.path(), &originals[..1]);
+        for (id, whole) in CA_SNAPSHOTS.iter().zip(&originals).skip(1) {
+            let f = in_snapshot(d.path(), id, CA);
+            assert_eq!(
+                std::fs::metadata(f).unwrap().len(),
+                whole.len() as u64 / 2,
+                "{id}"
+            );
+        }
+
+        let blobs = Blobs::content_store(d.path().join(BLOBS)).with_registry(&reg);
+        let (index, _) = layers::index_store(&blobs, far(), None, None).unwrap();
+        let prov = provenance(
+            &d.path().join(SNAPSHOTTER),
+            &[
+                meta::Index::registry(&reg),
+                meta::Index::content_store(&d.path().join(BLOBS)),
+            ],
+        );
+        let walked = snapshots::walk(&d.path().join(SNAPS)).unwrap();
+        let (_, cov) = snapshots::find_torn(&walked, &index, prov.as_ref());
+        let mut unheld = no_layer_blob(&cov);
+        unheld.sort();
+        assert_eq!(unheld, ["10", "11", "3", "4", "5", "6"]);
     }
 
     #[test]

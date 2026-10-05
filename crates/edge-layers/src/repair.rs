@@ -66,7 +66,7 @@ pub fn repair_all(blobs: &Blobs, torn: &[Torn], until: Instant) -> Repaired {
             tracing::error!(
                 layer = digest,
                 files = items.len(),
-                "the layer blob is gone"
+                "no source holds the layer blob"
             );
             continue;
         };
@@ -91,7 +91,7 @@ pub fn repair_all(blobs: &Blobs, torn: &[Torn], until: Instant) -> Repaired {
                 .filter(|t| t.source == source)
                 .collect();
             seen.insert(source.to_string());
-            repair_group(&group, size, data, from, &mut out);
+            repair_group(&group, size, data, from.as_str(), &mut out);
             Ok(())
         });
 

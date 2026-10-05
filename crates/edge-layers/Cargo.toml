@@ -16,5 +16,6 @@ tar.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+edge-registry = { path = "../edge-registry" }
 proptest = "1"
 tempfile = "3"

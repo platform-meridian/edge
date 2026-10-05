@@ -4,11 +4,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 
+use crate::blobs::{REGISTRY_BLOBS, REGISTRY_MANIFESTS};
 use crate::bolt::{Db, Value};
 
 /// containerd's `snapshots.KindCommitted`.
@@ -18,8 +19,7 @@ const MAX_JSON: u64 = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    /// Content-store blobs (hex digests) holding the layer; empty when no
-    /// manifest in the store names this chainID.
+    /// Layer blobs (hex digests); empty when no index's manifest names this chainID.
     Layer {
         chain_id: String,
         namespace: String,
@@ -31,10 +31,35 @@ pub enum Origin {
 
 pub type Provenance = HashMap<String, Origin>;
 
-pub fn read(snapshotter_root: &Path, blobs: &Path) -> anyhow::Result<Provenance> {
+/// Image manifests and the configs they name, each file named by its hex digest.
+pub struct Index {
+    manifests: PathBuf,
+    configs: PathBuf,
+}
+
+impl Index {
+    pub fn registry(root: &Path) -> Self {
+        Index {
+            manifests: root.join(REGISTRY_MANIFESTS),
+            configs: root.join(REGISTRY_BLOBS),
+        }
+    }
+
+    /// Mixes manifests, configs and layers in one directory.
+    pub fn content_store(dir: &Path) -> Self {
+        Index {
+            manifests: dir.to_path_buf(),
+            configs: dir.to_path_buf(),
+        }
+    }
+}
+
+/// A chainID's blobs are what any index names for it, so a release's image needs
+/// nothing of containerd's content.
+pub fn read(snapshotter_root: &Path, indexes: &[Index]) -> anyhow::Result<Provenance> {
     let db = Db::read(&snapshotter_root.join("metadata.db"))?;
     let chains = chain_ids_by_snapshot(&db)?;
-    let layers = blobs_by_chain_id(blobs);
+    let layers = blobs_by_chain_id(indexes);
     Ok(chains
         .into_iter()
         .map(|(id, chain)| {
@@ -100,9 +125,9 @@ pub fn chain_ids(diff_ids: &[String]) -> Vec<String> {
     out
 }
 
-fn read_json(blobs: &Path, digest: &str) -> Option<serde_json::Value> {
+fn read_json(dir: &Path, digest: &str) -> Option<serde_json::Value> {
     let hex = digest.strip_prefix("sha256:")?;
-    let mut f = std::fs::File::open(blobs.join(hex)).ok()?;
+    let mut f = std::fs::File::open(dir.join(hex)).ok()?;
     let mut buf = vec![0u8];
     f.read_exact(&mut buf).ok()?;
     if buf[0] != b'{' {
@@ -115,43 +140,45 @@ fn read_json(blobs: &Path, digest: &str) -> Option<serde_json::Value> {
 
 /// OCI and Docker schema 2 share the fields read here. A chainID can have
 /// several blobs: one layer compressed two ways.
-fn blobs_by_chain_id(blobs: &Path) -> HashMap<String, Vec<String>> {
+fn blobs_by_chain_id(indexes: &[Index]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
-    let Ok(rd) = std::fs::read_dir(blobs) else {
-        return HashMap::new();
-    };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(manifest) = read_json(blobs, &format!("sha256:{name}")) else {
+    for ix in indexes {
+        let Ok(rd) = std::fs::read_dir(&ix.manifests) else {
             continue;
         };
-        let (Some(layers), Some(cfg)) = (
-            manifest.get("layers").and_then(|l| l.as_array()),
-            manifest.pointer("/config/digest").and_then(|d| d.as_str()),
-        ) else {
-            continue;
-        };
-        let Some(diff_ids) = read_json(blobs, cfg).and_then(|c| {
-            c.pointer("/rootfs/diff_ids")?
-                .as_array()?
-                .iter()
-                .map(|d| d.as_str().map(str::to_string))
-                .collect::<Option<Vec<_>>>()
-        }) else {
-            continue;
-        };
-        if diff_ids.len() != layers.len() {
-            continue;
-        }
-        for (chain, layer) in chain_ids(&diff_ids).into_iter().zip(layers) {
-            let Some(hex) = layer
-                .get("digest")
-                .and_then(|d| d.as_str())
-                .and_then(|d| d.strip_prefix("sha256:"))
-            else {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(manifest) = read_json(&ix.manifests, &format!("sha256:{name}")) else {
                 continue;
             };
-            out.entry(chain).or_default().insert(hex.to_string());
+            let (Some(layers), Some(cfg)) = (
+                manifest.get("layers").and_then(|l| l.as_array()),
+                manifest.pointer("/config/digest").and_then(|d| d.as_str()),
+            ) else {
+                continue;
+            };
+            let Some(diff_ids) = read_json(&ix.configs, cfg).and_then(|c| {
+                c.pointer("/rootfs/diff_ids")?
+                    .as_array()?
+                    .iter()
+                    .map(|d| d.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+            }) else {
+                continue;
+            };
+            if diff_ids.len() != layers.len() {
+                continue;
+            }
+            for (chain, layer) in chain_ids(&diff_ids).into_iter().zip(layers) {
+                let Some(hex) = layer
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .and_then(|d| d.strip_prefix("sha256:"))
+                else {
+                    continue;
+                };
+                out.entry(chain).or_default().insert(hex.to_string());
+            }
         }
     }
     out.into_iter()
@@ -162,7 +189,7 @@ fn blobs_by_chain_id(blobs: &Path) -> HashMap<String, Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{BLOBS, IMAGECACHE, SNAPSHOTTER, fixture_root};
+    use crate::testutil::{BLOBS, IMAGECACHE, SNAPSHOTTER, fixture_root, registry_from};
 
     #[test]
     fn chain_ids_match_containerd() {
@@ -194,7 +221,11 @@ mod tests {
     fn traces_every_snapshot_to_layer() {
         let root = fixture_root();
         let store = root.path().join(BLOBS);
-        let p = read(&root.path().join(SNAPSHOTTER), &store).unwrap();
+        let p = read(
+            &root.path().join(SNAPSHOTTER),
+            &[Index::content_store(&store)],
+        )
+        .unwrap();
         let mut ids: Vec<_> = p.keys().map(|k| k.parse::<u32>().unwrap()).collect();
         ids.sort();
         assert_eq!(ids, (1..=11).collect::<Vec<_>>());
@@ -246,6 +277,35 @@ mod tests {
     }
 
     #[test]
+    fn registry_index_maps_without_containerd_content() {
+        let root = fixture_root();
+        let snapshotter = root.path().join(SNAPSHOTTER);
+        let cs = root.path().join(BLOBS);
+        let want = read(&snapshotter, &[Index::content_store(&cs)]).unwrap();
+        let reg = root.path().join("registry");
+        registry_from(root.path(), &reg, |_| true);
+        for e in std::fs::read_dir(&cs).unwrap().flatten() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+
+        let both = [Index::registry(&reg), Index::content_store(&cs)];
+        let p = read(&snapshotter, &both).unwrap();
+        for id in ["1", "2", "3", "4", "5", "6", "8", "9"] {
+            assert!(
+                matches!(&p[id], Origin::Layer { blobs, .. } if !blobs.is_empty()),
+                "{id}"
+            );
+            assert_eq!(p[id], want[id], "{id}");
+        }
+        assert!(
+            matches!(&p["10"], Origin::Layer { blobs, .. } if blobs.is_empty()),
+            "its manifest was only in the content store"
+        );
+        let p = read(&snapshotter, &[Index::content_store(&cs)]).unwrap();
+        assert!(matches!(&p["2"], Origin::Layer { blobs, .. } if blobs.is_empty()));
+    }
+
+    #[test]
     fn missing_manifest_means_no_blobs() {
         let root = fixture_root();
         let blobs = root.path().join(BLOBS);
@@ -254,7 +314,11 @@ mod tests {
                 std::fs::remove_file(e.path()).unwrap();
             }
         }
-        let p = read(&root.path().join(SNAPSHOTTER), &blobs).unwrap();
+        let p = read(
+            &root.path().join(SNAPSHOTTER),
+            &[Index::content_store(&blobs)],
+        )
+        .unwrap();
         assert!(matches!(&p["2"], Origin::Layer { blobs, .. } if blobs.is_empty()));
     }
 
