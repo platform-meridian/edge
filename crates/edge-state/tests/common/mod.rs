@@ -65,7 +65,11 @@ impl Watcher {
     }
 
     pub async fn open_raw(url: &str, key: &[u8], range_end: &[u8], start_revision: i64) -> Watcher {
-        let mut client = WatchClient::connect(url.to_string()).await.unwrap();
+        // As etcd's client: one response carries every event a stream owes.
+        let mut client = WatchClient::connect(url.to_string())
+            .await
+            .unwrap()
+            .max_decoding_message_size(i32::MAX as usize);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(WatchRequest {
             request_union: Some(watch_request::RequestUnion::CreateRequest(

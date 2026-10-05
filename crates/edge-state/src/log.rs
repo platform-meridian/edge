@@ -82,6 +82,15 @@ pub struct Ticket {
     seq: u64,
 }
 
+/// Room in the unsynced batch, waited for without the store lock.
+pub struct Room(Arc<GroupCommit>);
+
+impl Room {
+    pub fn wait(&self, frame_len: u64) -> Result<(), LogError> {
+        self.0.make_room(frame_len)
+    }
+}
+
 impl Ticket {
     pub fn wait(&self) -> Result<(), LogError> {
         self.group.wait(self.seq)
@@ -122,11 +131,13 @@ impl GroupCommit {
         self.sync_until(|st| st.synced >= seq)
     }
 
+    fn has_room(st: &GroupState, frame_len: u64) -> bool {
+        let unsynced = st.published_end - st.synced_end;
+        unsynced == 0 || unsynced + frame_len <= BATCH_BYTES
+    }
+
     fn make_room(&self, frame_len: u64) -> Result<(), LogError> {
-        self.sync_until(|st| {
-            let unsynced = st.published_end - st.synced_end;
-            unsynced == 0 || unsynced + frame_len <= BATCH_BYTES
-        })
+        self.sync_until(|st| Self::has_room(st, frame_len))
     }
 
     fn sync_until(&self, done: impl Fn(&GroupState) -> bool) -> Result<(), LogError> {
@@ -153,7 +164,13 @@ impl GroupCommit {
             drop(st);
             // A panic here must not leave `syncing` set, or every writer waits forever.
             let synced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let started = std::time::Instant::now();
                 storage.sync()?;
+                let took = started.elapsed();
+                crate::metrics::METRICS.fsync.observe(took);
+                if took >= SLOW_FSYNC {
+                    tracing::warn!(took = ?took, "slow fsync of the log; every write and its watchers waited for it");
+                }
                 // Watchers hear of it before the writers are answered, as with etcd.
                 self.mark_durable(revision);
                 Ok(())
@@ -331,6 +348,8 @@ pub struct Log {
 /// gRPC's largest request (4 MiB) is about one batch and apiserver objects (1.5 MiB at
 /// most) fit two, so batches stay shared.
 pub const BATCH_BYTES: u64 = 4 * 1024 * 1024;
+/// etcd's warning threshold for a WAL fsync.
+const SLOW_FSYNC: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A torn tail is one record plus zero-fill; a longer one is damage, not scanned.
 const MAX_TORN_SCAN: u64 = 64 * 1024 * 1024;
@@ -885,6 +904,15 @@ impl Log {
 
     pub fn ticket(&self) -> Ticket {
         self.group.ticket()
+    }
+
+    /// Whether a frame this long appends without an fsync first.
+    pub fn has_room(&self, frame_len: u64) -> bool {
+        GroupCommit::has_room(&lock_unpoisoned(&self.group.state), frame_len)
+    }
+
+    pub fn room(&self) -> Room {
+        Room(self.group.clone())
     }
 
     pub fn durable_revision(&self) -> u64 {

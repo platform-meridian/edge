@@ -172,8 +172,10 @@ async fn expiry_deletes_lease_keys() {
         1
     );
     tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
-    assert!(
-        kv.range(RangeRequest {
+    // Reads see the revoke once its fsync lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !kv
+        .range(RangeRequest {
             key: b"/ephemeral".to_vec(),
             ..Default::default()
         })
@@ -181,9 +183,14 @@ async fn expiry_deletes_lease_keys() {
         .unwrap()
         .into_inner()
         .kvs
-        .is_empty(),
-        "the expired lease did not take its key"
-    );
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the expired lease did not take its key"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]

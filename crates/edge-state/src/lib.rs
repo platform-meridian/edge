@@ -3,6 +3,7 @@ pub mod etcdflags;
 pub mod etcdtls;
 pub mod history;
 pub mod log;
+pub mod metrics;
 pub mod pb;
 pub mod record;
 pub mod server;

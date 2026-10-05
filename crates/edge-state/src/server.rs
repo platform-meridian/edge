@@ -1,7 +1,9 @@
-//! The store lock covers validation, append and apply, never an fsync; a call answers
+//! The store lock covers validation, append and apply, never an fsync; a write answers
 //! once a shared fsync covers everything it saw. The lock tolerates poison because the
-//! store never applies before it appends. Watches read only the durable history.
+//! store never applies before it appends. Reads and watches see only the durable
+//! history, so neither waits for another client's fsync.
 
+use crate::metrics::{METRICS, SLOW_REQUEST, SLOW_WATCH};
 use crate::pb::etcdserverpb::{
     self as pb, cluster_server::Cluster, cluster_server::ClusterServer, kv_server::Kv,
     kv_server::KvServer, lease_server::LeaseServer, maintenance_server::Maintenance,
@@ -13,8 +15,9 @@ use crate::store::{
     Store, StoreError,
 };
 use crate::txn;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,6 +28,7 @@ use tonic::transport::server::Router;
 use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
 use tower::util::MapResponseLayer;
+use tower::{Layer, Service};
 
 const ROTATION_POLL: Duration = Duration::from_secs(30);
 const HEAVY_WRITES_PER_POLL: u64 = 600;
@@ -48,7 +52,116 @@ mod raft_field {
 }
 
 type GrpcResponse = http::Response<tonic::body::Body>;
-pub type GrpcLayer = Stack<MapResponseLayer<fn(GrpcResponse) -> GrpcResponse>, Identity>;
+pub type GrpcLayer =
+    Stack<MetricsLayer, Stack<MapResponseLayer<fn(GrpcResponse) -> GrpcResponse>, Identity>>;
+
+/// Answers `GET /metrics` beside the gRPC services, as etcd does on its client port.
+#[derive(Clone)]
+pub struct MetricsLayer;
+
+impl<S> Layer<S> for MetricsLayer {
+    type Service = MetricsRoute<S>;
+    fn layer(&self, inner: S) -> MetricsRoute<S> {
+        MetricsRoute(inner)
+    }
+}
+
+#[derive(Clone)]
+pub struct MetricsRoute<S>(S);
+
+impl<S> Service<http::Request<tonic::body::Body>> for MetricsRoute<S>
+where
+    S: Service<http::Request<tonic::body::Body>, Response = GrpcResponse>,
+    S::Future: Send + 'static,
+{
+    type Response = GrpcResponse;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<GrpcResponse, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+        if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
+            let resp = http::Response::builder()
+                .header(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                .body(tonic::body::Body::new(METRICS.render()))
+                .expect("a static response is valid");
+            return Box::pin(async move { Ok(resp) });
+        }
+        Box::pin(self.0.call(req))
+    }
+}
+
+/// When recent revisions became durable, to time how late a watch hears of them.
+#[derive(Default)]
+struct DurableClock(VecDeque<(u64, Instant)>);
+
+const CLOCK_SPAN: usize = 8192;
+
+impl DurableClock {
+    fn record(&mut self, rev: u64) {
+        if self.0.len() == CLOCK_SPAN {
+            self.0.pop_front();
+        }
+        self.0.push_back((rev, Instant::now()));
+    }
+
+    /// The oldest remembered time stands in for a revision older than the span.
+    fn durable_at(&self, rev: u64) -> Option<Instant> {
+        let i = self.0.partition_point(|(r, _)| *r < rev);
+        self.0.get(i).map(|(_, t)| *t)
+    }
+}
+
+/// A request named in the slow-request warning and the latency metrics.
+struct Call {
+    method: &'static str,
+    key: Vec<u8>,
+    /// About what the write appends; room for it is made before the store is locked.
+    bytes: u64,
+}
+
+fn call(method: &'static str, key: &[u8]) -> Option<Call> {
+    Some(Call {
+        method,
+        key: key[..key.len().min(200)].to_vec(),
+        bytes: 0,
+    })
+}
+
+fn write_call(method: &'static str, key: &[u8], request: &impl prost::Message) -> Option<Call> {
+    call(method, key).map(|c| Call {
+        bytes: request.encoded_len() as u64,
+        ..c
+    })
+}
+
+#[derive(Default)]
+struct Phases {
+    lock_wait: Duration,
+    lock_held: Duration,
+    fsync_wait: Duration,
+}
+
+fn observe(call: &Call, took: Duration, p: &Phases) {
+    METRICS.request(call.method, took);
+    if took >= SLOW_REQUEST {
+        tracing::warn!(
+            method = call.method,
+            key = %String::from_utf8_lossy(&call.key),
+            took = ?took,
+            lock_wait = ?p.lock_wait,
+            lock_held = ?p.lock_held,
+            fsync_wait = ?p.fsync_wait,
+            "slow request"
+        );
+    }
+}
 
 /// grpc-go, so etcd, refuses an oversized message with ResourceExhausted, tonic
 /// with OutOfRange.
@@ -109,6 +222,7 @@ fn deadline_after(ttl: i64) -> Instant {
 pub struct EtcdServer {
     store: Arc<Mutex<Store>>,
     durable_ticks: broadcast::Sender<u64>,
+    clock: Arc<Mutex<DurableClock>>,
     /// Lock order: store, then this. Changes that can race a revoke hold the store lock,
     /// so the reaper's re-check is atomic.
     deadlines: Arc<Mutex<HashMap<i64, (Instant, i64)>>>,
@@ -164,7 +278,10 @@ impl EtcdServer {
     pub fn new(store: Store) -> Self {
         let (ticks, _) = broadcast::channel(1024);
         let durable = ticks.clone();
+        let clock = Arc::new(Mutex::new(DurableClock::default()));
+        let durable_clock = clock.clone();
         store.set_on_durable(move |rev| {
+            lock(&durable_clock).record(rev);
             let _ = durable.send(rev);
         });
         let deadlines = store
@@ -179,6 +296,7 @@ impl EtcdServer {
         Self {
             store: Arc::new(Mutex::new(store)),
             durable_ticks: ticks,
+            clock,
             deadlines: Arc::new(Mutex::new(deadlines)),
             cluster_id: 0x1005_7a7e,
             member_id: 0x1005_7a7e_0001,
@@ -201,9 +319,11 @@ impl EtcdServer {
     pub fn router(self, builder: Server) -> Router<GrpcLayer> {
         let limit = self.max_request_bytes.saturating_add(GRPC_OVERHEAD_BYTES);
         builder
+            .accept_http1(true)
             .layer(MapResponseLayer::new(
                 oversize_as_grpc_go as fn(GrpcResponse) -> GrpcResponse,
             ))
+            .layer(MetricsLayer)
             .add_service(KvServer::new(self.clone()).max_decoding_message_size(limit))
             .add_service(WatchServer::new(self.clone()).max_decoding_message_size(limit))
             .add_service(LeaseServer::new(self.clone()).max_decoding_message_size(limit))
@@ -234,9 +354,16 @@ impl EtcdServer {
 
     async fn blocking<R: Send + 'static>(
         &self,
+        call: Option<Call>,
         f: impl FnOnce(&mut Store) -> R + Send + 'static,
     ) -> Result<R, Status> {
-        match durable_on(&self.store, f).await? {
+        let started = Instant::now();
+        let bytes = call.as_ref().map_or(0, |c| c.bytes);
+        let (r, phases) = durable_on(&self.store, bytes, f).await?;
+        if let Some(c) = call {
+            observe(&c, started.elapsed(), &phases);
+        }
+        match r {
             Ok(r) => Ok(r),
             Err(e) => {
                 let e = StoreError::Log(e);
@@ -248,9 +375,10 @@ impl EtcdServer {
 
     async fn store_op<R: Send + 'static>(
         &self,
+        call: Option<Call>,
         f: impl FnOnce(&mut Store) -> Result<R, StoreError> + Send + 'static,
     ) -> Result<R, Status> {
-        match self.blocking(f).await? {
+        match self.blocking(call, f).await? {
             Ok(r) => Ok(r),
             Err(e) => {
                 self.note_error(&e);
@@ -273,7 +401,10 @@ impl EtcdServer {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            let freed = this.blocking(|s| s.reclaim_space()).await.unwrap_or(0);
+            let freed = this
+                .blocking(None, |s| s.reclaim_space())
+                .await
+                .unwrap_or(0);
             if freed > 0 {
                 tracing::warn!(
                     freed,
@@ -295,7 +426,7 @@ impl EtcdServer {
                 loop {
                     interval.tick().await;
                     let Ok(Ok(recovered)) = this
-                        .blocking(|s| {
+                        .blocking(None, |s| {
                             if !s.is_degraded() {
                                 return Ok(None);
                             }
@@ -324,7 +455,7 @@ impl EtcdServer {
     }
 
     async fn current_revision(&self) -> Result<u64, Status> {
-        self.blocking(|s| s.revision()).await
+        self.blocking(None, |s| s.revision()).await
     }
 
     pub fn spawn_lease_reaper(&self) {
@@ -356,7 +487,9 @@ impl EtcdServer {
                 loop {
                     interval.tick().await;
                     let Ok((due, rev, len, live)) = this
-                        .blocking(|s| (s.rotation_due(), s.revision(), s.log_len(), s.live_bytes()))
+                        .blocking(None, |s| {
+                            (s.rotation_due(), s.revision(), s.log_len(), s.live_bytes())
+                        })
                         .await
                     else {
                         continue;
@@ -388,18 +521,21 @@ impl EtcdServer {
     }
 
     pub async fn rotate_in_background(&self) -> Result<crate::store::RotationReport, Status> {
-        let plan = self.store_op(|s| s.begin_rotation()).await?;
+        let plan = self.store_op(None, |s| s.begin_rotation()).await?;
         let written = tokio::task::spawn_blocking(move || plan.write()).await;
         match written {
-            Ok(Ok(rotated)) => self.store_op(move |s| s.finish_rotation(rotated)).await,
+            Ok(Ok(rotated)) => {
+                self.store_op(None, move |s| s.finish_rotation(rotated))
+                    .await
+            }
             Ok(Err(e)) => {
-                let _ = self.blocking(|s| s.abort_rotation(None)).await;
+                let _ = self.blocking(None, |s| s.abort_rotation(None)).await;
                 Err(Status::internal(format!(
                     "edge-state: could not write the new log: {e}"
                 )))
             }
             Err(e) => {
-                let _ = self.blocking(|s| s.abort_rotation(None)).await;
+                let _ = self.blocking(None, |s| s.abort_rotation(None)).await;
                 Err(Status::internal(format!(
                     "edge-state: log rotation task failed: {e}"
                 )))
@@ -418,7 +554,7 @@ impl EtcdServer {
 
     async fn revoke_if_expired(&self, id: i64) -> Result<Result<Option<u64>, StoreError>, Status> {
         let this = self.clone();
-        self.blocking(move |s| {
+        self.blocking(None, move |s| {
             // A keepalive may have renewed it.
             {
                 let d = lock(&this.deadlines);
@@ -487,6 +623,24 @@ impl EtcdServer {
         }
     }
 
+    /// Answered at the durable revision, a read never waits for the fsync of writes it
+    /// cannot see; only a read of a newer revision waits.
+    async fn read(&self, call: Option<Call>, q: RangeQuery) -> Result<RangeOutput, Status> {
+        let started = Instant::now();
+        let probe = q.clone();
+        let (durable, phases) = timed_lock(&self.store, move |s| s.query_durable(&probe)).await?;
+        let Some(out) = durable else {
+            return self.store_op(call, move |s| s.query(&q)).await;
+        };
+        if let Some(c) = &call {
+            observe(c, started.elapsed(), &phases);
+        }
+        out.map_err(|e| {
+            self.note_error(&e);
+            status_of(&e)
+        })
+    }
+
     fn header(&self, revision: u64) -> Option<pb::ResponseHeader> {
         Some(pb::ResponseHeader {
             cluster_id: self.cluster_id,
@@ -497,14 +651,40 @@ impl EtcdServer {
     }
 }
 
+type Durable<R> = (Result<R, crate::log::LogError>, Phases);
+
+/// A batch is fsynced to make room with the store unlocked, so reads never queue behind
+/// that fsync.
 async fn durable_on<R: Send + 'static>(
     store: &Arc<Mutex<Store>>,
+    bytes: u64,
     f: impl FnOnce(&mut Store) -> R + Send + 'static,
-) -> Result<Result<R, crate::log::LogError>, Status> {
+) -> Result<Durable<R>, Status> {
     let store = store.clone();
+    let queued = Instant::now();
     tokio::task::spawn_blocking(move || {
-        let (r, ticket) = lock(&store).deferring(f);
-        ticket.wait().map(|()| r)
+        let mut guard = lock(&store);
+        while let Some(room) = (bytes > 0).then(|| guard.room_for(bytes)).flatten() {
+            drop(guard);
+            // A failed fsync fails the write in the store, which reports it.
+            let failed = room.wait(bytes).is_err();
+            guard = lock(&store);
+            if failed {
+                break;
+            }
+        }
+        let locked = Instant::now();
+        METRICS.lock_wait.observe(locked - queued);
+        let (r, ticket) = guard.deferring(f);
+        drop(guard);
+        let applied = Instant::now();
+        let r = ticket.wait().map(|()| r);
+        let phases = Phases {
+            lock_wait: locked - queued,
+            lock_held: applied - locked,
+            fsync_wait: applied.elapsed(),
+        };
+        (r, phases)
     })
     .await
     .map_err(|e| Status::internal(format!("store task failed: {e}")))
@@ -514,10 +694,31 @@ async fn locked_on<R: Send + 'static>(
     store: &Arc<Mutex<Store>>,
     f: impl FnOnce(&Store) -> R + Send + 'static,
 ) -> Result<R, Status> {
+    let (r, _) = timed_lock(store, f).await?;
+    Ok(r)
+}
+
+async fn timed_lock<R: Send + 'static>(
+    store: &Arc<Mutex<Store>>,
+    f: impl FnOnce(&Store) -> R + Send + 'static,
+) -> Result<(R, Phases), Status> {
     let store = store.clone();
-    tokio::task::spawn_blocking(move || f(&lock(&store)))
-        .await
-        .map_err(|e| Status::internal(format!("store task failed: {e}")))
+    let queued = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        let guard = lock(&store);
+        let locked = Instant::now();
+        METRICS.lock_wait.observe(locked - queued);
+        let r = f(&guard);
+        drop(guard);
+        let phases = Phases {
+            lock_wait: locked - queued,
+            lock_held: locked.elapsed(),
+            fsync_wait: Duration::ZERO,
+        };
+        (r, phases)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("store task failed: {e}")))
 }
 
 /// A compaction is applied before it is durable; wait before telling a watch of it.
@@ -682,8 +883,7 @@ impl Kv for EtcdServer {
                 "etcdserver: RangeStream does not support revision filters",
             ));
         }
-        let q = to_query(&r);
-        let out = self.store_op(move |store| store.query(&q)).await?;
+        let out = self.read(call("RangeStream", &r.key), to_query(&r)).await?;
         let revision = out.revision;
         let mut resp = range_response(out);
         resp.header = self.header(revision);
@@ -695,8 +895,8 @@ impl Kv for EtcdServer {
         &self,
         req: Request<pb::RangeRequest>,
     ) -> Result<Response<pb::RangeResponse>, Status> {
-        let q = to_query(&req.into_inner());
-        let out = self.store_op(move |store| store.query(&q)).await?;
+        let r = req.into_inner();
+        let out = self.read(call("Range", &r.key), to_query(&r)).await?;
         let revision = out.revision;
         let mut resp = range_response(out);
         resp.header = self.header(revision);
@@ -709,7 +909,7 @@ impl Kv for EtcdServer {
         refuse_ignore_flags(&r)?;
         let want_prev = r.prev_kv;
         let (rev, prev) = self
-            .store_op(move |store| {
+            .store_op(write_call("Put", &r.key, &r), move |store| {
                 let (_rev, prev) = store.put(&r.key, &r.value, r.lease)?;
                 Ok((store.revision(), prev))
             })
@@ -728,7 +928,7 @@ impl Kv for EtcdServer {
         self.check_request_size(raft_field::DELETE_RANGE, &r)?;
         let want_prev = r.prev_kv;
         let res = self
-            .store_op(move |store| {
+            .store_op(write_call("DeleteRange", &r.key, &r), move |store| {
                 txn::run(
                     store,
                     &[],
@@ -774,8 +974,21 @@ impl Kv for EtcdServer {
         if !is_read_only(&r) {
             self.check_request_size(raft_field::TXN, &r)?;
         }
+        let key = r
+            .compare
+            .first()
+            .map(|c| c.key.as_slice())
+            .or_else(|| r.success.first().and_then(op_key))
+            .unwrap_or_default();
         let result = self
-            .store_op(move |store| txn::run(store, &compares, &success, &failure))
+            .store_op(
+                if is_read_only(&r) {
+                    call("Txn", key)
+                } else {
+                    write_call("Txn", key, &r)
+                },
+                move |store| txn::run(store, &compares, &success, &failure),
+            )
             .await?;
         let rev = result.revision;
         let responses = result
@@ -799,7 +1012,7 @@ impl Kv for EtcdServer {
         let r = req.into_inner();
         self.check_request_size(raft_field::COMPACTION, &r)?;
         let rev = self
-            .store_op(move |store| {
+            .store_op(call("Compact", b""), move |store| {
                 store.compact(r.revision.max(0) as u64)?;
                 Ok(store.revision())
             })
@@ -807,6 +1020,16 @@ impl Kv for EtcdServer {
         Ok(Response::new(pb::CompactionResponse {
             header: self.header(rev),
         }))
+    }
+}
+
+fn op_key(op: &pb::RequestOp) -> Option<&[u8]> {
+    use pb::request_op::Request as R;
+    match op.request.as_ref()? {
+        R::RequestPut(p) => Some(&p.key),
+        R::RequestDeleteRange(d) => Some(&d.key),
+        R::RequestRange(g) => Some(&g.key),
+        R::RequestTxn(_) => None,
     }
 }
 
@@ -909,7 +1132,7 @@ impl Maintenance for EtcdServer {
         _req: Request<pb::StatusRequest>,
     ) -> Result<Response<pb::StatusResponse>, Status> {
         let (rev, len, live) = self
-            .blocking(|s| (s.revision(), s.log_len(), s.live_bytes()))
+            .blocking(None, |s| (s.revision(), s.log_len(), s.live_bytes()))
             .await?;
         let errors = lock(&self.alarms)
             .iter()
@@ -1018,7 +1241,7 @@ impl Maintenance for EtcdServer {
         _req: Request<pb::HashRequest>,
     ) -> Result<Response<pb::HashResponse>, Status> {
         let (rev, hash) = self
-            .store_op(|s| Ok((s.revision(), s.state_hash(0)?)))
+            .store_op(None, |s| Ok((s.revision(), s.state_hash(0)?)))
             .await?;
         Ok(Response::new(pb::HashResponse {
             header: self.header(rev),
@@ -1032,7 +1255,9 @@ impl Maintenance for EtcdServer {
     ) -> Result<Response<pb::HashKvResponse>, Status> {
         let at = req.into_inner().revision.max(0) as u64;
         let (rev, floor, hash) = self
-            .store_op(move |s| Ok((s.revision(), s.compact_revision(), s.state_hash(at)?)))
+            .store_op(None, move |s| {
+                Ok((s.revision(), s.compact_revision(), s.state_hash(at)?))
+            })
             .await?;
         Ok(Response::new(pb::HashKvResponse {
             header: self.header(rev),
@@ -1050,7 +1275,7 @@ impl Maintenance for EtcdServer {
         _req: Request<pb::SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
         let (file, len, rev) = self
-            .blocking(|s| s.snapshot_source())
+            .blocking(None, |s| s.snapshot_source())
             .await?
             .map_err(|e| Status::internal(format!("cannot open the log for a snapshot: {e}")))?;
         let header = self.header(rev);
@@ -1158,20 +1383,15 @@ fn collect_owed(store: &Store, watches: &[WatchView]) -> (u64, Vec<(i64, Owed)>)
         }
         out.push((
             *id,
-            match store.events_between(*cursor, rev) {
+            match store.events_matching(*cursor, rev, |k| in_range(k, key, range_end)) {
                 Err(floor) => Owed::Compacted(floor),
-                Ok(events) => {
-                    let evs: Vec<_> = events
+                Ok(events) if events.is_empty() => Owed::Nothing,
+                Ok(events) => Owed::Events(
+                    events
                         .iter()
-                        .filter(|e| in_range(&e.kv.key, key, range_end))
                         .map(|e| event_to_pb(store, e, *prev_kv))
-                        .collect();
-                    if evs.is_empty() {
-                        Owed::Nothing
-                    } else {
-                        Owed::Events(evs)
-                    }
-                }
+                        .collect(),
+                ),
             },
         ));
     }
@@ -1219,16 +1439,12 @@ fn start_watch(
         return (cur, cur, Ok(Vec::new()));
     }
     let after = (start_revision as u64).saturating_sub(1);
-    match s.events_between(after, cur) {
+    match s.events_matching(after, cur, |k| in_range(k, key, range_end)) {
         Err(floor) => (cur, after, Err(floor)),
         Ok(events) => (
             cur,
             cur.max(after),
-            Ok(events
-                .iter()
-                .filter(|e| in_range(&e.kv.key, key, range_end))
-                .map(|e| event_to_pb(s, e, prev_kv))
-                .collect()),
+            Ok(events.iter().map(|e| event_to_pb(s, e, prev_kv)).collect()),
         ),
     }
 }
@@ -1237,13 +1453,81 @@ use crate::pb::etcdserverpb::watch_server::Watch as WatchSvc;
 
 type WatchTx = tokio::sync::mpsc::Sender<Result<pb::WatchResponse, Status>>;
 
+/// A client this long without reading is named in the log, and again at each interval.
+const STUCK_STREAM: Duration = Duration::from_secs(5);
+const STUCK_STREAM_REPEAT: Duration = Duration::from_secs(60);
+
+/// One watch stream's sending side.
+struct Outbox {
+    tx: WatchTx,
+    peer: String,
+    clock: Arc<Mutex<DurableClock>>,
+    ids: (u64, u64),
+    /// Time spent waiting for the client to take responses.
+    blocked: Duration,
+}
+
+impl Outbox {
+    /// `None` once the client has gone. A client that stops reading stalls only its
+    /// own stream, and is named while it does.
+    async fn send(&mut self, resp: pb::WatchResponse) -> Option<()> {
+        let started = Instant::now();
+        let mut warn_at = started + STUCK_STREAM;
+        let permit = loop {
+            match tokio::time::timeout_at(warn_at.into(), self.tx.reserve()).await {
+                Ok(permit) => break permit.ok()?,
+                Err(_) => {
+                    tracing::warn!(
+                        peer = %self.peer,
+                        blocked = ?started.elapsed(),
+                        "watch stream: the client is not reading; its events are waiting"
+                    );
+                    warn_at += STUCK_STREAM_REPEAT;
+                }
+            }
+        };
+        permit.send(Ok(resp));
+        let blocked = started.elapsed();
+        self.blocked += blocked;
+        METRICS
+            .watch_send_blocked_us
+            .fetch_add(blocked.as_micros() as u64, Ordering::Relaxed);
+        Some(())
+    }
+
+    /// How long after the first event's revision became durable the events were sent.
+    fn delivered(&self, w: Option<&Watch>, first_rev: u64, events: usize, blocked: Duration) {
+        let Some(durable_at) = lock(&self.clock).durable_at(first_rev) else {
+            return;
+        };
+        let lag = durable_at.elapsed();
+        METRICS.watch_lag.observe(lag);
+        if lag >= SLOW_WATCH {
+            METRICS
+                .slow_watch_deliveries
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                peer = %self.peer,
+                watch = w.map_or(-1, |w| w.id),
+                key = %w.map(|w| String::from_utf8_lossy(&w.key).into_owned()).unwrap_or_default(),
+                range_end = %w.map(|w| String::from_utf8_lossy(&w.range_end).into_owned()).unwrap_or_default(),
+                revision = first_rev,
+                events,
+                lag = ?lag,
+                waiting_for_client = ?blocked,
+                "slow watch: events reached the stream long after they were durable"
+            );
+        }
+    }
+}
+
 /// The revision the cursors advanced to, or `None` if the client has gone.
 async fn deliver_owed(
     store: &Arc<Mutex<Store>>,
     watches: &mut Vec<Watch>,
-    tx: &WatchTx,
-    ids: (u64, u64),
+    out: &mut Outbox,
 ) -> Option<u64> {
+    let ids = out.ids;
     let snapshot: Vec<_> = watches
         .iter()
         .map(|w| {
@@ -1274,9 +1558,7 @@ async fn deliver_owed(
             Owed::Nothing => {}
             Owed::Events(events) => pending.extend(events.into_iter().map(|e| (id, e))),
             Owed::Compacted(floor) => {
-                tx.send(Ok(compacted_cancel(ids, rev, id, floor)))
-                    .await
-                    .ok()?;
+                out.send(compacted_cancel(ids, rev, id, floor)).await?;
                 watches.retain(|w| w.id != id);
                 continue;
             }
@@ -1285,9 +1567,21 @@ async fn deliver_owed(
             w.cursor = w.cursor.max(rev);
         }
     }
+    let mod_rev = |e: &mvccpb::Event| e.kv.as_ref().map_or(0, |kv| kv.mod_revision as u64);
+    let mut first: Vec<(i64, u64, usize)> = Vec::new();
+    for (id, e) in &pending {
+        match first.iter_mut().find(|(w, _, _)| w == id) {
+            Some((_, at, n)) => {
+                *at = (*at).min(mod_rev(e));
+                *n += 1;
+            }
+            None => first.push((*id, mod_rev(e), 1)),
+        }
+    }
     // Commit order across watches, as etcd sends it; consecutive events for one watch
     // share a response.
-    pending.sort_by_key(|(id, e)| (e.kv.as_ref().map_or(0, |kv| kv.mod_revision), *id));
+    pending.sort_by_key(|(id, e)| (mod_rev(e), *id));
+    let blocked_before = out.blocked;
     let mut run: Option<(i64, Vec<mvccpb::Event>)> = None;
     for (id, event) in pending {
         match run.as_mut() {
@@ -1296,7 +1590,7 @@ async fn deliver_owed(
                 if let Some((rid, evs)) = run.take() {
                     let mut resp = watch_response(ids.0, ids.1, rev, rid);
                     resp.events = evs;
-                    tx.send(Ok(resp)).await.ok()?;
+                    out.send(resp).await?;
                 }
                 run = Some((id, vec![event]));
             }
@@ -1305,9 +1599,40 @@ async fn deliver_owed(
     if let Some((rid, evs)) = run {
         let mut resp = watch_response(ids.0, ids.1, rev, rid);
         resp.events = evs;
-        tx.send(Ok(resp)).await.ok()?;
+        out.send(resp).await?;
+    }
+    let blocked = out.blocked - blocked_before;
+    for (id, at, n) in first {
+        out.delivered(watches.iter().find(|w| w.id == id), at, n, blocked);
     }
     Some(rev)
+}
+
+/// Keeps the open-stream and open-watch gauges true however the stream ends.
+struct Gauges {
+    watchers: i64,
+}
+
+impl Gauges {
+    fn open() -> Self {
+        METRICS.watch_streams.fetch_add(1, Ordering::Relaxed);
+        Gauges { watchers: 0 }
+    }
+
+    fn set(&mut self, watchers: usize) {
+        let n = watchers as i64;
+        METRICS
+            .watchers
+            .fetch_add(n - self.watchers, Ordering::Relaxed);
+        self.watchers = n;
+    }
+}
+
+impl Drop for Gauges {
+    fn drop(&mut self) {
+        METRICS.watch_streams.fetch_sub(1, Ordering::Relaxed);
+        METRICS.watchers.fetch_sub(self.watchers, Ordering::Relaxed);
+    }
 }
 
 #[tonic::async_trait]
@@ -1318,20 +1643,32 @@ impl WatchSvc for EtcdServer {
         &self,
         req: Request<tonic::Streaming<pb::WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let peer = req
+            .remote_addr()
+            .map_or_else(|| "unknown".into(), |a| a.to_string());
         let mut requests = req.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let store = self.store.clone();
         let mut ticks = self.durable_ticks.subscribe();
         let ids = (self.cluster_id, self.member_id);
         let progress_interval = self.progress_interval;
+        let mut out = Outbox {
+            tx,
+            peer,
+            clock: self.clock.clone(),
+            ids,
+            blocked: Duration::ZERO,
+        };
 
         tokio::spawn(async move {
+            let mut gauges = Gauges::open();
             let mut watches: Vec<Watch> = Vec::new();
             let mut next_id: i64 = 1;
             let header_only = |rev: u64, id: i64| watch_response(ids.0, ids.1, rev, id);
             let mut progress = tokio::time::interval(progress_interval);
             progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                gauges.set(watches.len());
                 tokio::select! {
                     msg = requests.message() => {
                         let Ok(Some(req)) = msg else { break };
@@ -1342,7 +1679,7 @@ impl WatchSvc for EtcdServer {
                                 refused.created = true;
                                 refused.canceled = true;
                                 refused.cancel_reason = COMPACTED.into();
-                                if tx.send(Ok(refused)).await.is_err() { break; }
+                                if out.send(refused).await.is_none() { break; }
                             }
                             Some(pb::watch_request::RequestUnion::CreateRequest(c)) => {
                                 let start_revision = c.start_revision;
@@ -1364,19 +1701,19 @@ impl WatchSvc for EtcdServer {
                                 if watches.iter().any(|w| w.id == id) {
                                     created.canceled = true;
                                     created.cancel_reason = "etcdserver: watcher with this ID already exists".into();
-                                    if tx.send(Ok(created)).await.is_err() { break; }
+                                    if out.send(created).await.is_none() { break; }
                                     continue;
                                 }
-                                if tx.send(Ok(created)).await.is_err() { break; }
+                                if out.send(created).await.is_none() { break; }
                                 match catch_up {
                                     Err(floor) => {
-                                        if tx.send(Ok(compacted_cancel(ids, current, id, floor))).await.is_err() { break; }
+                                        if out.send(compacted_cancel(ids, current, id, floor)).await.is_none() { break; }
                                     }
                                     Ok(evs) => {
                                         if !evs.is_empty() {
                                             let mut resp = header_only(current, id);
                                             resp.events = evs;
-                                            if tx.send(Ok(resp)).await.is_err() { break; }
+                                            if out.send(resp).await.is_none() { break; }
                                         }
                                         watches.push(Watch { id, key: c.key, range_end: c.range_end, cursor, progress_notify: c.progress_notify, prev_kv, start_revision: start_revision as u64 });
                                     }
@@ -1387,22 +1724,26 @@ impl WatchSvc for EtcdServer {
                                 let rev = locked_on(&store, |s| s.durable_revision()).await.unwrap_or(0);
                                 let mut resp = header_only(rev, c.watch_id);
                                 resp.canceled = true;
-                                if tx.send(Ok(resp)).await.is_err() { break; }
+                                if out.send(resp).await.is_none() { break; }
                             }
                             Some(pb::watch_request::RequestUnion::ProgressRequest(_)) => {
                                 // It claims everything up to `rev`, so deliver what is owed first.
-                                let Some(rev) = deliver_owed(&store, &mut watches, &tx, ids).await else { break };
+                                let Some(rev) = deliver_owed(&store, &mut watches, &mut out).await else { break };
                                 if watches.iter().any(|w| rev < w.start_revision) { continue; }
-                                if tx.send(Ok(header_only(rev, -1))).await.is_err() { break; }
+                                if out.send(header_only(rev, -1)).await.is_none() { break; }
                             }
                             _ => {}
                         }
                     }
                     _ = progress.tick() => {
-                        let Some(rev) = deliver_owed(&store, &mut watches, &tx, ids).await else { break };
-                        for w in watches.iter().filter(|w| w.progress_notify) {
-                            if w.cursor < rev || rev < w.start_revision { continue; }
-                            if tx.send(Ok(header_only(rev, w.id))).await.is_err() { return; }
+                        let Some(rev) = deliver_owed(&store, &mut watches, &mut out).await else { break };
+                        let due: Vec<i64> = watches
+                            .iter()
+                            .filter(|w| w.progress_notify && w.cursor >= rev && rev >= w.start_revision)
+                            .map(|w| w.id)
+                            .collect();
+                        for id in due {
+                            if out.send(header_only(rev, id)).await.is_none() { return; }
                         }
                     }
                     // `collect_owed` reads the durable revision itself, so lagging is fine.
@@ -1411,7 +1752,7 @@ impl WatchSvc for EtcdServer {
                             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
-                        if deliver_owed(&store, &mut watches, &tx, ids).await.is_none() { break; }
+                        if deliver_owed(&store, &mut watches, &mut out).await.is_none() { break; }
                     }
                 }
             }
@@ -1444,7 +1785,7 @@ impl LeaseSvc for EtcdServer {
         self.check_request_size(raft_field::LEASE_GRANT, &sized)?;
         let this = self.clone();
         let (id, rev) = self
-            .store_op(move |store| {
+            .store_op(call("LeaseGrant", b""), move |store| {
                 let id = store.grant_lease(r.id, r.ttl)?;
                 this.set_deadline(id, r.ttl);
                 Ok((id, store.revision()))
@@ -1466,7 +1807,7 @@ impl LeaseSvc for EtcdServer {
         self.check_request_size(raft_field::LEASE_REVOKE, &r)?;
         let this = self.clone();
         let rev = self
-            .store_op(move |store| {
+            .store_op(call("LeaseRevoke", b""), move |store| {
                 let rev = store.revoke_lease(r.id)?;
                 this.clear_deadline(r.id);
                 Ok(rev)
@@ -1484,7 +1825,7 @@ impl LeaseSvc for EtcdServer {
         let r = req.into_inner();
         let this = self.clone();
         let (rev, ttl, keys, remaining) = self
-            .blocking(move |store| {
+            .blocking(call("LeaseTimeToLive", b""), move |store| {
                 let keys = if r.keys {
                     store.lease_keys(r.id)
                 } else {
@@ -1511,7 +1852,9 @@ impl LeaseSvc for EtcdServer {
         &self,
         _req: Request<pb::LeaseLeasesRequest>,
     ) -> Result<Response<pb::LeaseLeasesResponse>, Status> {
-        let (rev, ids) = self.blocking(|s| (s.revision(), s.lease_ids())).await?;
+        let (rev, ids) = self
+            .blocking(None, |s| (s.revision(), s.lease_ids()))
+            .await?;
         Ok(Response::new(pb::LeaseLeasesResponse {
             header: self.header(rev),
             leases: ids.into_iter().map(|id| pb::LeaseStatus { id }).collect(),
@@ -1533,7 +1876,7 @@ impl LeaseSvc for EtcdServer {
                 let id = req.id;
                 let worker = this.clone();
                 let Ok((rev, ttl)) = this
-                    .blocking(move |store| {
+                    .blocking(call("LeaseKeepAlive", b""), move |store| {
                         let ttl = store.lease_ttl(id).unwrap_or(0);
                         if ttl > 0 {
                             worker.set_deadline(id, ttl);
@@ -1675,7 +2018,7 @@ mod tests {
         store.lock().unwrap().put(b"/k", b"4", 0).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         assert_eq!(
-            deliver_owed(&store, &mut watches, &tx, (1, 1)).await,
+            deliver_owed(&store, &mut watches, &mut outbox(tx)).await,
             Some(5)
         );
         let cancelled = rx.recv().await.unwrap().unwrap();
@@ -1686,6 +2029,113 @@ mod tests {
             watches.iter().map(|w| (w.id, w.cursor)).collect::<Vec<_>>(),
             [(2, 5)]
         );
+    }
+
+    #[test]
+    fn fanout_copies_only_matching_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("state.log")).unwrap();
+        let big = vec![b'x'; 1 << 20];
+        let (r, ticket) = store.deferring(|s| {
+            for _ in 0..48 {
+                s.put(b"/hot", &big, 0)?;
+            }
+            s.put(b"/idle/7", b"v", 0)
+        });
+        r.unwrap();
+        ticket.wait().unwrap();
+        let views: Vec<WatchView> = (0..256)
+            .map(|i| (i, format!("/idle/{i}").into_bytes(), Vec::new(), 1, true))
+            .collect();
+        let started = Instant::now();
+        let (rev, owed) = collect_owed(&store, &views);
+        let took = started.elapsed();
+        assert_eq!(rev, 50);
+        for (id, o) in &owed {
+            match o {
+                Owed::Events(e) if *id == 7 => assert_eq!(e.len(), 1),
+                Owed::Nothing if *id != 7 => {}
+                _ => panic!("watch {id} was owed the wrong events"),
+            }
+        }
+        assert!(
+            took < Duration::from_millis(500),
+            "256 idle watches took {took:?} to skip 48 MiB of other keys' writes"
+        );
+    }
+
+    #[test]
+    fn clock_dates_revisions() {
+        let mut c = DurableClock::default();
+        assert!(c.durable_at(1).is_none());
+        c.record(5);
+        let t5 = c.0[0].1;
+        c.record(9);
+        let t9 = c.0[1].1;
+        assert_eq!(
+            c.durable_at(3),
+            Some(t5),
+            "older than the span: its oldest time"
+        );
+        assert_eq!(c.durable_at(5), Some(t5));
+        assert_eq!(c.durable_at(6), Some(t9), "durable with the next fsync");
+        assert_eq!(c.durable_at(10), None);
+        for r in 10..10 + CLOCK_SPAN as u64 {
+            c.record(r);
+        }
+        assert_eq!(c.0.len(), CLOCK_SPAN);
+        assert_eq!(c.0[0].0, 10);
+    }
+
+    #[tokio::test]
+    async fn blocked_sends_are_timed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut out = outbox(tx);
+        out.send(watch_response(1, 1, 1, 1)).await.unwrap();
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            rx.recv().await.unwrap().unwrap();
+            rx
+        });
+        out.send(watch_response(1, 1, 2, 1)).await.unwrap();
+        assert!(
+            out.blocked >= Duration::from_millis(150),
+            "{:?}",
+            out.blocked
+        );
+        let mut rx = drain.await.unwrap();
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap().header.unwrap().revision,
+            2
+        );
+        drop(rx);
+        assert!(out.send(watch_response(1, 1, 3, 1)).await.is_none());
+    }
+
+    #[test]
+    fn late_delivery_is_counted() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let out = outbox(tx);
+        lock(&out.clock).record(4);
+        let before = METRICS.slow_watch_deliveries.load(Ordering::Relaxed);
+        out.delivered(None, 4, 1, Duration::ZERO);
+        assert_eq!(
+            METRICS.slow_watch_deliveries.load(Ordering::Relaxed),
+            before
+        );
+        lock(&out.clock).0[0].1 -= SLOW_WATCH;
+        out.delivered(None, 4, 1, Duration::ZERO);
+        assert!(METRICS.slow_watch_deliveries.load(Ordering::Relaxed) > before);
+    }
+
+    fn outbox(tx: WatchTx) -> Outbox {
+        Outbox {
+            tx,
+            peer: "test".into(),
+            clock: Arc::default(),
+            ids: (1, 1),
+            blocked: Duration::ZERO,
+        }
     }
 
     fn server_with_leased_key() -> (tempfile::TempDir, EtcdServer, i64) {

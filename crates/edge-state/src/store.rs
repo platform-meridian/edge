@@ -678,6 +678,13 @@ impl Store {
         self.log.ticket()
     }
 
+    /// `None` when a write of about `bytes` appends without waiting for an fsync, else
+    /// the room to wait for with the store unlocked.
+    pub fn room_for(&self, bytes: u64) -> Option<log::Room> {
+        let frame = bytes + record::HEADER_LEN as u64 + 64;
+        (!self.log.has_room(frame)).then(|| self.log.room())
+    }
+
     pub fn durable_revision(&self) -> u64 {
         self.log.durable_revision().min(self.revision)
     }
@@ -919,6 +926,17 @@ impl Store {
     }
 
     pub fn events_between(&self, after: u64, upto: u64) -> Result<Vec<Event>, u64> {
+        self.events_matching(after, upto, |_| true)
+    }
+
+    /// Only the matching events' values are copied: a watch on one prefix must not pay
+    /// for every other key's writes.
+    pub fn events_matching(
+        &self,
+        after: u64,
+        upto: u64,
+        wanted: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<Event>, u64> {
         if after < self.compact_revision {
             return Err(self.compact_revision);
         }
@@ -927,6 +945,7 @@ impl Store {
             .changes
             .range((after.saturating_add(1), 0, Vec::new())..)
             .take_while(|(rev, _, _)| *rev <= upto)
+            .filter(|(_, _, key)| wanted(key))
         {
             let Some(versions) = self.index.get(key) else {
                 continue;
@@ -1014,8 +1033,25 @@ pub struct RangeOutput {
 
 impl Store {
     pub fn query(&self, q: &RangeQuery) -> Result<RangeOutput, StoreError> {
+        self.query_at(q, self.revision)
+    }
+
+    /// The query as of the durable revision, which needs no fsync before it is answered;
+    /// `None` when it asks for a newer revision or compaction has passed that one.
+    pub fn query_durable(&self, q: &RangeQuery) -> Option<Result<RangeOutput, StoreError>> {
+        let head = self.durable_revision();
+        if q.revision > head || head < self.compact_revision {
+            return None;
+        }
+        Some(self.query_at(q, head))
+    }
+
+    fn query_at(&self, q: &RangeQuery, head: u64) -> Result<RangeOutput, StoreError> {
+        if q.revision > head {
+            return Err(StoreError::FutureRevision { current: head });
+        }
         self.check_revision(q.revision)?;
-        let at = self.resolve(q.revision);
+        let at = if q.revision == 0 { head } else { q.revision };
 
         let keep = |v: &Version| {
             !((q.min_mod_revision > 0 && (v.mod_revision as i64) < q.min_mod_revision)
@@ -1095,7 +1131,7 @@ impl Store {
             kvs,
             count,
             more,
-            revision: self.revision,
+            revision: head,
         })
     }
 
@@ -1412,6 +1448,75 @@ mod tests {
 
     fn keys(kvs: Vec<KeyValue>) -> Vec<Vec<u8>> {
         kvs.into_iter().map(|kv| kv.key).collect()
+    }
+
+    fn at(s: &Store, key: &[u8], revision: u64) -> Option<Option<(Vec<u8>, u64)>> {
+        let q = RangeQuery {
+            key: key.to_vec(),
+            revision,
+            ..Default::default()
+        };
+        s.query_durable(&q).map(|r| {
+            r.unwrap()
+                .kvs
+                .first()
+                .map(|kv| (kv.value.clone(), kv.mod_revision))
+        })
+    }
+
+    #[test]
+    fn durable_reads_hide_unsynced_writes() {
+        let (_d, mut s) = store();
+        s.put(b"/k", b"old", 0).unwrap();
+        let (r, ticket) = s.deferring(|s| s.put(b"/k", b"new", 0));
+        let (rev, _) = r.unwrap();
+        assert_eq!(s.durable_revision(), rev - 1);
+        assert_eq!(at(&s, b"/k", 0), Some(Some((b"old".to_vec(), rev - 1))));
+        let q = RangeQuery {
+            key: b"/k".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(s.query_durable(&q).unwrap().unwrap().revision, rev - 1);
+        assert_eq!(at(&s, b"/k", rev), None, "a newer revision must wait");
+        ticket.wait().unwrap();
+        assert_eq!(at(&s, b"/k", 0), Some(Some((b"new".to_vec(), rev))));
+        assert_eq!(at(&s, b"/k", rev), Some(Some((b"new".to_vec(), rev))));
+    }
+
+    #[test]
+    fn durable_reads_wait_below_the_floor() {
+        let (_d, mut s) = store();
+        for v in [&b"1"[..], b"2", b"3"] {
+            s.put(b"/k", v, 0).unwrap();
+        }
+        let (r, ticket) = s.deferring(|s| {
+            s.put(b"/k", b"4", 0)?;
+            s.compact(5)
+        });
+        r.unwrap();
+        assert_eq!((s.durable_revision(), s.compact_revision()), (4, 5));
+        assert_eq!(at(&s, b"/k", 0), None);
+        ticket.wait().unwrap();
+        assert_eq!(at(&s, b"/k", 0), Some(Some((b"4".to_vec(), 5))));
+    }
+
+    #[test]
+    fn matching_events_skip_other_keys() {
+        let (_d, mut s) = store();
+        for k in [&b"/a/1"[..], b"/b/1", b"/a/2", b"/b/2"] {
+            s.put(k, b"v", 0).unwrap();
+        }
+        let keys = |evs: Vec<Event>| evs.into_iter().map(|e| e.kv.key).collect::<Vec<_>>();
+        assert_eq!(
+            keys(s.events_matching(1, 5, |k| k.starts_with(b"/a/")).unwrap()),
+            [b"/a/1".to_vec(), b"/a/2".to_vec()]
+        );
+        assert_eq!(
+            keys(s.events_matching(3, 4, |k| k.starts_with(b"/a/")).unwrap()),
+            [b"/a/2".to_vec()]
+        );
+        s.compact(3).unwrap();
+        assert_eq!(s.events_matching(1, 5, |_| true).unwrap_err(), 3);
     }
 
     #[test]
