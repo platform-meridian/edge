@@ -71,7 +71,10 @@ async fn serve(cfg: config::Config) -> anyhow::Result<()> {
             namespace: std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "edge".into()),
             bound_port: listen_port(&cfg.listen),
         },
-        cfg.routes.clone(),
+        controller::Settings {
+            statics: cfg.routes.clone(),
+            strip: cfg.strip_request_headers.clone(),
+        },
         acceptor.clone(),
     );
 

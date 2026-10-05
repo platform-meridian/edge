@@ -30,6 +30,7 @@ pub(super) struct Ctx<'a> {
     pub services: Option<&'a BTreeSet<Key>>,
     pub grants: &'a [ReferenceGrant],
     pub backend_tls: &'a BTreeMap<Key, UpstreamTls>,
+    pub strip: &'a [String],
     /// No HTTPRoute may claim the config file's hostnames.
     pub static_hosts: &'a HashSet<String>,
 }
@@ -120,7 +121,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
     let mut routes = Vec::new();
     let mut services = BTreeSet::new();
     for (i, rule) in spec.rules.iter().enumerate() {
-        let (filters, host_rewrite) = match rule_filters(i, rule, ctx.gateway.bound_port) {
+        let (filters, host_rewrite) = match rule_filters(i, rule, ctx) {
             Ok(f) => f,
             Err(p) => {
                 unsupported.push(p);
@@ -343,11 +344,8 @@ fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<(Backend
 
 /// Each kind at most once, and never a redirect with a rewrite: the API's own
 /// rules, checked again since nothing else here would notice.
-fn rule_filters(
-    i: usize,
-    rule: &Rule,
-    listener_port: u16,
-) -> Result<(Filters, Option<String>), Problem> {
+fn rule_filters(i: usize, rule: &Rule, ctx: &Ctx) -> Result<(Filters, Option<String>), Problem> {
+    let listener_port = ctx.gateway.bound_port;
     let bad = |what: String| problem("UnsupportedValue", format!("rule {i}: {what}"));
     let mut filters = Filters::default();
     let mut host_rewrite = None;
@@ -362,7 +360,7 @@ fn rule_filters(
         match f.r#type.as_str() {
             "RequestHeaderModifier" => {
                 let h = f.request_header_modifier.as_ref().ok_or_else(missing)?;
-                filters.request_headers = header_modifier(h).map_err(bad)?;
+                filters.request_headers = header_modifier(h, ctx.strip).map_err(bad)?;
             }
             "RequestRedirect" => {
                 let r = f.request_redirect.as_ref().ok_or_else(missing)?;
@@ -387,14 +385,22 @@ fn rule_filters(
     Ok((filters, host_rewrite))
 }
 
-fn header_modifier(h: &HeaderFilter) -> Result<HeaderModifier, String> {
+/// Never what sanitising settled: framing, hop-by-hop, routing and forwarding
+/// headers (the upstream Host is URLRewrite's), nor an identity header backends
+/// trust from authz or the gateway alone.
+fn header_modifier(h: &HeaderFilter, strip: &[String]) -> Result<HeaderModifier, String> {
     let name = |n: &str| {
         let parsed = http::HeaderName::try_from(n).map_err(|_| format!("header name {n:?}"))?;
-        // The upstream Host is the route's; URLRewrite's hostname sets it.
-        if parsed == http::header::HOST {
-            return Err("a header filter on Host".to_string());
+        let lower = parsed.as_str();
+        if crate::authz::is_forbidden_for_authz(lower) {
+            return Err(format!(
+                "a header filter on {lower}, which the gateway sets"
+            ));
         }
-        Ok(parsed.as_str().to_string())
+        if lower == crate::xfcc::HEADER || crate::config::strip_listed(strip, lower) {
+            return Err(format!("a header filter on {lower}, an identity header"));
+        }
+        Ok(lower.to_string())
     };
     let pairs = |list: &[super::schema::NameValue]| {
         list.iter()

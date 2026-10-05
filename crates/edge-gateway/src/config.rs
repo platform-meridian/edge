@@ -174,6 +174,17 @@ pub const DEFAULT_STRIP_HEADERS: &[&str] = &[
     "x-forwarded-client-cert",
 ];
 
+/// Whether `lower` (a lowercase header name) is in a strip list.
+pub fn strip_listed(patterns: &[String], lower: &str) -> bool {
+    patterns.iter().any(|p| {
+        let p = p.to_ascii_lowercase();
+        match p.strip_suffix('*') {
+            Some(prefix) => lower.starts_with(prefix),
+            None => p == lower,
+        }
+    })
+}
+
 fn default_strip() -> Vec<String> {
     DEFAULT_STRIP_HEADERS
         .iter()

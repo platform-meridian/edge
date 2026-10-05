@@ -245,7 +245,7 @@ fn check_request(input: &CheckInput<'_>) -> CheckRequest {
 
 /// Routing, framing, forwarding and hop-by-hop headers: letting authz set these
 /// after sanitising would reopen the ambiguity sanitising closed.
-fn is_forbidden_for_authz(lower: &str) -> bool {
+pub(crate) fn is_forbidden_for_authz(lower: &str) -> bool {
     lower.starts_with(':')
         || matches!(
             lower,

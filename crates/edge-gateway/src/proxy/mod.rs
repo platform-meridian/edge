@@ -380,8 +380,9 @@ fn rewrite_for_upstream(
         return false;
     };
     parts.uri = uri;
-    authz::apply_request_edits(&mut parts.headers, remove, ops);
+    // The route's edits first: authz's, which decided the request, win.
     modify_headers(&mut parts.headers, &route.filters.request_headers);
+    authz::apply_request_edits(&mut parts.headers, remove, ops);
     // The upstream Host is the route's, never the client's: otherwise it would
     // differ between h1 (Host forwarded) and h2 (Host synthesised).
     let upstream_host = route

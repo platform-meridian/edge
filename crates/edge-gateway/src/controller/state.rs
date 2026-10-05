@@ -1,11 +1,11 @@
 //! The cluster's objects as a plain value, with no I/O.
 
-use super::GatewayRef;
 use super::convert::{Ctx, Outcome, convert};
 use super::frontend::{Derived, derive};
 use super::policy;
 use super::schema::{Listener, ReferenceGrant};
 use super::trust::{Sources, thin_configmap};
+use super::{GatewayRef, Settings};
 use crate::config::Route;
 use kube::ResourceExt;
 use kube::api::DynamicObject;
@@ -158,7 +158,8 @@ impl State {
 
     /// Without Services the existence check is skipped (the route would only
     /// 502); without ReferenceGrants every cross-namespace backend is refused.
-    pub fn build(&self, gateway: &GatewayRef, statics: &[Route]) -> Built {
+    pub fn build(&self, gateway: &GatewayRef, settings: &Settings) -> Built {
+        let statics = &settings.statics;
         let our_gateway = self
             .gateways
             .live
@@ -183,6 +184,7 @@ impl State {
             services: services.as_ref(),
             grants: &grants,
             backend_tls: &policies.by_service,
+            strip: &settings.strip,
             static_hosts: &static_hosts,
         };
 
@@ -418,7 +420,14 @@ mod tests {
         }
 
         fn feed(&mut self, msg: Msg) {
-            if let Some(b) = step(&mut self.state, msg, &gw(), &self.statics, &self.routes) {
+            let settings = Settings {
+                statics: self.statics.clone(),
+                strip: crate::config::DEFAULT_STRIP_HEADERS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
+            if let Some(b) = step(&mut self.state, msg, &gw(), &settings, &self.routes) {
                 self.last = Some(b);
             }
         }
@@ -1732,5 +1741,58 @@ mod tests {
 
         c.delete(Kind::Policy, btls("jel", "jel", "jel-ca"));
         assert_eq!(tls_of(&c, "a.test"), None);
+    }
+
+    #[test]
+    fn header_filters_cannot_touch_what_the_gateway_settles() {
+        for (list, name, why) in [
+            (
+                "set",
+                "Content-Length",
+                "content-length, which the gateway sets",
+            ),
+            (
+                "add",
+                "Transfer-Encoding",
+                "transfer-encoding, which the gateway sets",
+            ),
+            ("set", "Connection", "connection, which the gateway sets"),
+            (
+                "set",
+                "X-Forwarded-For",
+                "x-forwarded-for, which the gateway sets",
+            ),
+            ("set", "x-user", "x-user, an identity header"),
+            (
+                "add",
+                "X-Auth-Request-User",
+                "x-auth-request-user, an identity header",
+            ),
+            (
+                "set",
+                "X-Forwarded-Client-Cert",
+                "x-forwarded-client-cert, an identity header",
+            ),
+        ] {
+            let spec = json!({ "rules": [{ "filters": [{ "type": "RequestHeaderModifier",
+                "requestHeaderModifier": { list: [{ "name": name, "value": "v" }] } }],
+                "backendRefs": [{ "name": "svc", "port": 80 }] }] });
+            let (t, c) = Cluster::basic().one(spec, json!({}));
+            assert!(t.is_empty(), "{name}: served");
+            let a = &c.outcome("t").accepted;
+            assert_eq!((a.ok, a.reason), (false, "UnsupportedValue"), "{name}");
+            assert!(
+                a.message.contains(&format!("a header filter on {why}")),
+                "{name}: {}",
+                a.message
+            );
+        }
+        let spec = json!({ "rules": [{ "filters": [{ "type": "RequestHeaderModifier",
+            "requestHeaderModifier": { "remove": ["Keep-Alive"] } }],
+            "backendRefs": [{ "name": "svc", "port": 80 }] }] });
+        assert!(
+            Cluster::basic().one(spec, json!({})).0.is_empty(),
+            "remove too"
+        );
     }
 }

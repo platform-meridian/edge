@@ -463,4 +463,27 @@ mod tests {
             assert_eq!(super::without_port(h), want, "{h}");
         }
     }
+
+    /// Authz decided the request, so its header edits outrank the route's.
+    #[tokio::test]
+    async fn authz_edits_outrank_route_filters() {
+        use crate::authz::HeaderOp;
+        let authz = fake_authz().await;
+        authz.set(AuthzMode::AllowWith {
+            ops: vec![HeaderOp::Set("x-tenant".into(), "from-authz".into())],
+            remove: vec![],
+            response: vec![],
+        });
+        let b = recorder("b").await;
+        let mut r = with(
+            "/",
+            headers(&[("x-tenant", "from-route"), ("x-other", "o")], &[], &[]),
+            &b,
+        );
+        r.authz = Authz::Required;
+        let gw = gateway(authz_cfg(authz.addr), vec![r]).await;
+        request(gw.addr, "/", "example.org", "").await;
+        assert_eq!(b.last().headers_named("x-tenant"), ["from-authz"]);
+        assert_eq!(b.last().header("x-other"), Some("o"));
+    }
 }

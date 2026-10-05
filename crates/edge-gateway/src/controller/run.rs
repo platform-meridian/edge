@@ -2,8 +2,7 @@ use super::frontend::Derived;
 use super::report::{publish_policy_status, publish_route_status, run_gateway_status};
 use super::state::{Built, Kind, Msg, State};
 use super::trust::BUNDLE_GROUP;
-use super::{GATEWAY_GROUP, GatewayRef, Routes, api_resource};
-use crate::config::Route;
+use super::{GATEWAY_GROUP, GatewayRef, Routes, Settings, api_resource};
 use edge_common::Outage;
 use futures::{Stream, StreamExt};
 use kube::api::{Api, DynamicObject};
@@ -19,7 +18,7 @@ const SUPERVISE_MAX: Duration = Duration::from_secs(60);
 pub fn spawn(
     routes: Routes,
     gateway: GatewayRef,
-    static_routes: Vec<Route>,
+    settings: Settings,
     tls: Option<crate::tls::Acceptor>,
 ) {
     let g = gateway.clone();
@@ -37,7 +36,7 @@ pub fn spawn(
             run(
                 routes.clone(),
                 gateway.clone(),
-                static_routes.clone(),
+                settings.clone(),
                 tls.clone(),
             )
         },
@@ -70,17 +69,17 @@ pub(super) fn step(
     state: &mut State,
     msg: Msg,
     gateway: &GatewayRef,
-    statics: &[Route],
+    settings: &Settings,
     routes: &Routes,
 ) -> Option<Built> {
     if !state.apply(msg) || !state.ready() {
         return None;
     }
-    let built = state.build(gateway, statics);
+    let built = state.build(gateway, settings);
     if **routes.load() != built.table {
         tracing::info!(
             total = built.table.len(),
-            static_routes = statics.len(),
+            static_routes = settings.statics.len(),
             "route table updated"
         );
         routes.store(Arc::new(built.table.clone()));
@@ -88,12 +87,10 @@ pub(super) fn step(
     Some(built)
 }
 
-/// `static_routes` survive every republish: they reach loopback-bound backends,
-/// which no Service can name (Endpoints reject 127.0.0.1).
 async fn run(
     routes: Routes,
     gateway: GatewayRef,
-    static_routes: Vec<Route>,
+    settings: Settings,
     tls: Option<crate::tls::Acceptor>,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
@@ -119,7 +116,7 @@ async fn run(
     let mut state = State::default();
     let mut frontend = None;
     while let Some(msg) = msgs.next().await {
-        let Some(built) = step(&mut state, msg, &gateway, &static_routes, &routes) else {
+        let Some(built) = step(&mut state, msg, &gateway, &settings, &routes) else {
             continue;
         };
         if let Some(tls) = &tls
