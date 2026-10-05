@@ -247,6 +247,10 @@ struct Active {
     spec: Option<Frontend>,
     /// `None` with a spec: no usable CA.
     verifying: Option<Arc<rustls::ServerConfig>>,
+    verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    /// Moves when the mode or CAs do; a handshake under another one is
+    /// verified again before its identity is used.
+    generation: u64,
 }
 
 impl Active {
@@ -269,22 +273,21 @@ impl Active {
         }
     }
 
-    fn requests(&self, host: &str) -> bool {
-        match &self.spec {
-            Some(s) if self.verifying.is_some() => {
-                s.mode == Mode::AllowValidOnly || s.names.contains(host)
-            }
-            _ => false,
-        }
+    fn requests(&self, plain: &Arc<rustls::ServerConfig>, host: &str) -> bool {
+        matches!(self.choose(plain, Some(host)), Some((_, true)))
     }
 }
 
 /// What the handshake established.
 #[derive(Debug, Clone, Default)]
 pub struct Handshake {
+    pub sni: Option<String>,
     pub requested: bool,
-    /// The verified client certificate as `X-Forwarded-Client-Cert`.
+    /// The verified client certificate as `X-Forwarded-Client-Cert`; read it
+    /// through `Acceptor::verified`, which checks it is still trusted.
     pub client_cert: Option<Arc<str>>,
+    chain: Arc<[CertificateDer<'static>]>,
+    generation: u64,
 }
 
 /// Picks the server config per handshake from the client's SNI, so only the
@@ -328,24 +331,57 @@ impl Acceptor {
     /// False when `spec` names no usable CA, which the result then refuses or
     /// stops asking for.
     pub fn set_frontend(&self, spec: Option<Frontend>) -> bool {
-        let verifying = spec.as_ref().and_then(|s| {
-            let roots = Arc::new(roots(&s.ca_pem).ok()?);
-            let b = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider());
-            let b = match s.mode {
-                Mode::AllowValidOnly => b,
-                Mode::AllowInsecureFallback => b.allow_unauthenticated(),
-            };
-            let v = b.build().ok()?;
-            Some(server_config(self.resolver.clone(), Some(v)))
-        });
+        let old = self.active.load();
+        let trust = |s: &Option<Frontend>| s.as_ref().map(|f| (f.mode, f.ca_pem.clone()));
+        let (verifier, verifying, generation) = if trust(&old.spec) == trust(&spec) {
+            (old.verifier.clone(), old.verifying.clone(), old.generation)
+        } else {
+            let verifier = spec.as_ref().and_then(|s| {
+                let roots = Arc::new(roots(&s.ca_pem).ok()?);
+                let b =
+                    rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider());
+                let b = match s.mode {
+                    Mode::AllowValidOnly => b,
+                    Mode::AllowInsecureFallback => b.allow_unauthenticated(),
+                };
+                b.build().ok()
+            });
+            let verifying = verifier
+                .clone()
+                .map(|v| server_config(self.resolver.clone(), Some(v)));
+            (verifier, verifying, old.generation + 1)
+        };
         let usable = spec.is_none() || verifying.is_some();
-        self.active.store(Arc::new(Active { spec, verifying }));
+        self.active.store(Arc::new(Active {
+            spec,
+            verifying,
+            verifier,
+            generation,
+        }));
         usable
     }
 
     /// Whether a connection whose SNI is `host` would be asked for a certificate.
     pub fn requests_certificate(&self, host: &str) -> bool {
-        self.active.load().requests(host)
+        self.active.load().requests(&self.plain, host)
+    }
+
+    /// The connection's verified certificate, if the CAs it was verified
+    /// against, or the current ones, still trust it.
+    pub fn verified(&self, h: &Handshake) -> Option<Arc<str>> {
+        let cert = h.client_cert.clone()?;
+        let active = self.active.load();
+        active.spec.as_ref()?;
+        if active.generation == h.generation {
+            return Some(cert);
+        }
+        let (leaf, intermediates) = h.chain.split_first()?;
+        active
+            .verifier
+            .as_ref()?
+            .verify_client_cert(leaf, intermediates, rustls_pki_types::UnixTime::now())
+            .ok()
+            .map(|_| cert)
     }
 
     pub async fn accept(
@@ -362,22 +398,31 @@ impl Acceptor {
             .client_hello()
             .server_name()
             .and_then(crate::config::normalize_host);
-        let Some((cfg, requested)) = self.active.load().choose(&self.plain, sni.as_deref()) else {
+        let active = self.active.load();
+        let Some((cfg, requested)) = active.choose(&self.plain, sni.as_deref()) else {
             return Err(std::io::Error::other("no usable client CA"));
         };
+        let generation = active.generation;
+        drop(active);
         let tls = start.into_stream(cfg).await?;
-        let client_cert = tls
+        let chain: Arc<[CertificateDer<'static>]> = tls
             .get_ref()
             .1
             .peer_certificates()
-            .and_then(|c| c.first())
+            .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
+            .unwrap_or_default();
+        let client_cert = chain
+            .first()
             .and_then(|c| crate::xfcc::value(c.as_ref()))
             .map(Arc::from);
         Ok((
             tls,
             Handshake {
+                sni,
                 requested,
                 client_cert,
+                chain,
+                generation,
             },
         ))
     }
@@ -853,6 +898,84 @@ mod tests {
         f.tls.set_frontend(None);
         let got = tls_get_as(f.gw.addr, "ui.test", "elf.test", None, "").await;
         assert_eq!(got.unwrap().0, 200, "nothing would ask: no 421 loop");
+    }
+
+    /// A client sending no SNI was never asked, and no connection would be:
+    /// it is served without an identity, not sent round a 421 loop.
+    #[tokio::test]
+    async fn no_sni_gets_the_fallback() {
+        let f = front().await;
+        let ca = ClientCa::new("operators");
+        f.tls
+            .set_frontend(validation(Mode::AllowInsecureFallback, &ca));
+        let forged = "X-Forwarded-Client-Cert: Hash=00\r\n";
+        let got = tls_get_as(f.gw.addr, "127.0.0.1", "elf.test", None, forged).await;
+        assert_eq!(got.unwrap(), (200, false));
+        assert!(f.marked.last().header("x-forwarded-client-cert").is_none());
+    }
+
+    async fn keep_alive(
+        f: &Front,
+        client: ClientCert,
+    ) -> hyper::client::conn::http1::SendRequest<crate::proxy::Body> {
+        let (s, asked) = tls_connect_as(f.gw.addr, "elf.test", Some(client))
+            .await
+            .unwrap();
+        assert!(asked);
+        let (sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        sender
+    }
+
+    async fn send(sender: &mut hyper::client::conn::http1::SendRequest<crate::proxy::Body>) -> u16 {
+        let req = hyper::Request::builder()
+            .uri("/")
+            .header("host", "elf.test")
+            .body(crate::proxy::Body::default())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        let code = resp.status().as_u16();
+        http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap();
+        code
+    }
+
+    /// The identity of an open connection follows the CAs now trusted: a
+    /// removed CA or validation stops it on the next request.
+    #[tokio::test]
+    async fn identity_rechecked_per_request() {
+        let f = front().await;
+        let (ca, other) = (ClientCa::new("operators"), ClientCa::new("others"));
+        let xfcc = || f.marked.last().header("x-forwarded-client-cert").is_some();
+        f.tls
+            .set_frontend(validation(Mode::AllowInsecureFallback, &ca));
+        let mut c = keep_alive(&f, ca.issue("op")).await;
+        assert_eq!(send(&mut c).await, 200);
+        assert!(xfcc());
+
+        let both = Frontend {
+            mode: Mode::AllowInsecureFallback,
+            ca_pem: format!("{}{}", ca.pem, other.pem),
+            names: ["elf.test".to_string(), "more.test".to_string()].into(),
+        };
+        f.tls.set_frontend(Some(both));
+        assert_eq!(send(&mut c).await, 200);
+        assert!(xfcc(), "its CA is still trusted");
+
+        f.tls
+            .set_frontend(validation(Mode::AllowInsecureFallback, &other));
+        assert_eq!(send(&mut c).await, 200);
+        assert!(!xfcc(), "its CA was removed");
+
+        let mut c = keep_alive(&f, other.issue("op")).await;
+        assert_eq!(send(&mut c).await, 200);
+        assert!(xfcc());
+        f.tls.set_frontend(None);
+        assert_eq!(send(&mut c).await, 200);
+        assert!(!xfcc(), "validation was removed");
     }
 
     #[test]

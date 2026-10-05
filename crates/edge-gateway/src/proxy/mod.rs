@@ -93,7 +93,9 @@ impl Gateway {
         let Some(frontend) = &self.frontend else {
             return false;
         };
+        // Without SNI no fresh connection would be asked either: served without.
         route.client_cert
+            && conn.handshake.sni.is_some()
             && !conn.handshake.requested
             && host
                 .and_then(crate::config::normalize_host)
@@ -180,6 +182,7 @@ impl Gateway {
             &allowed.remove,
             host,
             conn,
+            self.frontend.as_ref(),
         ) {
             return Ok(status(StatusCode::INTERNAL_SERVER_ERROR, "bad backend uri"));
         }
@@ -358,6 +361,7 @@ fn rewrite_for_upstream(
     remove: &[String],
     client_host: Option<String>,
     conn: &ConnInfo,
+    frontend: Option<&crate::tls::Acceptor>,
 ) -> bool {
     let rewritten;
     let target = match &route.filters.rewrite_path {
@@ -397,11 +401,9 @@ fn rewrite_for_upstream(
     // Whatever the strip list says: only the route that asked gets one.
     parts.headers.remove(crate::xfcc::HEADER);
     if route.client_cert
-        && let Some(v) = conn
-            .handshake
-            .client_cert
-            .as_deref()
-            .and_then(|v| HeaderValue::try_from(v).ok())
+        && let Some(v) = frontend
+            .and_then(|f| f.verified(&conn.handshake))
+            .and_then(|v| HeaderValue::try_from(&*v).ok())
     {
         parts.headers.insert(crate::xfcc::HEADER, v);
     }

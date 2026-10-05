@@ -113,11 +113,19 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
         _ => Authz::Required,
     };
     let rewrite_host = annotation(REWRITE_HOST_ANNOTATION);
-    let client_cert = annotation(CLIENT_CERT_ANNOTATION).as_deref() == Some("request");
+    let mut client_cert = annotation(CLIENT_CERT_ANNOTATION).as_deref() == Some("request");
 
     let mut unsupported = Vec::new();
     let mut unresolved = Vec::new();
     let hostnames = hostnames(&spec.hostnames, ctx, &mut unsupported);
+    // Asked for by SNI, so only a named host can be.
+    if client_cert && !hostnames.iter().any(Option::is_some) {
+        unsupported.push(problem(
+            "UnsupportedValue",
+            format!("{CLIENT_CERT_ANNOTATION} needs a hostname; no certificate is asked for"),
+        ));
+        client_cert = false;
+    }
     let mut routes = Vec::new();
     let mut services = BTreeSet::new();
     for (i, rule) in spec.rules.iter().enumerate() {

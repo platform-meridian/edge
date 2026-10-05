@@ -1841,4 +1841,17 @@ mod tests {
             "remove too"
         );
     }
+
+    #[test]
+    fn hostless_route_cannot_ask_for_a_certificate() {
+        let (t, c) = Cluster::basic().one(
+            svc_spec(),
+            json!({ "edge.meridian/client-certificate": "request" }),
+        );
+        assert_eq!(t.len(), 1, "still served");
+        assert!(!t[0].client_cert);
+        let a = &c.outcome("t").accepted;
+        assert_eq!((a.ok, a.reason), (false, "UnsupportedValue"));
+        assert!(a.message.contains("needs a hostname"), "{}", a.message);
+    }
 }
