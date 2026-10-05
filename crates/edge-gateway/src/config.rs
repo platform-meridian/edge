@@ -1,3 +1,4 @@
+pub use crate::path::{normalize_host, segment_prefix};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -27,11 +28,35 @@ pub struct Backend {
     pub tls: Option<UpstreamTls>,
 }
 
-/// An empty `ca_pem` refuses every request: the policy could not be honoured.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// How a BackendTLSPolicy's Service is dialled. Compared by what it says; the
+/// dialer is built from it once per table, and without one every request is
+/// refused: the policy could not be honoured.
+#[derive(Clone, Default)]
 pub struct UpstreamTls {
     pub hostname: String,
     pub ca_pem: String,
+    /// What the gateway presents as the client, by fingerprint.
+    pub identity: String,
+    pub dialer: Option<std::sync::Arc<crate::proxy::Dialer>>,
+}
+
+impl PartialEq for UpstreamTls {
+    fn eq(&self, o: &Self) -> bool {
+        (&self.hostname, &self.ca_pem, &self.identity) == (&o.hostname, &o.ca_pem, &o.identity)
+            && self.dialer.is_some() == o.dialer.is_some()
+    }
+}
+
+impl Eq for UpstreamTls {}
+
+impl std::fmt::Debug for UpstreamTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamTls")
+            .field("hostname", &self.hostname)
+            .field("identity", &self.identity)
+            .field("usable", &self.dialer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -386,32 +411,6 @@ fn fragment_files(dir: &Path) -> (Vec<PathBuf>, Vec<anyhow::Error>) {
     (files, vec![])
 }
 
-pub fn normalize_host(h: &str) -> Option<String> {
-    let h = h.trim();
-    let (host, port) = match h.rsplit_once(':') {
-        Some((host, port)) if !port.contains(']') => (host, port),
-        _ => (h, ""),
-    };
-    if !port.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        return ip
-            .parse::<std::net::Ipv6Addr>()
-            .ok()
-            .map(|ip| format!("[{ip}]"));
-    }
-    let name = host.strip_suffix('.').unwrap_or(host);
-    let label = |l: &str| {
-        !l.is_empty()
-            && l.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    };
-    name.split('.')
-        .all(label)
-        .then(|| name.to_ascii_lowercase())
-}
-
 impl Route {
     pub fn precedence(a: &Route, b: &Route) -> std::cmp::Ordering {
         b.hostname
@@ -429,19 +428,6 @@ impl Route {
             }
         }
         segment_prefix(path, &self.prefix)
-    }
-}
-
-/// Gateway API PathPrefix: `/abc` matches `/abc/d`, never `/abcd`.
-pub fn segment_prefix(path: &str, prefix: &str) -> bool {
-    let p = prefix.trim_end_matches('/');
-    if p.is_empty() {
-        return true;
-    }
-    match path.strip_prefix(p) {
-        Some("") => true,
-        Some(rest) => rest.starts_with('/'),
-        None => false,
     }
 }
 

@@ -239,7 +239,11 @@ impl State {
             statics.iter().filter_map(|r| r.hostname.clone()).collect();
         let sources = self.sources();
         let policies: Vec<&DynamicObject> = self.policies.live.values().collect();
-        let policies = policy::evaluate(&policies, &sources);
+        let mut policies = policy::evaluate(&policies, &sources);
+        for t in policies.by_service.values_mut() {
+            t.identity = "pod".into();
+            t.dialer = settings.dialers.build(t);
+        }
         let ctx = Ctx {
             gateway,
             listeners: listeners.as_deref(),
@@ -493,6 +497,10 @@ mod tests {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                dialers: crate::proxy::Dialers {
+                    identity: None,
+                    connect_timeout: std::time::Duration::from_secs(1),
+                },
             };
             if let Some(b) = step(&mut self.state, msg, &gw(), &settings, &self.routes) {
                 self.last = Some(b);
@@ -1884,6 +1892,8 @@ mod tests {
         let jel = tls_of(&c, "a.test").expect("dialled over TLS");
         assert_eq!(jel.hostname, "jel.apps.svc");
         assert_eq!(jel.ca_pem.trim(), pem.trim());
+        assert!(jel.dialer.is_some(), "built with the table");
+        assert!(tls_of(&c, "c.test").unwrap().dialer.is_none(), "refused");
         assert_eq!(tls_of(&c, "b.test"), None, "no policy, plaintext as before");
         assert_eq!(
             tls_of(&c, "c.test").unwrap().ca_pem,

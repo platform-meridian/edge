@@ -22,7 +22,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use std::time::Duration;
 use tunnel::tunnel;
-use upstream::Upstreams;
+pub use upstream::{Dialer, Dialers};
 
 pub use headers::ConnInfo;
 
@@ -37,7 +37,6 @@ pub struct Gateway {
     authorizer: Option<Authorizer>,
     strip: Arc<StripSet>,
     frontend: Option<crate::tls::Acceptor>,
-    upstreams: Upstreams,
 }
 
 trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -66,9 +65,7 @@ impl Gateway {
         )));
         let authorizer = Authorizer::from_config(&cfg)?;
         let strip = Arc::new(StripSet::new(&cfg.strip_request_headers));
-        let connect = Duration::from_millis(cfg.limits.upstream_connect_timeout_ms);
         Ok(Self {
-            upstreams: Upstreams::new(None, connect),
             cfg,
             routes,
             client: Client::builder(TokioExecutor::new()).build(connector),
@@ -78,10 +75,7 @@ impl Gateway {
         })
     }
 
-    /// The pod certificate it serves is also the client's to TLS backends.
     pub fn with_tls(mut self, acceptor: crate::tls::Acceptor) -> Self {
-        let connect = Duration::from_millis(self.cfg.limits.upstream_connect_timeout_ms);
-        self.upstreams = Upstreams::new(Some(acceptor.identity()), connect);
         self.frontend = Some(acceptor);
         self
     }
@@ -243,8 +237,8 @@ impl Gateway {
         let limit = Duration::from_millis(self.cfg.limits.upstream_response_timeout_ms);
         let sent = match &backend.tls {
             None => self.client.request(req),
-            Some(t) => match self.upstreams.client(t) {
-                Some(c) => c.request(req),
+            Some(t) => match &t.dialer {
+                Some(d) => d.pool.request(req),
                 None => return status(StatusCode::BAD_GATEWAY, "upstream TLS unusable"),
             },
         };
@@ -291,8 +285,12 @@ impl Gateway {
                     let _ = s.set_nodelay(true);
                     Box::new(s) as Box<dyn Io>
                 }),
-            Some(t) => match self.upstreams.connector(t) {
-                Some(c) => c.dial(&addr).await.map(|s| Box::new(s) as Box<dyn Io>),
+            Some(t) => match &t.dialer {
+                Some(d) => d
+                    .connector
+                    .dial(&addr)
+                    .await
+                    .map(|s| Box::new(s) as Box<dyn Io>),
                 None => return status(StatusCode::BAD_GATEWAY, "upstream TLS unusable"),
             },
         };

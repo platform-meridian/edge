@@ -1,9 +1,6 @@
 #![no_main]
 
-// edge-gateway is a binary: compile the two modules in directly.
-#[allow(dead_code)]
-#[path = "../../src/config.rs"]
-mod config;
+// edge-gateway is a binary: compile the module in directly.
 #[path = "../../src/path.rs"]
 mod path;
 
@@ -13,8 +10,8 @@ fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
-    if let Some(h) = config::normalize_host(text) {
-        assert_eq!(config::normalize_host(&h).as_ref(), Some(&h), "{text:?}");
+    if let Some(h) = path::normalize_host(text) {
+        assert_eq!(path::normalize_host(&h).as_ref(), Some(&h), "{text:?}");
     }
     let (prefix, raw) = text.split_once('\n').unwrap_or(("/", text));
     let Ok(c) = path::canonicalize(raw) else {
@@ -40,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
     let want = aggressive_backend_segments(&p);
     let backend_view = landed.len() >= want.len() && landed.iter().zip(&want).all(|(a, b)| a == b);
     assert_eq!(
-        config::segment_prefix(&c, &p),
+        path::segment_prefix(&c, &p),
         backend_view,
         "{raw:?} under {p:?}"
     );

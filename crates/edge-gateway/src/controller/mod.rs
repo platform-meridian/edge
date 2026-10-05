@@ -23,13 +23,15 @@ const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
 pub type Routes = Arc<ArcSwap<Vec<Route>>>;
 
 /// What the config file gives the controller.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Settings {
     /// Survive every republish: they reach loopback-bound backends, which no
     /// Service can name (Endpoints reject 127.0.0.1).
     pub statics: Vec<Route>,
     /// Identity headers no route filter may set.
     pub strip: Vec<String>,
+    /// Dial the Services BackendTLSPolicies name.
+    pub dialers: crate::proxy::Dialers,
 }
 
 #[derive(Clone)]

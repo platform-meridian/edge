@@ -1,18 +1,16 @@
 //! TLS to a backend a BackendTLSPolicy names: its CA and hostname verify the
-//! server, and the gateway's own pod certificate is the client's.
+//! server, and the gateway's identity is the client's.
 
 use super::Body;
 use crate::config::UpstreamTls;
-use crate::tls::Reloading;
 use hyper::Uri;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_pki_types::ServerName;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -20,47 +18,35 @@ use tokio_rustls::client::TlsStream;
 
 pub type TlsClient = Client<Connector, Body>;
 
-/// One pooled client per policy, so a changed CA or name never reuses a
+/// A policy's dialer: its own pool, so a changed CA or name never reuses a
 /// connection verified under the old one.
-#[derive(Clone)]
-pub struct Upstreams {
-    identity: Option<Arc<Reloading>>,
-    connect_timeout: Duration,
-    clients: Arc<Mutex<HashMap<UpstreamTls, Option<TlsClient>>>>,
+pub struct Dialer {
+    pub connector: Connector,
+    pub pool: TlsClient,
 }
 
-/// Policies change rarely; past this the cache starts over.
-const MAX_CLIENTS: usize = 64;
+/// Builds dialers; the identity is what the gateway presents as the client.
+#[derive(Clone)]
+pub struct Dialers {
+    pub identity: Option<Arc<dyn rustls::client::ResolvesClientCert>>,
+    pub connect_timeout: Duration,
+}
 
-impl Upstreams {
-    pub fn new(identity: Option<Arc<Reloading>>, connect_timeout: Duration) -> Self {
-        Self {
-            identity,
-            connect_timeout,
-            clients: Arc::default(),
-        }
-    }
-
-    /// `None` fails the request closed: no usable CA or hostname.
-    pub fn client(&self, t: &UpstreamTls) -> Option<TlsClient> {
-        let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(c) = clients.get(t) {
-            return c.clone();
-        }
-        if clients.len() >= MAX_CLIENTS {
-            clients.clear();
-        }
-        let built = self
-            .connector(t)
-            .map(|c| Client::builder(TokioExecutor::new()).build(c));
-        if built.is_none() {
+impl Dialers {
+    /// `None` fails every request closed: no usable CA or hostname.
+    pub fn build(&self, t: &UpstreamTls) -> Option<Arc<Dialer>> {
+        let connector = self.connector(t);
+        if connector.is_none() {
             tracing::warn!(hostname = %t.hostname, "backend TLS unusable; refusing its requests");
         }
-        clients.insert(t.clone(), built.clone());
-        built
+        let connector = connector?;
+        Some(Arc::new(Dialer {
+            pool: Client::builder(TokioExecutor::new()).build(connector.clone()),
+            connector,
+        }))
     }
 
-    pub fn connector(&self, t: &UpstreamTls) -> Option<Connector> {
+    fn connector(&self, t: &UpstreamTls) -> Option<Connector> {
         let roots = crate::tls::roots(&t.ca_pem).ok()?;
         let name = ServerName::try_from(t.hostname.clone()).ok()?;
         let builder = rustls::ClientConfig::builder_with_provider(crate::tls::provider())
@@ -166,6 +152,7 @@ mod tests {
         backend: TlsBackend,
         pod_leaf: Vec<u8>,
         backend_ca: ClientCa,
+        dialers: super::Dialers,
         _dir: tempfile::TempDir,
     }
 
@@ -182,23 +169,31 @@ mod tests {
             "listen: '127.0.0.1:0'\ntls: {{ cert: {cert}, key: {key} }}\nroutes: []\n"
         ))
         .unwrap();
-        let tls = crate::tls::acceptor(crate::tls::Reloading::new(&cert, &key));
+        let pod_cert = crate::tls::Reloading::new(&cert, &key);
+        let tls = crate::tls::acceptor(pod_cert.clone());
         let gw = start(cfg, vec![], Some(tls)).await;
         Setup {
             gw,
             backend,
             pod_leaf: pod.der,
             backend_ca,
+            dialers: super::Dialers {
+                identity: Some(pod_cert),
+                connect_timeout: std::time::Duration::from_secs(2),
+            },
             _dir: dir,
         }
     }
 
     fn to(s: &Setup, hostname: &str, ca_pem: &str) -> crate::config::Route {
         let mut r = route("/", Authz::Skip, s.backend.addr);
-        r.backend.as_mut().unwrap().tls = Some(UpstreamTls {
+        let mut t = UpstreamTls {
             hostname: hostname.into(),
             ca_pem: ca_pem.into(),
-        });
+            ..UpstreamTls::default()
+        };
+        t.dialer = s.dialers.build(&t);
+        r.backend.as_mut().unwrap().tls = Some(t);
         r
     }
 

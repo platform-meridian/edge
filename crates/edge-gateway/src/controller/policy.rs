@@ -148,10 +148,7 @@ fn unparseable(
         .collect();
     (
         names,
-        UpstreamTls {
-            hostname: String::new(),
-            ca_pem: String::new(),
-        },
+        UpstreamTls::default(),
         verdict(
             false,
             "Invalid",
@@ -223,6 +220,7 @@ fn judge(
         UpstreamTls {
             hostname: v.hostname.clone(),
             ca_pem: if usable { pem } else { String::new() },
+            ..UpstreamTls::default()
         },
         accepted,
         resolved,

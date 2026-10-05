@@ -136,6 +136,45 @@ fn encode(bytes: &[u8]) -> String {
     s
 }
 
+pub fn normalize_host(h: &str) -> Option<String> {
+    let h = h.trim();
+    let (host, port) = match h.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => (host, port),
+        _ => (h, ""),
+    };
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return ip
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| format!("[{ip}]"));
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let label = |l: &str| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    name.split('.')
+        .all(label)
+        .then(|| name.to_ascii_lowercase())
+}
+
+/// Gateway API PathPrefix: `/abc` matches `/abc/d`, never `/abcd`.
+pub fn segment_prefix(path: &str, prefix: &str) -> bool {
+    let p = prefix.trim_end_matches('/');
+    if p.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(p) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -327,7 +366,7 @@ pub(crate) mod tests {
                     let backend_view = landed.len() >= want.len()
                         && landed.iter().zip(&want).all(|(a, b)| a == b);
                     prop_assert_eq!(
-                        crate::config::segment_prefix(&c, prefix),
+                        super::segment_prefix(&c, prefix),
                         backend_view,
                         "{} vs prefix {} (backend resolves {:?})", raw, prefix, landed
                     );

@@ -74,6 +74,14 @@ async fn serve(cfg: config::Config) -> anyhow::Result<()> {
         controller::Settings {
             statics: cfg.routes.clone(),
             strip: cfg.strip_request_headers.clone(),
+            dialers: proxy::Dialers {
+                identity: acceptor
+                    .as_ref()
+                    .map(|a| a.identity() as Arc<dyn rustls::client::ResolvesClientCert>),
+                connect_timeout: std::time::Duration::from_millis(
+                    cfg.limits.upstream_connect_timeout_ms,
+                ),
+            },
         },
         acceptor.clone(),
     );
