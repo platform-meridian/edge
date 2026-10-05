@@ -34,6 +34,54 @@ pub(super) struct Rule {
     pub filters: Vec<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Filter {
+    pub r#type: String,
+    pub request_header_modifier: Option<HeaderFilter>,
+    pub request_redirect: Option<RedirectFilter>,
+    pub url_rewrite: Option<RewriteFilter>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct HeaderFilter {
+    pub set: Vec<NameValue>,
+    pub add: Vec<NameValue>,
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct NameValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct RedirectFilter {
+    pub scheme: Option<String>,
+    pub hostname: Option<String>,
+    pub path: Option<PathFilter>,
+    pub port: Option<u16>,
+    pub status_code: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct RewriteFilter {
+    pub hostname: Option<String>,
+    pub path: Option<PathFilter>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct PathFilter {
+    pub r#type: String,
+    pub replace_full_path: Option<String>,
+    pub replace_prefix_match: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub(super) struct Match {

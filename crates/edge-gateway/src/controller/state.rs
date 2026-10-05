@@ -191,7 +191,7 @@ pub(super) fn thin(ev: Event<DynamicObject>) -> Event<DynamicObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Authz, Backend};
+    use crate::config::{Authz, Backend, Filters, HeaderModifier, PathModifier, Redirect};
     use crate::controller::convert::Outcome;
     use crate::controller::run::step;
     use crate::controller::{GATEWAY_GROUP, Routes};
@@ -294,10 +294,11 @@ mod tests {
             prefix: "/".into(),
             authz: Authz::Skip,
             rewrite_host: None,
-            backend: Backend {
+            backend: Some(Backend {
                 host: backend.into(),
                 port: 1,
-            },
+            }),
+            filters: Default::default(),
         }
     }
 
@@ -307,10 +308,11 @@ mod tests {
             prefix: prefix.into(),
             authz: Authz::Required,
             rewrite_host: None,
-            backend: Backend {
+            backend: Some(Backend {
                 host: format!("{service}.svc.cluster.local"),
                 port,
-            },
+            }),
+            filters: Default::default(),
         }
     }
 
@@ -375,7 +377,10 @@ mod tests {
             (**self.routes.load()).clone()
         }
         fn backends(&self) -> Vec<String> {
-            self.table().into_iter().map(|r| r.backend.host).collect()
+            self.table()
+                .into_iter()
+                .map(|r| r.backend.unwrap().host)
+                .collect()
         }
         fn outcome(&self, name: &str) -> &Outcome {
             let built = self.last.as_ref().expect("no table built");
@@ -1024,6 +1029,224 @@ mod tests {
                 resolved,
             ),
             (
+                "header modifier",
+                rule(
+                    json!({ "filters": [{ "type": "RequestHeaderModifier", "requestHeaderModifier": {
+                    "set": [{ "name": "X-Set", "value": "s" }], "add": [{ "name": "x-add", "value": "a" }], "remove": ["X-Gone"] } }],
+                    "backendRefs": be }),
+                ),
+                json!({}),
+                vec![Route {
+                    filters: Filters {
+                        request_headers: HeaderModifier {
+                            set: vec![("x-set".into(), "s".into())],
+                            add: vec![("x-add".into(), "a".into())],
+                            remove: vec!["x-gone".into()],
+                        },
+                        ..Filters::default()
+                    },
+                    ..served(None, "/", "svc.apps", 80)
+                }],
+                accepted,
+                resolved,
+            ),
+            (
+                "URLRewrite: prefix and host, which outranks the annotation",
+                rule(
+                    json!({ "matches": [{ "path": { "value": "/app" } }], "filters": [{ "type": "URLRewrite", "urlRewrite": {
+                    "hostname": "Inner.Example", "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": "/a/./b" } } }],
+                    "backendRefs": be }),
+                ),
+                json!({ "edge.meridian/rewrite-host": "mesh.name" }),
+                vec![Route {
+                    rewrite_host: Some("inner.example".into()),
+                    filters: Filters {
+                        rewrite_path: Some(PathModifier::Prefix("/a/b".into())),
+                        ..Filters::default()
+                    },
+                    ..served(None, "/app", "svc.apps", 80)
+                }],
+                accepted,
+                resolved,
+            ),
+            (
+                "URLRewrite: full path, an empty prefix",
+                json!({ "rules": [
+                    { "matches": [{ "path": { "value": "/f" } }], "filters": [{ "type": "URLRewrite", "urlRewrite": {
+                        "path": { "type": "ReplaceFullPath", "replaceFullPath": "/one" } } }], "backendRefs": be },
+                    { "matches": [{ "path": { "value": "/p" } }], "filters": [{ "type": "URLRewrite", "urlRewrite": {
+                        "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": "" } } }], "backendRefs": be },
+                ] }),
+                json!({}),
+                vec![
+                    Route {
+                        filters: Filters {
+                            rewrite_path: Some(PathModifier::Full("/one".into())),
+                            ..Filters::default()
+                        },
+                        ..served(None, "/f", "svc.apps", 80)
+                    },
+                    Route {
+                        filters: Filters {
+                            rewrite_path: Some(PathModifier::Prefix(String::new())),
+                            ..Filters::default()
+                        },
+                        ..served(None, "/p", "svc.apps", 80)
+                    },
+                ],
+                accepted,
+                resolved,
+            ),
+            (
+                "a redirect needs no backend and ignores any",
+                json!({ "hostnames": ["a.example"], "rules": [{ "filters": [{ "type": "RequestRedirect", "requestRedirect": {
+                    "scheme": "https", "hostname": "b.example", "port": 8443, "statusCode": 301,
+                    "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": "/x" } } }],
+                    "backendRefs": [{ "name": "missing" }] }] }),
+                json!({}),
+                vec![Route {
+                    backend: None,
+                    filters: Filters {
+                        redirect: Some(Redirect {
+                            scheme: Some("https".into()),
+                            hostname: Some("b.example".into()),
+                            path: Some(PathModifier::Prefix("/x".into())),
+                            port: Some(8443),
+                            status: 301,
+                            listener_port: 8443,
+                        }),
+                        ..Filters::default()
+                    },
+                    ..served(Some("a.example"), "/", "svc.apps", 80)
+                }],
+                accepted,
+                resolved,
+            ),
+            (
+                "a redirect defaults to 302",
+                rule(json!({ "filters": [{ "type": "RequestRedirect", "requestRedirect": {} }] })),
+                json!({}),
+                vec![Route {
+                    backend: None,
+                    filters: Filters {
+                        redirect: Some(Redirect {
+                            scheme: None,
+                            hostname: None,
+                            path: None,
+                            port: None,
+                            status: 302,
+                            listener_port: 8443,
+                        }),
+                        ..Filters::default()
+                    },
+                    ..served(None, "/", "svc.apps", 80)
+                }],
+                accepted,
+                resolved,
+            ),
+            (
+                "an unsupported filter",
+                rule(
+                    json!({ "filters": [{ "type": "ResponseHeaderModifier", "responseHeaderModifier": {} }], "backendRefs": be }),
+                ),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a filter twice",
+                rule(json!({ "filters": [
+                    { "type": "RequestHeaderModifier", "requestHeaderModifier": {} },
+                    { "type": "RequestHeaderModifier", "requestHeaderModifier": {} },
+                ], "backendRefs": be })),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a redirect with a rewrite",
+                rule(json!({ "filters": [
+                    { "type": "RequestRedirect", "requestRedirect": {} },
+                    { "type": "URLRewrite", "urlRewrite": {} },
+                ], "backendRefs": be })),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a header filter on Host",
+                rule(
+                    json!({ "filters": [{ "type": "RequestHeaderModifier", "requestHeaderModifier": {
+                    "set": [{ "name": "Host", "value": "x" }] } }], "backendRefs": be }),
+                ),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a bad header value",
+                rule(
+                    json!({ "filters": [{ "type": "RequestHeaderModifier", "requestHeaderModifier": {
+                    "add": [{ "name": "x", "value": "a\nb" }] } }], "backendRefs": be }),
+                ),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a redirect scheme",
+                rule(
+                    json!({ "filters": [{ "type": "RequestRedirect", "requestRedirect": { "scheme": "ftp" } }] }),
+                ),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a redirect status",
+                rule(
+                    json!({ "filters": [{ "type": "RequestRedirect", "requestRedirect": { "statusCode": 200 } }] }),
+                ),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a redirect host with a port",
+                rule(
+                    json!({ "filters": [{ "type": "RequestRedirect", "requestRedirect": { "hostname": "a.test:1" } }] }),
+                ),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a rewrite to a non-canonical path",
+                rule(json!({ "filters": [{ "type": "URLRewrite", "urlRewrite": {
+                    "path": { "type": "ReplaceFullPath", "replaceFullPath": "/a%2fb" } } }], "backendRefs": be })),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
+                "a path modifier without its value",
+                rule(json!({ "filters": [{ "type": "URLRewrite", "urlRewrite": {
+                    "path": { "type": "ReplacePrefixMatch", "replaceFullPath": "/a" } } }], "backendRefs": be })),
+                json!({}),
+                vec![],
+                unsupported,
+                resolved,
+            ),
+            (
                 "backendRef filter",
                 rule(json!({ "backendRefs": [{ "name": "svc", "port": 80, "filters": [{}] }] })),
                 json!({}),
@@ -1091,7 +1314,7 @@ mod tests {
         );
         assert_eq!(
             o.accepted.message,
-            "rule 0: filters, rule 1: method matches; unsupported parts were dropped, the rest is served"
+            "rule 0: a filter without a type, rule 1: method matches; unsupported parts were dropped, the rest is served"
         );
         assert_eq!(
             o.resolved.message,

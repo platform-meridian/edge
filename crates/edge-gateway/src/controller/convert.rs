@@ -1,10 +1,15 @@
-//! Whatever this data plane cannot honour (a header match, a filter, a weighted
-//! split) is dropped and reported, never served wider than asked.
+//! Whatever this data plane cannot honour (a header match, an unknown filter, a
+//! weighted split) is dropped and reported, never served wider than asked.
 
-use super::schema::{BackendRef, HttpRouteSpec, Listener, Match, ParentRef, ReferenceGrant, Rule};
+use super::schema::{
+    BackendRef, Filter, HeaderFilter, HttpRouteSpec, Listener, Match, ParentRef, PathFilter,
+    RedirectFilter, ReferenceGrant, RewriteFilter, Rule,
+};
 use super::state::Key;
 use super::{GATEWAY_GROUP, GatewayRef};
-use crate::config::{Authz, Backend, Route, normalize_host};
+use crate::config::{
+    Authz, Backend, Filters, HeaderModifier, PathModifier, Redirect, Route, normalize_host,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::ResourceExt;
 use kube::api::DynamicObject;
@@ -105,17 +110,30 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
     let hostnames = hostnames(&spec.hostnames, ctx, &mut unsupported);
     let mut routes = Vec::new();
     for (i, rule) in spec.rules.iter().enumerate() {
-        let backend = match rule_backend(i, rule, &ns, ctx) {
-            Ok(b) => b,
-            Err(Skipped::Unsupported(p)) => {
+        let (filters, host_rewrite) = match rule_filters(i, rule, ctx.gateway.bound_port) {
+            Ok(f) => f,
+            Err(p) => {
                 unsupported.push(p);
                 continue;
             }
-            Err(Skipped::Unresolved(p)) => {
-                unresolved.push(p);
-                continue;
+        };
+        // A redirect is answered here, whatever the rule's backends.
+        let backend = if filters.redirect.is_some() {
+            None
+        } else {
+            match rule_backend(i, rule, &ns, ctx) {
+                Ok(b) => Some(b),
+                Err(Skipped::Unsupported(p)) => {
+                    unsupported.push(p);
+                    continue;
+                }
+                Err(Skipped::Unresolved(p)) => {
+                    unresolved.push(p);
+                    continue;
+                }
             }
         };
+        let rewrite_host = host_rewrite.or_else(|| rewrite_host.clone());
         let prefixes = rule_prefixes(i, rule, &mut unsupported);
         for host in &hostnames {
             for prefix in &prefixes {
@@ -125,6 +143,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
                     authz,
                     rewrite_host: rewrite_host.clone(),
                     backend: backend.clone(),
+                    filters: filters.clone(),
                 });
             }
         }
@@ -231,9 +250,6 @@ fn rule_backend(i: usize, rule: &Rule, route_ns: &str, ctx: &Ctx) -> Result<Back
     let unsupported = |what: String| {
         Skipped::Unsupported(problem("UnsupportedValue", format!("rule {i}: {what}")))
     };
-    if !rule.filters.is_empty() {
-        return Err(unsupported("filters".into()));
-    }
     let receiving_traffic: Vec<&BackendRef> = rule
         .backend_refs
         .iter()
@@ -293,6 +309,125 @@ fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<Backend,
         host: format!("{}.{ns}.svc.cluster.local", b.name),
         port,
     })
+}
+
+/// Each kind at most once, and never a redirect with a rewrite: the API's own
+/// rules, checked again since nothing else here would notice.
+fn rule_filters(
+    i: usize,
+    rule: &Rule,
+    listener_port: u16,
+) -> Result<(Filters, Option<String>), Problem> {
+    let bad = |what: String| problem("UnsupportedValue", format!("rule {i}: {what}"));
+    let mut filters = Filters::default();
+    let mut host_rewrite = None;
+    let mut seen = HashSet::new();
+    for raw in &rule.filters {
+        let f: Filter = serde_json::from_value(raw.clone())
+            .map_err(|_| bad("a filter without a type".into()))?;
+        if !seen.insert(f.r#type.clone()) {
+            return Err(bad(format!("filter {} twice", f.r#type)));
+        }
+        let missing = || bad(format!("filter {} without its settings", f.r#type));
+        match f.r#type.as_str() {
+            "RequestHeaderModifier" => {
+                let h = f.request_header_modifier.as_ref().ok_or_else(missing)?;
+                filters.request_headers = header_modifier(h).map_err(bad)?;
+            }
+            "RequestRedirect" => {
+                let r = f.request_redirect.as_ref().ok_or_else(missing)?;
+                filters.redirect = Some(redirect(r, listener_port).map_err(bad)?);
+            }
+            "URLRewrite" => {
+                let r = f.url_rewrite.as_ref().ok_or_else(missing)?;
+                let RewriteFilter { hostname, path } = r;
+                if let Some(h) = hostname {
+                    host_rewrite = Some(precise_host(h).map_err(bad)?);
+                }
+                if let Some(p) = path {
+                    filters.rewrite_path = Some(path_modifier(p).map_err(bad)?);
+                }
+            }
+            other => return Err(bad(format!("filter {other}"))),
+        }
+    }
+    if filters.redirect.is_some() && seen.contains("URLRewrite") {
+        return Err(bad("a redirect and a rewrite together".into()));
+    }
+    Ok((filters, host_rewrite))
+}
+
+fn header_modifier(h: &HeaderFilter) -> Result<HeaderModifier, String> {
+    let name = |n: &str| {
+        let parsed = http::HeaderName::try_from(n).map_err(|_| format!("header name {n:?}"))?;
+        // The upstream Host is the route's; URLRewrite's hostname sets it.
+        if parsed == http::header::HOST {
+            return Err("a header filter on Host".to_string());
+        }
+        Ok(parsed.as_str().to_string())
+    };
+    let pairs = |list: &[super::schema::NameValue]| {
+        list.iter()
+            .map(|nv| {
+                http::HeaderValue::try_from(nv.value.as_str())
+                    .map_err(|_| format!("header value for {}", nv.name))?;
+                Ok((name(&nv.name)?, nv.value.clone()))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
+    Ok(HeaderModifier {
+        set: pairs(&h.set)?,
+        add: pairs(&h.add)?,
+        remove: h.remove.iter().map(|n| name(n)).collect::<Result<_, _>>()?,
+    })
+}
+
+fn redirect(r: &RedirectFilter, listener_port: u16) -> Result<Redirect, String> {
+    if let Some(s) = &r.scheme
+        && s != "http"
+        && s != "https"
+    {
+        return Err(format!("redirect scheme {s}"));
+    }
+    let status = r.status_code.unwrap_or(302);
+    if ![301, 302, 303, 307, 308].contains(&status) {
+        return Err(format!("redirect status {status}"));
+    }
+    if r.port == Some(0) {
+        return Err("redirect port 0".into());
+    }
+    Ok(Redirect {
+        scheme: r.scheme.clone(),
+        hostname: r.hostname.as_deref().map(precise_host).transpose()?,
+        path: r.path.as_ref().map(path_modifier).transpose()?,
+        port: r.port,
+        status,
+        listener_port,
+    })
+}
+
+fn precise_host(h: &str) -> Result<String, String> {
+    match normalize_host(h) {
+        Some(n) if !h.contains(':') => Ok(n),
+        _ => Err(format!("hostname {h}")),
+    }
+}
+
+fn path_modifier(p: &PathFilter) -> Result<PathModifier, String> {
+    let canonical = |v: &str| crate::path::canonicalize(v).map_err(|e| format!("path {v:?}: {e}"));
+    match (
+        p.r#type.as_str(),
+        &p.replace_full_path,
+        &p.replace_prefix_match,
+    ) {
+        ("ReplaceFullPath", Some(v), _) => Ok(PathModifier::Full(canonical(v)?)),
+        // Empty means strip the prefix.
+        ("ReplacePrefixMatch", _, Some(v)) if v.is_empty() => {
+            Ok(PathModifier::Prefix(String::new()))
+        }
+        ("ReplacePrefixMatch", _, Some(v)) => Ok(PathModifier::Prefix(canonical(v)?)),
+        (t, ..) => Err(format!("path modifier {t}")),
+    }
 }
 
 fn rule_prefixes(i: usize, rule: &Rule, unsupported: &mut Vec<Problem>) -> Vec<String> {

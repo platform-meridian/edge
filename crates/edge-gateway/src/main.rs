@@ -75,7 +75,7 @@ async fn serve(cfg: config::Config) -> anyhow::Result<()> {
             host = r.hostname.as_deref().unwrap_or("*"),
             prefix = %r.prefix,
             authz = ?r.authz,
-            backend = %format!("{}:{}", r.backend.host, r.backend.port),
+            backend = %r.backend.as_ref().map_or("-".into(), |b| format!("{}:{}", b.host, b.port)),
             "route"
         );
     }

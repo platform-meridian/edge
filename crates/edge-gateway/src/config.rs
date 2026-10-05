@@ -35,7 +35,61 @@ pub struct Route {
     pub authz: Authz,
     #[serde(default)]
     pub rewrite_host: Option<String>,
-    pub backend: Backend,
+    /// Absent only on a redirect, which is answered here.
+    pub backend: Option<Backend>,
+    /// HTTPRoute filters; the config file has none.
+    #[serde(skip)]
+    pub filters: Filters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Filters {
+    pub redirect: Option<Redirect>,
+    pub rewrite_path: Option<PathModifier>,
+    pub request_headers: HeaderModifier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathModifier {
+    Full(String),
+    /// Replaces the route's matched prefix.
+    Prefix(String),
+}
+
+impl PathModifier {
+    /// `path` and the replacement are canonical, and `path` is under `prefix`.
+    pub fn apply(&self, path: &str, prefix: &str) -> String {
+        match self {
+            PathModifier::Full(p) => p.clone(),
+            PathModifier::Prefix(with) => {
+                let rest = &path[prefix.trim_end_matches('/').len().min(path.len())..];
+                let joined = format!("{}{rest}", with.trim_end_matches('/'));
+                if joined.is_empty() {
+                    "/".into()
+                } else {
+                    joined
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    pub scheme: Option<String>,
+    pub hostname: Option<String>,
+    pub path: Option<PathModifier>,
+    pub port: Option<u16>,
+    pub status: u16,
+    /// Stands in for a port when neither it nor a scheme is named.
+    pub listener_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeaderModifier {
+    pub set: Vec<(String, String)>,
+    pub add: Vec<(String, String)>,
+    pub remove: Vec<String>,
 }
 
 fn root() -> String {
@@ -272,7 +326,9 @@ fn canonicalize_routes(routes: &mut [Route]) -> anyhow::Result<()> {
             r.hostname = Some(n);
         }
         anyhow::ensure!(
-            !r.backend.host.is_empty() && r.backend.port != 0,
+            r.backend
+                .as_ref()
+                .is_some_and(|b| !b.host.is_empty() && b.port != 0),
             "route backend must have host and port"
         );
     }
@@ -440,6 +496,7 @@ mod tests {
             with_routes("{ hostname: '.', backend: { host: h, port: 1 } }"),
             with_routes("{ backend: { host: '', port: 1 } }"),
             with_routes("{ backend: { host: h, port: 0 } }"),
+            with_routes("{ prefix: '/' }"),
         ]);
         for c in &bad {
             assert!(Config::parse(c).is_err(), "{c}");
@@ -511,11 +568,39 @@ routes:
             prefix: "/".into(),
             authz: Authz::Required,
             rewrite_host: None,
-            backend: Backend {
+            backend: Some(Backend {
                 host: "b".into(),
                 port: 1,
-            },
+            }),
+            filters: Filters::default(),
         }
+    }
+
+    /// Gateway API's `ReplacePrefixMatch` table, then a full replacement.
+    #[test]
+    fn path_modifier_table() {
+        for (path, prefix, with, want) in [
+            ("/foo/bar", "/foo", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo", "/xyz/", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz/", "/xyz/bar"),
+            ("/foo", "/foo", "/xyz", "/xyz"),
+            ("/foo/", "/foo", "/xyz", "/xyz/"),
+            ("/foo/bar", "/foo", "", "/bar"),
+            ("/foo/", "/foo", "", "/"),
+            ("/foo", "/foo", "", "/"),
+            ("/foo/", "/foo", "/", "/"),
+            ("/foo", "/foo", "/", "/"),
+            ("/", "/", "/ews", "/ews/"),
+            ("/a/b", "/", "/ews", "/ews/a/b"),
+        ] {
+            let got = PathModifier::Prefix(with.into()).apply(path, prefix);
+            assert_eq!(got, want, "{path} {prefix} -> {with}");
+        }
+        assert_eq!(
+            PathModifier::Full("/one".into()).apply("/a/b", "/a"),
+            "/one"
+        );
     }
 
     #[test]
@@ -618,7 +703,13 @@ routes:
     fn table(c: &Config) -> Vec<(Option<&str>, &str, u16)> {
         c.routes
             .iter()
-            .map(|r| (r.hostname.as_deref(), r.prefix.as_str(), r.backend.port))
+            .map(|r| {
+                (
+                    r.hostname.as_deref(),
+                    r.prefix.as_str(),
+                    r.backend.as_ref().unwrap().port,
+                )
+            })
             .collect()
     }
 
@@ -683,7 +774,7 @@ routes:
             c.routes
                 .iter()
                 .find(|r| r.matches(host, path))
-                .map(|r| r.backend.port)
+                .map(|r| r.backend.as_ref().unwrap().port)
         };
         assert_eq!(first(Some("h.test"), "/a/b"), Some(4));
         assert_eq!(first(None, "/a/b/c"), Some(3));

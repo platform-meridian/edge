@@ -1,13 +1,15 @@
 //! Canonicalise, route, sanitise, authorise, forward: in that order.
 
+mod filters;
 mod headers;
 mod tunnel;
 
 use crate::authz::{self, Allowed, Authorizer, CheckInput, Decision};
-use crate::config::{Authz, Config, Route};
+use crate::config::{Authz, Backend, Config, Route};
 use crate::controller::Routes;
 use crate::path;
 use bytes::Bytes;
+use filters::{modify_headers, redirect};
 use headers::{StripSet, request_host, sanitize, set_forwarded, upgrade_protocol};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::header::{HeaderName, HeaderValue};
@@ -34,7 +36,7 @@ pub struct Gateway {
     strip: Arc<StripSet>,
 }
 
-struct Target {
+pub(super) struct Target {
     path: String,
     query: Option<String>,
 }
@@ -120,10 +122,21 @@ impl Gateway {
             Err(why) => return Ok(status(StatusCode::FORBIDDEN, why)),
         };
 
+        if let Some(r) = &route.filters.redirect {
+            return Ok(redirect(r, route, &target, host.as_deref(), conn));
+        }
+        let Some(backend) = &route.backend else {
+            return Ok(status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "route has no backend",
+            ));
+        };
+
         let (mut parts, body) = req.into_parts();
         if !rewrite_for_upstream(
             &mut parts,
             route,
+            backend,
             &target,
             allowed.ops,
             &allowed.remove,
@@ -135,9 +148,10 @@ impl Gateway {
         let req = Request::from_parts(parts, body.boxed());
         let mut resp = match upgrade {
             Some((protocol, downstream)) => {
-                self.forward_upgrade(req, protocol, downstream, route).await
+                self.forward_upgrade(req, protocol, downstream, backend)
+                    .await
             }
-            None => self.forward(req, route).await,
+            None => self.forward(req, backend).await,
         };
         for (k, v) in allowed.response_headers {
             if let (Ok(n), Ok(v)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
@@ -184,16 +198,16 @@ impl Gateway {
         }
     }
 
-    async fn forward(&self, req: Request<Body>, route: &Route) -> Response<Body> {
+    async fn forward(&self, req: Request<Body>, backend: &Backend) -> Response<Body> {
         let limit = Duration::from_millis(self.cfg.limits.upstream_response_timeout_ms);
         match tokio::time::timeout(limit, self.client.request(req)).await {
             Ok(Ok(resp)) => resp.map(|b| b.boxed()),
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, backend = %route.backend.host, "upstream failed");
+                tracing::warn!(error = %e, backend = %backend.host, "upstream failed");
                 status(StatusCode::BAD_GATEWAY, "upstream unavailable")
             }
             Err(_) => {
-                tracing::warn!(backend = %route.backend.host, "upstream response timed out");
+                tracing::warn!(backend = %backend.host, "upstream response timed out");
                 status(StatusCode::GATEWAY_TIMEOUT, "upstream timed out")
             }
         }
@@ -205,7 +219,7 @@ impl Gateway {
         mut req: Request<Body>,
         protocol: HeaderValue,
         downstream: OnUpgrade,
-        route: &Route,
+        backend: &Backend,
     ) -> Response<Body> {
         let limits = &self.cfg.limits;
         let connect = Duration::from_millis(limits.upstream_connect_timeout_ms);
@@ -220,7 +234,7 @@ impl Gateway {
         );
         req.headers_mut().insert(hyper::header::UPGRADE, protocol);
 
-        let addr = format!("{}:{}", route.backend.host, route.backend.port);
+        let addr = format!("{}:{}", backend.host, backend.port);
         let stream =
             match tokio::time::timeout(connect, tokio::net::TcpStream::connect(&addr)).await {
                 Ok(Ok(s)) => s,
@@ -278,19 +292,32 @@ impl Gateway {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_for_upstream(
     parts: &mut Parts,
     route: &Route,
+    backend: &Backend,
     target: &Target,
     ops: Vec<authz::HeaderOp>,
     remove: &[String],
     client_host: Option<String>,
     conn: ConnInfo,
 ) -> bool {
+    let rewritten;
+    let target = match &route.filters.rewrite_path {
+        Some(m) => {
+            rewritten = Target {
+                path: m.apply(&target.path, &route.prefix),
+                query: target.query.clone(),
+            };
+            &rewritten
+        }
+        None => target,
+    };
     let uri = format!(
         "http://{}:{}{}",
-        route.backend.host,
-        route.backend.port,
+        backend.host,
+        backend.port,
         target.request_target()
     );
     let Ok(uri) = uri.parse() else {
@@ -298,12 +325,13 @@ fn rewrite_for_upstream(
     };
     parts.uri = uri;
     authz::apply_request_edits(&mut parts.headers, remove, ops);
+    modify_headers(&mut parts.headers, &route.filters.request_headers);
     // The upstream Host is the route's, never the client's: otherwise it would
     // differ between h1 (Host forwarded) and h2 (Host synthesised).
     let upstream_host = route
         .rewrite_host
         .clone()
-        .unwrap_or_else(|| format!("{}:{}", route.backend.host, route.backend.port));
+        .unwrap_or_else(|| format!("{}:{}", backend.host, backend.port));
     if let Ok(val) = HeaderValue::try_from(upstream_host) {
         parts.headers.insert(hyper::header::HOST, val);
     }

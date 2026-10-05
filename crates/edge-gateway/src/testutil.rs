@@ -37,10 +37,11 @@ pub fn route(prefix: &str, authz: Authz, backend: SocketAddr) -> Route {
         prefix: prefix.into(),
         authz,
         rewrite_host: None,
-        backend: Backend {
+        backend: Some(Backend {
             host: backend.ip().to_string(),
             port: backend.port(),
-        },
+        }),
+        filters: Default::default(),
     }
 }
 
