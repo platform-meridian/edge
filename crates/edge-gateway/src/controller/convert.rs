@@ -35,7 +35,7 @@ pub(super) struct Ctx<'a> {
     pub static_hosts: &'a HashSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Verdict {
     pub ok: bool,
     pub reason: &'static str,
@@ -71,6 +71,8 @@ pub(super) struct Outcome {
     pub routes: Vec<Route>,
     /// The Services its served rules forward to.
     pub services: BTreeSet<Key>,
+    /// The listeners it is attached to.
+    pub listeners: BTreeSet<String>,
     pub parent: Value,
     pub accepted: Verdict,
     pub resolved: Verdict,
@@ -93,19 +95,23 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
         .collect();
     let parent = status_parent_ref(ours.first()?, ctx.gateway);
 
-    if let Err(p) = attach_any(&ours, &ns, ctx) {
-        return Some(Outcome {
-            routes: vec![],
-            services: BTreeSet::new(),
-            parent,
-            accepted: p.into_verdict(),
-            resolved: Verdict {
-                ok: true,
-                reason: "ResolvedRefs",
-                message: "not attached; backendRefs not evaluated".into(),
-            },
-        });
-    }
+    let listeners = match attach_any(&ours, &ns, ctx) {
+        Ok(l) => l,
+        Err(p) => {
+            return Some(Outcome {
+                routes: vec![],
+                services: BTreeSet::new(),
+                listeners: BTreeSet::new(),
+                parent,
+                accepted: p.into_verdict(),
+                resolved: Verdict {
+                    ok: true,
+                    reason: "ResolvedRefs",
+                    message: "not attached; backendRefs not evaluated".into(),
+                },
+            });
+        }
+    };
 
     let annotation = |k: &str| o.annotations().get(k).cloned();
     let authz = match annotation(AUTHZ_ANNOTATION).as_deref() {
@@ -177,6 +183,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
         resolved: resolved(&unresolved),
         routes,
         services,
+        listeners,
         parent,
     })
 }
@@ -201,14 +208,20 @@ fn status_parent_ref(p: &ParentRef, gw: &GatewayRef) -> Value {
     v
 }
 
-fn attach_any(ours: &[&ParentRef], route_ns: &str, ctx: &Ctx) -> Result<(), Problem> {
-    if ours.iter().any(|p| attach(p, route_ns, ctx).is_ok()) {
-        return Ok(());
+/// The listeners it attaches to, through any of our parentRefs.
+fn attach_any(ours: &[&ParentRef], route_ns: &str, ctx: &Ctx) -> Result<BTreeSet<String>, Problem> {
+    let attached: BTreeSet<String> = ours
+        .iter()
+        .filter_map(|p| attach(p, route_ns, ctx).ok())
+        .flatten()
+        .collect();
+    if !attached.is_empty() {
+        return Ok(attached);
     }
-    attach(ours[0], route_ns, ctx)
+    attach(ours[0], route_ns, ctx).map(|l| l.into_iter().collect())
 }
 
-fn attach(p: &ParentRef, route_ns: &str, ctx: &Ctx) -> Result<(), Problem> {
+fn attach(p: &ParentRef, route_ns: &str, ctx: &Ctx) -> Result<Vec<String>, Problem> {
     let gw = ctx.gateway;
     let Some(listeners) = ctx.listeners else {
         return Err(problem(
@@ -226,8 +239,12 @@ fn attach(p: &ParentRef, route_ns: &str, ctx: &Ctx) -> Result<(), Problem> {
             ),
         ));
     }
-    if selected.any(|l| l.admits(route_ns, &gw.namespace)) {
-        Ok(())
+    let admitting: Vec<String> = selected
+        .filter(|l| l.admits(route_ns, &gw.namespace))
+        .map(|l| l.name().to_string())
+        .collect();
+    if !admitting.is_empty() {
+        Ok(admitting)
     } else {
         Err(problem(
             "NotAllowedByListeners",

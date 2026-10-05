@@ -112,7 +112,23 @@ pub fn parents_same(current: Option<&Value>, desired: &[Value]) -> bool {
     })
 }
 
-fn conditions_equal(a: &Value, b: &Value) -> bool {
+/// Listener entries, ignoring `lastTransitionTime`.
+pub fn listeners_same(current: &Value, desired: &[Value]) -> bool {
+    let Value::Array(have) = current else {
+        return false;
+    };
+    have.len() == desired.len()
+        && desired.iter().all(|d| {
+            have.iter().any(|h| {
+                h["name"] == d["name"]
+                    && h["supportedKinds"] == d["supportedKinds"]
+                    && h["attachedRoutes"] == d["attachedRoutes"]
+                    && conditions_equal(&h["conditions"], &d["conditions"])
+            })
+        })
+}
+
+pub fn conditions_equal(a: &Value, b: &Value) -> bool {
     let (Value::Array(a), Value::Array(b)) = (a, b) else {
         return false;
     };

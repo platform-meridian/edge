@@ -2,6 +2,8 @@
 
 use super::convert::{Ctx, Outcome, convert};
 use super::frontend::{Derived, derive};
+use super::gateway_status;
+use super::identity::backend_identity;
 use super::policy;
 use super::schema::{Listener, ReferenceGrant};
 use super::trust::{RefKind, RefState, Refs, Sources, referenced};
@@ -114,6 +116,7 @@ pub(super) struct Built {
     /// BackendTLSPolicies, and whether one of our routes uses a Service each
     /// targets: their status is ours to report only then.
     pub policies: Vec<(DynamicObject, policy::Outcome, bool)>,
+    pub gateway: Option<(DynamicObject, gateway_status::GatewayStatus)>,
 }
 
 impl State {
@@ -241,9 +244,20 @@ impl State {
         let policies: Vec<&DynamicObject> = self.policies.live.values().collect();
         let listed_services = (self.services.phase == Phase::Listed).then_some(&self.services.live);
         let mut policies = policy::evaluate(&policies, &sources, listed_services);
+        let (identity, fingerprint, client_cert) = backend_identity(
+            our_gateway,
+            gateway,
+            &self.refs,
+            &grants,
+            &settings.dialers.identity,
+        );
+        let dialers = crate::proxy::Dialers {
+            identity,
+            ..settings.dialers.clone()
+        };
         for t in policies.by_service.values_mut() {
-            t.identity = "pod".into();
-            t.dialer = settings.dialers.build(t);
+            t.identity = fingerprint.clone();
+            t.dialer = dialers.build(t);
         }
         let ctx = Ctx {
             gateway,
@@ -276,11 +290,16 @@ impl State {
         // Stable sort: on a tie, statics then the oldest route win.
         table.sort_by(Route::precedence);
         let frontend = derive(our_gateway, gateway, &sources, &grants, &table);
+        let status = our_gateway.map(|g| {
+            let s = gateway_status::derive(g, gateway, &outcomes, &frontend, client_cert);
+            (g.clone(), s)
+        });
         Built {
             table,
             outcomes,
             frontend,
             policies,
+            gateway: status,
         }
     }
 
@@ -470,7 +489,7 @@ mod tests {
         statics: Vec<Route>,
         last: Option<Built>,
         /// The ConfigMaps that exist, which a referenced one's watch lists.
-        world: BTreeMap<Key, DynamicObject>,
+        world: BTreeMap<(RefKind, Key), DynamicObject>,
         /// Leaves referenced ConfigMaps unanswered, as a slow watch would.
         hold: bool,
     }
@@ -519,16 +538,16 @@ mod tests {
             if self.hold {
                 return;
             }
-            let pending: Vec<Key> = self
+            let pending: Vec<(RefKind, Key)> = self
                 .state
                 .refs
                 .iter()
                 .filter(|(_, r)| r.listed.is_none())
-                .map(|((_, k), _)| k.clone())
+                .map(|(k, _)| k.clone())
                 .collect();
             for k in pending {
                 let o = self.world.get(&k).cloned();
-                self.feed(Msg::Ref(RefKind::ConfigMap, k, RefEvent::Listed(o)));
+                self.feed(Msg::Ref(k.0, k.1, RefEvent::Listed(o)));
             }
         }
         fn cms(&mut self, objs: Vec<DynamicObject>) {
@@ -536,14 +555,17 @@ mod tests {
                 self.cm_apply(o);
             }
         }
-        fn cm_apply(&mut self, o: DynamicObject) {
+        fn ref_apply(&mut self, kind: RefKind, o: DynamicObject) {
             let k = key(&o);
-            self.world.insert(k.clone(), o.clone());
-            self.feed(Msg::Ref(RefKind::ConfigMap, k, RefEvent::Applied(o)));
+            self.world.insert((kind, k.clone()), o.clone());
+            self.feed(Msg::Ref(kind, k, RefEvent::Applied(o)));
+        }
+        fn cm_apply(&mut self, o: DynamicObject) {
+            self.ref_apply(RefKind::ConfigMap, o);
         }
         fn cm_delete(&mut self, o: DynamicObject) {
             let k = key(&o);
-            self.world.remove(&k);
+            self.world.remove(&(RefKind::ConfigMap, k.clone()));
             self.feed(Msg::Ref(RefKind::ConfigMap, k, RefEvent::Deleted));
         }
         fn list(&mut self, k: Kind, objs: Vec<DynamicObject>) {
@@ -2048,5 +2070,112 @@ mod tests {
         };
         assert_eq!(tls("a.test"), Some("port.apps.svc".into()));
         assert_eq!(tls("b.test"), None, "another port: plaintext");
+    }
+
+    fn status_of(c: &Cluster) -> &gateway_status::GatewayStatus {
+        &c.last.as_ref().unwrap().gateway.as_ref().unwrap().1
+    }
+
+    /// GEP-91 in status: a missing CA ConfigMap is the listener's
+    /// `ResolvedRefs=False`, and true again once it exists.
+    #[test]
+    fn frontend_ca_problems_in_listener_status() {
+        let pem = ca_pem();
+        let mut c = frontend_cluster(
+            json!({ "frontend": { "default": validation("AllowInsecureFallback", json!([cm("operators")])) } }),
+            vec![],
+            vec![],
+        );
+        let https = |c: &Cluster| {
+            status_of(c).listeners[0]
+                .conditions
+                .iter()
+                .map(|(t, v)| (*t, v.ok, v.reason))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            https(&c),
+            [
+                ("Accepted", false, "NoValidCACertificate"),
+                ("Programmed", true, "Programmed"),
+                ("ResolvedRefs", false, "InvalidCACertificateRef")
+            ]
+        );
+        assert_eq!(status_of(&c).listeners[0].attached, 2, "both routes attach");
+        c.cm_apply(configmap("edge", "operators", &pem));
+        assert!(
+            status_of(&c).listeners[0]
+                .conditions
+                .iter()
+                .all(|(_, v)| v.ok)
+        );
+    }
+
+    fn tls_secret(ns: &str, name: &str, cert: &str, key: &str) -> DynamicObject {
+        use base64::Engine;
+        let b64 = |v: &str| base64::engine::general_purpose::STANDARD.encode(v);
+        let mut o = obj("v1", "Secret", ns, name, T0, json!({}), json!(null));
+        o.data = json!({ "type": "kubernetes.io/tls", "data": { "tls.crt": b64(cert), "tls.key": b64(key) } });
+        o
+    }
+
+    /// `tls.backend.clientCertificateRef` replaces the pod certificate as the
+    /// identity backends see; a bad one presents nothing and says so.
+    #[test]
+    fn backend_client_certificate_from_a_secret() {
+        let pem = ca_pem();
+        let issued = crate::testutil::issue();
+        let cluster = |secret: Option<DynamicObject>| {
+            let mut c = frontend_cluster(
+                json!({ "backend": { "clientCertificateRef": { "name": "gw-client" } } }),
+                vec![configmap("apps", "jel-ca", &pem)],
+                vec![],
+            );
+            if let Some(s) = secret {
+                c.ref_apply(RefKind::Secret, s);
+            }
+            c.list(Kind::Policy, vec![btls("jel", "jel", "jel-ca")]);
+            c.list(Kind::Route, vec![to_service("a", T0, "a.test", "jel")]);
+            c
+        };
+        let tls = |c: &Cluster| c.table()[0].backend.clone().unwrap().tls.unwrap();
+        let gw_resolved = |c: &Cluster| {
+            let (_, v) = &status_of(c).conditions[2];
+            (v.ok, v.reason)
+        };
+
+        let c = cluster(Some(tls_secret(
+            "edge",
+            "gw-client",
+            &issued.cert_pem,
+            &issued.key_pem,
+        )));
+        assert!(tls(&c).identity.starts_with("secret:"), "{:?}", tls(&c));
+        assert!(tls(&c).dialer.is_some());
+        assert_eq!(gw_resolved(&c), (true, "ResolvedRefs"));
+
+        for (what, secret) in [
+            ("missing", None),
+            (
+                "a key of another certificate",
+                Some(tls_secret(
+                    "edge",
+                    "gw-client",
+                    &issued.cert_pem,
+                    &crate::testutil::issue().key_pem,
+                )),
+            ),
+            ("not PEM", Some(tls_secret("edge", "gw-client", "x", "y"))),
+        ] {
+            let c = cluster(secret);
+            assert_eq!(tls(&c).identity, "none", "{what}");
+            assert_eq!(
+                gw_resolved(&c),
+                (false, "InvalidClientCertificateRef"),
+                "{what}"
+            );
+        }
+        let c = frontend_cluster(json!({}), vec![], vec![]);
+        assert_eq!(gw_resolved(&c), (true, "ResolvedRefs"), "no reference");
     }
 }

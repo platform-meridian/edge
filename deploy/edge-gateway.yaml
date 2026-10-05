@@ -100,8 +100,8 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch"]
-  # Client CAs for spec.tls.frontend: a ConfigMap's ca.crt, or a
-  # ClusterTrustBundle. Only ca.crt is kept.
+  # CAs a frontend validation or a BackendTLSPolicy names: each ConfigMap is
+  # watched by name while referenced, and only its ca.crt kept.
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["list", "watch"]
@@ -122,6 +122,27 @@ kind: ClusterRoleBinding
 metadata:
   name: edge-gateway
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edge-gateway }
+subjects:
+  - { kind: ServiceAccount, name: edge-gateway, namespace: edge }
+---
+# The Secret spec.tls.backend.clientCertificateRef names, watched by name: only
+# in the Gateway's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: edge-gateway
+  namespace: edge
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: edge-gateway
+  namespace: edge
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edge-gateway }
 subjects:
   - { kind: ServiceAccount, name: edge-gateway, namespace: edge }
 ---

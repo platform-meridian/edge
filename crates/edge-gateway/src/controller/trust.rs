@@ -11,18 +11,25 @@ pub(super) const BUNDLE_GROUP: &str = "certificates.k8s.io";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum RefKind {
     ConfigMap,
+    Secret,
 }
 
 impl RefKind {
     pub fn api(self) -> (&'static str, &'static str, &'static str) {
         match self {
             RefKind::ConfigMap => ("", "v1", "ConfigMap"),
+            RefKind::Secret => ("", "v1", "Secret"),
         }
     }
 
     pub fn thin(self, o: &mut DynamicObject) {
         match self {
             RefKind::ConfigMap => thin_configmap(o),
+            RefKind::Secret => {
+                let data = &o.data["data"];
+                o.data = serde_json::json!({ "type": o.data["type"], "data": {
+                    "tls.crt": data["tls.crt"], "tls.key": data["tls.key"] } });
+            }
         }
         o.metadata.managed_fields = None;
         o.metadata.annotations = None;
@@ -135,6 +142,14 @@ pub(super) fn referenced(
             &super::frontend::validation(g, gw)["caCertificateRefs"],
             &gw.namespace,
         ));
+        let client = &g.data["spec"]["tls"]["backend"]["clientCertificateRef"];
+        if client["group"].as_str().unwrap_or_default().is_empty()
+            && client["kind"].as_str().unwrap_or("Secret") == "Secret"
+            && let Some(name) = client["name"].as_str()
+        {
+            let ns = client["namespace"].as_str().unwrap_or(&gw.namespace);
+            out.insert((RefKind::Secret, (ns.to_string(), name.to_string())));
+        }
     }
     for p in policies {
         let ns = kube::ResourceExt::namespace(&p).unwrap_or_default();

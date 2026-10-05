@@ -1,5 +1,7 @@
 use super::frontend::Derived;
-use super::report::{publish_policy_status, publish_route_status, run_gateway_status};
+use super::report::{
+    publish_gateway_status, publish_policy_status, publish_route_status, run_class_status,
+};
 use super::state::{Built, Key, Kind, Msg, RefEvent, State};
 use super::trust::BUNDLE_GROUP;
 use super::trust::RefKind;
@@ -22,12 +24,11 @@ pub fn spawn(
     settings: Settings,
     tls: Option<crate::tls::Acceptor>,
 ) {
-    let g = gateway.clone();
     tokio::spawn(supervise(
-        "gateway status watch",
+        "gatewayclass status watch",
         SUPERVISE_MIN,
         SUPERVISE_MAX,
-        move || run_gateway_status(g.clone()),
+        run_class_status,
     ));
     tokio::spawn(supervise(
         "gateway api controller",
@@ -136,6 +137,11 @@ async fn run(
             if let Err(e) = publish_route_status(&client, &route_ar, o, outcome).await {
                 tracing::warn!(route = %o.name_any(), error = %e, "status not written");
             }
+        }
+        if let Some((o, st)) = &built.gateway
+            && let Err(e) = publish_gateway_status(&client, o, st).await
+        {
+            tracing::warn!(gateway = %o.name_any(), error = %e, "status not written");
         }
         for (o, outcome, ours) in &built.policies {
             if let Err(e) =

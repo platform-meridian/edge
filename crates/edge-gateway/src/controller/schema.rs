@@ -122,6 +122,7 @@ enum AllowedNamespaces {
 pub(super) struct Listener {
     name: String,
     port: Option<u16>,
+    protocol: String,
     namespaces: AllowedNamespaces,
     admits_httproute: bool,
 }
@@ -151,9 +152,26 @@ impl Listener {
         Listener {
             name: l["name"].as_str().unwrap_or_default().to_string(),
             port: l["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+            protocol: l["protocol"].as_str().unwrap_or_default().to_string(),
             namespaces,
             admits_httproute,
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    pub fn is_https(&self) -> bool {
+        self.protocol == "HTTPS"
+    }
+
+    pub fn admits_httproute(&self) -> bool {
+        self.admits_httproute
     }
 
     pub fn selected_by(&self, p: &ParentRef) -> bool {

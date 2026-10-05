@@ -1,18 +1,21 @@
 //! GEP-91: the Gateway's `spec.tls.frontend`, for the port this gateway binds.
 
 use super::GatewayRef;
+use super::convert::Verdict;
 use super::schema::ReferenceGrant;
-use super::trust::Sources;
+use super::trust::{RefError, Sources};
 use crate::config::Route;
 use crate::tls::{Frontend, Mode};
 use kube::api::DynamicObject;
 use serde_json::Value;
 
-/// `problems` are what was dropped, for the log.
+/// `problems` are what was dropped, for the log; `refs` is the listener's
+/// `ResolvedRefs`, and whether no reference was usable (its `Accepted`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Derived {
     pub frontend: Option<Frontend>,
     pub problems: Vec<String>,
+    pub refs: Option<(Verdict, bool)>,
 }
 
 pub(super) fn derive(
@@ -26,18 +29,12 @@ pub(super) fn derive(
     let Some(tls) = gateway.map(|g| &g.data["spec"]["tls"]) else {
         return Derived::default();
     };
-    if !tls["backend"]["clientCertificateRef"].is_null() {
-        problems.push(
-            "tls.backend.clientCertificateRef is not supported; backends get the pod certificate"
-                .into(),
-        );
+    if tls.is_null() {
+        return Derived::default();
     }
     let validation = validation(gateway.expect("checked above"), gw);
     if validation.is_null() {
-        return Derived {
-            frontend: None,
-            problems,
-        };
+        return Derived::default();
     }
     let mode = match validation["mode"].as_str() {
         None | Some("AllowValidOnly") => Mode::AllowValidOnly,
@@ -50,19 +47,44 @@ pub(super) fn derive(
         }
     };
     let mut ca_pem = String::new();
-    for r in validation["caCertificateRefs"]
+    let mut bad: Vec<(&'static str, String)> = Vec::new();
+    let refs = validation["caCertificateRefs"]
         .as_array()
         .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    for r in refs {
         match resolve(r, gw, sources, grants) {
             Ok(pem) => {
                 ca_pem.push_str(&pem);
                 ca_pem.push('\n');
             }
-            Err(e) => problems.push(format!("frontend caCertificateRef: {e}")),
+            Err(e) => {
+                problems.push(format!("frontend caCertificateRef: {}", e.1));
+                bad.push(e);
+            }
         }
     }
+    let severity = |reason: &str| match reason {
+        "InvalidCACertificateKind" => 0,
+        "RefNotPermitted" => 1,
+        _ => 2,
+    };
+    let resolved = match bad.iter().min_by_key(|(r, _)| severity(r)) {
+        None => Verdict {
+            ok: true,
+            reason: "ResolvedRefs",
+            message: "all caCertificateRefs resolved".into(),
+        },
+        Some((reason, _)) => Verdict {
+            ok: false,
+            reason,
+            message: bad
+                .iter()
+                .map(|(_, m)| m.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        },
+    };
     if ca_pem.is_empty() {
         problems.push(match mode {
             Mode::AllowValidOnly => "no usable client CA: every handshake is refused".into(),
@@ -77,6 +99,7 @@ pub(super) fn derive(
         .filter_map(|r| r.hostname.clone())
         .collect();
     Derived {
+        refs: Some((resolved, ca_pem.is_empty())),
         frontend: Some(Frontend {
             mode,
             ca_pem,
@@ -105,7 +128,7 @@ fn resolve(
     gw: &GatewayRef,
     sources: &Sources,
     grants: &[ReferenceGrant],
-) -> Result<String, String> {
+) -> Result<String, (&'static str, String)> {
     let text = |k: &str| r[k].as_str().unwrap_or_default();
     let (group, kind, name) = (text("group"), text("kind"), text("name"));
     let ns = r["namespace"].as_str().unwrap_or(&gw.namespace);
@@ -115,9 +138,13 @@ fn resolve(
             .iter()
             .any(|g| g.permits("Gateway", &gw.namespace, kind, ns, name))
     {
-        return Err(format!("{kind} {ns}/{name} needs a ReferenceGrant in {ns}"));
+        return Err((
+            "RefNotPermitted",
+            format!("{kind} {ns}/{name} needs a ReferenceGrant in {ns}"),
+        ));
     }
-    sources
-        .resolve(group, kind, ns, name)
-        .map_err(|e| e.message().to_string())
+    sources.resolve(group, kind, ns, name).map_err(|e| match e {
+        RefError::Kind(m) => ("InvalidCACertificateKind", m),
+        RefError::Invalid(m) => ("InvalidCACertificateRef", m),
+    })
 }

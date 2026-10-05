@@ -3,6 +3,8 @@
 
 mod convert;
 mod frontend;
+mod gateway_status;
+mod identity;
 mod policy;
 mod report;
 mod run;
