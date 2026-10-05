@@ -34,6 +34,7 @@ pub struct Gateway {
     client: HttpClient,
     authorizer: Option<Authorizer>,
     strip: Arc<StripSet>,
+    frontend: Option<crate::tls::Acceptor>,
 }
 
 pub(super) struct Target {
@@ -65,13 +66,33 @@ impl Gateway {
             client: Client::builder(TokioExecutor::new()).build(connector),
             authorizer,
             strip,
+            frontend: None,
         })
+    }
+
+    pub fn with_tls(mut self, acceptor: crate::tls::Acceptor) -> Self {
+        self.frontend = Some(acceptor);
+        self
+    }
+
+    /// A route that wants the client's certificate, on an h2 connection the
+    /// browser coalesced from a name never asked for one: 421 makes it retry on
+    /// a connection of its own, which is asked.
+    fn misdirected(&self, route: &Route, host: Option<&str>, conn: &ConnInfo) -> bool {
+        let Some(frontend) = &self.frontend else {
+            return false;
+        };
+        route.client_cert
+            && !conn.handshake.requested
+            && host
+                .and_then(crate::config::normalize_host)
+                .is_some_and(|h| frontend.requests_certificate(&h))
     }
 
     pub async fn handle(
         &self,
         mut req: Request<Incoming>,
-        conn: ConnInfo,
+        conn: &ConnInfo,
     ) -> Result<Response<Body>, hyper::Error> {
         // Two Hosts, or two Authorizations, are requests two parties read differently.
         if req.headers().get_all(hyper::header::HOST).iter().count() > 1 {
@@ -96,6 +117,12 @@ impl Gateway {
         else {
             return Ok(status(StatusCode::NOT_FOUND, "no route"));
         };
+        if self.misdirected(route, host.as_deref(), conn) {
+            return Ok(status(
+                StatusCode::MISDIRECTED_REQUEST,
+                "this connection was not asked for a client certificate",
+            ));
+        }
 
         // Read before sanitising, which removes Connection and Upgrade.
         let upgrade = upgrade_protocol(req.headers()).map(|p| (p, hyper::upgrade::on(&mut req)));
@@ -169,7 +196,7 @@ impl Gateway {
         route: &Route,
         host: Option<&str>,
         target: &Target,
-        conn: ConnInfo,
+        conn: &ConnInfo,
     ) -> Result<Allowed, &'static str> {
         if route.authz == Authz::Skip {
             return Ok(Allowed::default());
@@ -301,7 +328,7 @@ fn rewrite_for_upstream(
     ops: Vec<authz::HeaderOp>,
     remove: &[String],
     client_host: Option<String>,
-    conn: ConnInfo,
+    conn: &ConnInfo,
 ) -> bool {
     let rewritten;
     let target = match &route.filters.rewrite_path {
@@ -336,7 +363,18 @@ fn rewrite_for_upstream(
         parts.headers.insert(hyper::header::HOST, val);
     }
     // Last, so neither the client nor authz can override it.
-    set_forwarded(&mut parts.headers, &conn, client_host.as_deref());
+    set_forwarded(&mut parts.headers, conn, client_host.as_deref());
+    // Whatever the strip list says: only the route that asked gets one.
+    parts.headers.remove(crate::xfcc::HEADER);
+    if route.client_cert
+        && let Some(v) = conn
+            .handshake
+            .client_cert
+            .as_deref()
+            .and_then(|v| HeaderValue::try_from(v).ok())
+    {
+        parts.headers.insert(crate::xfcc::HEADER, v);
+    }
     // Upstream is HTTP/1.1; an h2 downstream version would be rejected by the client.
     parts.version = hyper::Version::HTTP_11;
     true

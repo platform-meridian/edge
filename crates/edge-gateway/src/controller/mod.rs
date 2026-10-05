@@ -2,10 +2,12 @@
 //! matching and forwarding never see Gateway API types.
 
 mod convert;
+mod frontend;
 mod report;
 mod run;
 mod schema;
 mod state;
+mod trust;
 
 use crate::config::Route;
 use arc_swap::ArcSwap;

@@ -8,9 +8,8 @@ use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio_rustls::TlsAcceptor;
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -194,14 +193,173 @@ impl ResolvesServerCert for Reloading {
     }
 }
 
-pub fn acceptor(resolver: Arc<Reloading>) -> TlsAcceptor {
-    let mut cfg = rustls::ServerConfig::builder_with_provider(provider())
+/// Every certificate in `pem` as a trust anchor; none, or any unusable, fails.
+pub fn roots(pem: &str) -> Result<rustls::RootCertStore, String> {
+    let mut store = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        let c = c.map_err(|e| format!("not PEM: {e}"))?;
+        store
+            .add(c)
+            .map_err(|e| format!("not a CA certificate: {e}"))?;
+    }
+    if store.is_empty() {
+        return Err("no certificate".into());
+    }
+    Ok(store)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Every handshake must present a certificate that verifies.
+    AllowValidOnly,
+    /// Asked for only on `names`; one that is presented must still verify.
+    AllowInsecureFallback,
+}
+
+/// Client-certificate validation as the controller derives it from the Gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frontend {
+    pub mode: Mode,
+    /// Empty when no CA reference resolved.
+    pub ca_pem: String,
+    pub names: std::collections::BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct Active {
+    spec: Option<Frontend>,
+    /// `None` with a spec: no usable CA.
+    verifying: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl Active {
+    /// The config for this SNI, and whether it asks for a certificate. `None`
+    /// refuses the handshake.
+    fn choose(
+        &self,
+        plain: &Arc<rustls::ServerConfig>,
+        sni: Option<&str>,
+    ) -> Option<(Arc<rustls::ServerConfig>, bool)> {
+        let Some(spec) = &self.spec else {
+            return Some((plain.clone(), false));
+        };
+        match spec.mode {
+            Mode::AllowValidOnly => self.verifying.clone().map(|c| (c, true)),
+            Mode::AllowInsecureFallback => match &self.verifying {
+                Some(c) if sni.is_some_and(|s| spec.names.contains(s)) => Some((c.clone(), true)),
+                _ => Some((plain.clone(), false)),
+            },
+        }
+    }
+
+    fn requests(&self, host: &str) -> bool {
+        match &self.spec {
+            Some(s) if self.verifying.is_some() => {
+                s.mode == Mode::AllowValidOnly || s.names.contains(host)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the handshake established.
+#[derive(Debug, Clone, Default)]
+pub struct Handshake {
+    pub requested: bool,
+    /// The verified client certificate as `X-Forwarded-Client-Cert`.
+    pub client_cert: Option<Arc<str>>,
+}
+
+/// Picks the server config per handshake from the client's SNI, so only the
+/// names that use a client certificate make a browser offer one.
+#[derive(Clone)]
+pub struct Acceptor {
+    resolver: Arc<Reloading>,
+    plain: Arc<rustls::ServerConfig>,
+    active: Arc<arc_swap::ArcSwap<Active>>,
+}
+
+fn server_config(
+    resolver: Arc<Reloading>,
+    verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Arc<rustls::ServerConfig> {
+    let builder = rustls::ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .expect("ring supports the default protocol versions");
+    let mut cfg = match verifier {
+        Some(v) => builder.with_client_cert_verifier(v),
+        None => builder.with_no_client_auth(),
+    }
+    .with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    TlsAcceptor::from(Arc::new(cfg))
+    Arc::new(cfg)
+}
+
+pub fn acceptor(resolver: Arc<Reloading>) -> Acceptor {
+    Acceptor {
+        plain: server_config(resolver.clone(), None),
+        resolver,
+        active: Arc::default(),
+    }
+}
+
+impl Acceptor {
+    /// False when `spec` names no usable CA, which the result then refuses or
+    /// stops asking for.
+    pub fn set_frontend(&self, spec: Option<Frontend>) -> bool {
+        let verifying = spec.as_ref().and_then(|s| {
+            let roots = Arc::new(roots(&s.ca_pem).ok()?);
+            let b = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider());
+            let b = match s.mode {
+                Mode::AllowValidOnly => b,
+                Mode::AllowInsecureFallback => b.allow_unauthenticated(),
+            };
+            let v = b.build().ok()?;
+            Some(server_config(self.resolver.clone(), Some(v)))
+        });
+        let usable = spec.is_none() || verifying.is_some();
+        self.active.store(Arc::new(Active { spec, verifying }));
+        usable
+    }
+
+    /// Whether a connection whose SNI is `host` would be asked for a certificate.
+    pub fn requests_certificate(&self, host: &str) -> bool {
+        self.active.load().requests(host)
+    }
+
+    pub async fn accept(
+        &self,
+        stream: tokio::net::TcpStream,
+    ) -> std::io::Result<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        Handshake,
+    )> {
+        let start =
+            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream)
+                .await?;
+        let sni = start
+            .client_hello()
+            .server_name()
+            .and_then(crate::config::normalize_host);
+        let Some((cfg, requested)) = self.active.load().choose(&self.plain, sni.as_deref()) else {
+            return Err(std::io::Error::other("no usable client CA"));
+        };
+        let tls = start.into_stream(cfg).await?;
+        let client_cert = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .and_then(|c| crate::xfcc::value(c.as_ref()))
+            .map(Arc::from);
+        Ok((
+            tls,
+            Handshake {
+                requested,
+                client_cert,
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +658,191 @@ mod tests {
 
         let (code, _) = get(gw.addr, "/", "").await;
         assert_eq!(code, 0);
+    }
+
+    struct Front {
+        gw: RunningGateway,
+        tls: Acceptor,
+        marked: Recorder,
+        open: Recorder,
+        _dir: tempfile::TempDir,
+    }
+
+    /// `elf.test` wants the client's certificate; `ui.test` does not.
+    async fn front() -> Front {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = install(dir.path(), &issue());
+        let (marked, open) = (recorder("marked").await, recorder("open").await);
+        let mut elf = host_route("elf.test", "/", Authz::Skip, marked.addr);
+        elf.client_cert = true;
+        let tls = acceptor(Reloading::new(&cert, &key));
+        let gw = start(
+            tls_cfg(&cert, &key, ""),
+            vec![elf, host_route("ui.test", "/", Authz::Skip, open.addr)],
+            Some(tls.clone()),
+        )
+        .await;
+        Front {
+            gw,
+            tls,
+            marked,
+            open,
+            _dir: dir,
+        }
+    }
+
+    fn validation(mode: Mode, ca: &ClientCa) -> Option<Frontend> {
+        Some(Frontend {
+            mode,
+            ca_pem: ca.pem.clone(),
+            names: ["elf.test".to_string()].into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn no_validation_asks_nobody() {
+        let f = front().await;
+        let ca = ClientCa::new("operators");
+        for sni in ["elf.test", "ui.test"] {
+            let got = tls_get_as(f.gw.addr, sni, sni, Some(ca.issue("op")), "").await;
+            assert_eq!(got.unwrap(), (200, false), "{sni}");
+        }
+        assert!(f.tls.set_frontend(None));
+        assert!(!f.tls.requests_certificate("elf.test"));
+    }
+
+    #[tokio::test]
+    async fn insecure_fallback_asks_only_marked_names() {
+        let f = front().await;
+        let (ca, other) = (ClientCa::new("operators"), ClientCa::new("strangers"));
+        assert!(
+            f.tls
+                .set_frontend(validation(Mode::AllowInsecureFallback, &ca))
+        );
+        assert!(f.tls.requests_certificate("elf.test"));
+        assert!(!f.tls.requests_certificate("ui.test"));
+
+        let ui = tls_get_as(f.gw.addr, "ui.test", "ui.test", Some(ca.issue("op")), "").await;
+        assert_eq!(ui.unwrap(), (200, false), "an unmarked name is never asked");
+        let none = tls_get_as(f.gw.addr, "elf.test", "elf.test", None, "").await;
+        assert_eq!(none.unwrap(), (200, true), "asked, and served without one");
+        let good = tls_get_as(f.gw.addr, "ELF.test.", "elf.test", Some(ca.issue("op")), "").await;
+        assert_eq!(good.unwrap(), (200, true));
+        let bad = tls_get_as(
+            f.gw.addr,
+            "elf.test",
+            "elf.test",
+            Some(other.issue("op")),
+            "",
+        )
+        .await;
+        assert!(
+            !matches!(bad, Ok((200, _))),
+            "a certificate that does not verify was accepted: {bad:?}"
+        );
+        assert_eq!(f.marked.count(), 2);
+        assert_eq!(f.open.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn valid_only_asks_everyone_and_refuses_without() {
+        let f = front().await;
+        let (ca, other) = (ClientCa::new("operators"), ClientCa::new("strangers"));
+        assert!(f.tls.set_frontend(validation(Mode::AllowValidOnly, &ca)));
+        assert!(f.tls.requests_certificate("ui.test"));
+        for sni in ["elf.test", "ui.test"] {
+            let good = tls_get_as(f.gw.addr, sni, sni, Some(ca.issue("op")), "").await;
+            assert_eq!(good.unwrap(), (200, true), "{sni}");
+            for client in [None, Some(other.issue("op"))] {
+                let refused = tls_get_as(f.gw.addr, sni, sni, client, "").await;
+                assert!(!matches!(refused, Ok((200, _))), "{sni}: {refused:?}");
+            }
+        }
+        assert_eq!(f.marked.count() + f.open.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn unusable_ca_fails_closed_only_where_required() {
+        let f = front().await;
+        let broken = |mode| {
+            Some(Frontend {
+                mode,
+                ca_pem: String::new(),
+                names: ["elf.test".to_string()].into(),
+            })
+        };
+        assert!(!f.tls.set_frontend(broken(Mode::AllowInsecureFallback)));
+        let got = tls_get_as(f.gw.addr, "elf.test", "elf.test", None, "").await;
+        assert_eq!(got.unwrap(), (200, false), "fallback: nothing to ask with");
+        assert!(!f.tls.set_frontend(broken(Mode::AllowValidOnly)));
+        let got = tls_get_as(f.gw.addr, "ui.test", "ui.test", None, "").await;
+        assert!(got.is_err() || got.unwrap().0 == 0, "required, yet served");
+    }
+
+    /// Envoy's header reaches the route that asked, whatever the client sent;
+    /// any other route, or a request with no certificate, gets none.
+    #[tokio::test]
+    async fn verified_certificate_forwarded_as_xfcc() {
+        let f = front().await;
+        let ca = ClientCa::new("operators");
+        f.tls
+            .set_frontend(validation(Mode::AllowInsecureFallback, &ca));
+        let forged = "X-Forwarded-Client-Cert: Hash=00;Subject=\"CN=admin\"\r\n";
+        let op = ca.issue("DOE.JOHN.1234");
+
+        let got = tls_get_as(f.gw.addr, "elf.test", "elf.test", Some(op.clone()), forged).await;
+        assert_eq!(got.unwrap().0, 200);
+        let seen = f.marked.last();
+        let xfcc = seen.headers_named("x-forwarded-client-cert");
+        assert_eq!(xfcc, [crate::xfcc::value(&op.der).unwrap().as_str()]);
+        assert!(
+            xfcc[0].contains(";Subject=\"CN=DOE.JOHN.1234\""),
+            "{}",
+            xfcc[0]
+        );
+
+        tls_get_as(f.gw.addr, "elf.test", "elf.test", None, forged)
+            .await
+            .unwrap();
+        assert!(f.marked.last().header("x-forwarded-client-cert").is_none());
+        tls_get_as(f.gw.addr, "ui.test", "ui.test", None, forged)
+            .await
+            .unwrap();
+        assert!(f.open.last().header("x-forwarded-client-cert").is_none());
+        tls_get_as(f.gw.addr, "elf.test", "ui.test", Some(op), forged)
+            .await
+            .unwrap();
+        assert!(
+            f.open.last().header("x-forwarded-client-cert").is_none(),
+            "an unmarked route got the identity"
+        );
+    }
+
+    /// A connection opened for `ui.test` was never asked for a certificate, so a
+    /// browser that reuses it for `elf.test` is sent to open its own.
+    #[tokio::test]
+    async fn coalesced_request_is_misdirected() {
+        let f = front().await;
+        let ca = ClientCa::new("operators");
+        f.tls
+            .set_frontend(validation(Mode::AllowInsecureFallback, &ca));
+        let got = tls_get_as(f.gw.addr, "ui.test", "elf.test", None, "").await;
+        assert_eq!(got.unwrap(), (421, false));
+        assert_eq!(f.marked.count(), 0);
+        f.tls.set_frontend(None);
+        let got = tls_get_as(f.gw.addr, "ui.test", "elf.test", None, "").await;
+        assert_eq!(got.unwrap().0, 200, "nothing would ask: no 421 loop");
+    }
+
+    #[test]
+    fn roots_need_every_certificate_usable() {
+        let ca = ClientCa::new("a");
+        assert_eq!(roots(&ca.pem).unwrap().len(), 1);
+        let two = format!("{}{}", ca.pem, ClientCa::new("b").pem);
+        assert_eq!(roots(&two).unwrap().len(), 2);
+        assert!(roots("").is_err());
+        assert!(roots("no pem here").is_err());
+        let junk = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert!(roots(&format!("{}{junk}", ca.pem)).is_err());
     }
 }

@@ -1,5 +1,7 @@
+use super::frontend::Derived;
 use super::report::{publish_route_status, run_gateway_status};
 use super::state::{Built, Kind, Msg, State};
+use super::trust::BUNDLE_GROUP;
 use super::{GATEWAY_GROUP, GatewayRef, Routes, api_resource};
 use crate::config::Route;
 use edge_common::Outage;
@@ -14,7 +16,12 @@ use std::time::Duration;
 const SUPERVISE_MIN: Duration = Duration::from_secs(1);
 const SUPERVISE_MAX: Duration = Duration::from_secs(60);
 
-pub fn spawn(routes: Routes, gateway: GatewayRef, static_routes: Vec<Route>) {
+pub fn spawn(
+    routes: Routes,
+    gateway: GatewayRef,
+    static_routes: Vec<Route>,
+    tls: Option<crate::tls::Acceptor>,
+) {
     let g = gateway.clone();
     tokio::spawn(supervise(
         "gateway status watch",
@@ -26,7 +33,14 @@ pub fn spawn(routes: Routes, gateway: GatewayRef, static_routes: Vec<Route>) {
         "gateway api controller",
         SUPERVISE_MIN,
         SUPERVISE_MAX,
-        move || run(routes.clone(), gateway.clone(), static_routes.clone()),
+        move || {
+            run(
+                routes.clone(),
+                gateway.clone(),
+                static_routes.clone(),
+                tls.clone(),
+            )
+        },
     ));
 }
 
@@ -76,7 +90,12 @@ pub(super) fn step(
 
 /// `static_routes` survive every republish: they reach loopback-bound backends,
 /// which no Service can name (Endpoints reject 127.0.0.1).
-async fn run(routes: Routes, gateway: GatewayRef, static_routes: Vec<Route>) -> anyhow::Result<()> {
+async fn run(
+    routes: Routes,
+    gateway: GatewayRef,
+    static_routes: Vec<Route>,
+    tls: Option<crate::tls::Acceptor>,
+) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     let route_ar = api_resource(GATEWAY_GROUP, "v1", "HTTPRoute");
     let watch_all = |group, version, kind, k| {
@@ -91,13 +110,22 @@ async fn run(routes: Routes, gateway: GatewayRef, static_routes: Vec<Route>) -> 
         watch_all(GATEWAY_GROUP, "v1", "Gateway", Kind::Gateway),
         watch_all("", "v1", "Service", Kind::Service),
         watch_all(GATEWAY_GROUP, "v1beta1", "ReferenceGrant", Kind::Grant),
+        watch_all("", "v1", "ConfigMap", Kind::ConfigMap),
+        watch_all(BUNDLE_GROUP, "v1", "ClusterTrustBundle", Kind::TrustBundle),
     ]);
 
     let mut state = State::default();
+    let mut frontend = None;
     while let Some(msg) = msgs.next().await {
         let Some(built) = step(&mut state, msg, &gateway, &static_routes, &routes) else {
             continue;
         };
+        if let Some(tls) = &tls
+            && frontend.as_ref() != Some(&built.frontend)
+        {
+            apply_frontend(tls, &built.frontend);
+            frontend = Some(built.frontend.clone());
+        }
         for (o, outcome) in &built.outcomes {
             if let Err(e) = publish_route_status(&client, &route_ar, o, outcome).await {
                 tracing::warn!(route = %o.name_any(), error = %e, "status not written");
@@ -105,6 +133,22 @@ async fn run(routes: Routes, gateway: GatewayRef, static_routes: Vec<Route>) -> 
         }
     }
     anyhow::bail!("every watch ended")
+}
+
+fn apply_frontend(tls: &crate::tls::Acceptor, d: &Derived) {
+    for p in &d.problems {
+        tracing::warn!(problem = %p, "gateway tls");
+    }
+    let usable = tls.set_frontend(d.frontend.clone());
+    match &d.frontend {
+        None => tracing::info!("no client certificate is asked for"),
+        Some(f) => tracing::info!(
+            mode = ?f.mode,
+            usable,
+            names = ?f.names,
+            "client certificate validation applied"
+        ),
+    }
 }
 
 fn watch(api: Api<DynamicObject>, kind: Kind) -> impl Stream<Item = Msg> {

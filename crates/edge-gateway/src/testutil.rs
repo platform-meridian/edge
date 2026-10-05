@@ -42,6 +42,7 @@ pub fn route(prefix: &str, authz: Authz, backend: SocketAddr) -> Route {
             port: backend.port(),
         }),
         filters: Default::default(),
+        client_cert: false,
     }
 }
 
@@ -65,10 +66,13 @@ pub async fn gateway(cfg: Config, routes: Vec<Route>) -> RunningGateway {
 pub async fn start(
     cfg: Config,
     routes: Vec<Route>,
-    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    acceptor: Option<crate::tls::Acceptor>,
 ) -> RunningGateway {
     let table: Routes = Arc::new(arc_swap::ArcSwap::from_pointee(routes));
-    let gw = Gateway::new(Arc::new(cfg), table.clone()).unwrap();
+    let mut gw = Gateway::new(Arc::new(cfg), table.clone()).unwrap();
+    if let Some(a) = &acceptor {
+        gw = gw.with_tls(a.clone());
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -394,6 +398,127 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
+}
+
+/// A CA, and client certificates it issues.
+pub struct ClientCa {
+    pub pem: String,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+pub struct ClientCert {
+    pub chain: Vec<rustls_pki_types::CertificateDer<'static>>,
+    pub key: rustls_pki_types::PrivateKeyDer<'static>,
+    pub der: Vec<u8>,
+}
+
+impl Clone for ClientCert {
+    fn clone(&self) -> Self {
+        Self {
+            chain: self.chain.clone(),
+            key: self.key.clone_key(),
+            der: self.der.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClientCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientCert")
+    }
+}
+
+impl ClientCa {
+    pub fn new(cn: &str) -> Self {
+        let mut p = rcgen::CertificateParams::default();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        Self {
+            pem: cert.pem(),
+            issuer: rcgen::Issuer::new(p, key),
+        }
+    }
+
+    pub fn issue(&self, cn: &str) -> ClientCert {
+        let mut p = rcgen::CertificateParams::default();
+        p.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &self.issuer).unwrap();
+        ClientCert {
+            chain: vec![cert.der().clone()],
+            key: rustls_pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            der: cert.der().to_vec(),
+        }
+    }
+}
+
+/// Whether the server asked for a certificate, and the connection.
+pub async fn tls_connect_as(
+    addr: SocketAddr,
+    sni: &str,
+    client: Option<ClientCert>,
+) -> std::io::Result<(tokio_rustls::client::TlsStream<TcpStream>, bool)> {
+    #[derive(Debug)]
+    struct Asked(Option<ClientCert>, Arc<std::sync::atomic::AtomicBool>);
+    impl rustls::client::ResolvesClientCert for Asked {
+        fn resolve(
+            &self,
+            _: &[&[u8]],
+            _: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            let c = self.0.as_ref()?;
+            Some(Arc::new(
+                rustls::sign::CertifiedKey::from_der(
+                    c.chain.clone(),
+                    c.key.clone_key(),
+                    &rustls::crypto::ring::default_provider(),
+                )
+                .unwrap(),
+            ))
+        }
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+        .with_client_cert_resolver(Arc::new(Asked(client, asked.clone())));
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tcp = TcpStream::connect(addr).await?;
+    let s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(
+            rustls_pki_types::ServerName::try_from(sni.to_string()).unwrap(),
+            tcp,
+        )
+        .await?;
+    Ok((s, asked.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
+/// A GET over `tls_connect_as`: the status, or 0 when the server hung up.
+pub async fn tls_get_as(
+    addr: SocketAddr,
+    sni: &str,
+    host: &str,
+    client: Option<ClientCert>,
+    extra: &str,
+) -> std::io::Result<(u16, bool)> {
+    let (mut s, asked) = tls_connect_as(addr, sni, client).await?;
+    s.write_all(
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes(),
+    )
+    .await?;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut buf)).await;
+    Ok((parse_status(&String::from_utf8_lossy(&buf)).0, asked))
 }
 
 pub async fn tls_connect(

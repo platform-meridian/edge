@@ -953,6 +953,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "base64 0.22.1",
  "bytes",
  "edge-common",
  "envoy-types",
@@ -964,6 +965,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "notify",
+ "percent-encoding",
  "proptest",
  "rcgen",
  "rustls",
@@ -971,12 +973,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

@@ -30,7 +30,7 @@ pub(super) fn redirect(
     route: &Route,
     target: &Target,
     client_host: Option<&str>,
-    conn: ConnInfo,
+    conn: &ConnInfo,
 ) -> Response<Body> {
     let Some(host) = r
         .hostname

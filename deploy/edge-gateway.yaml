@@ -100,6 +100,14 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch"]
+  # Client CAs for spec.tls.frontend: a ConfigMap's ca.crt, or a
+  # ClusterTrustBundle. Only ca.crt is kept.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["clustertrustbundles"]
+    verbs: ["list", "watch"]
   # Without these a rejected route is absent and nothing says why.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]

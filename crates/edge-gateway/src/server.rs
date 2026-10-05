@@ -1,5 +1,6 @@
 use crate::config::Limits;
 use crate::proxy::{ConnInfo, Gateway};
+use crate::tls::Acceptor as TlsAcceptor;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
@@ -9,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_rustls::TlsAcceptor;
 
 /// Lets a test make `accept` fail the way EMFILE does.
 pub trait Accept {
@@ -82,14 +82,13 @@ async fn connection(
     _slot: OwnedSemaphorePermit,
 ) {
     let _ = stream.set_nodelay(true);
-    let conn = ConnInfo {
-        peer,
-        tls: acceptor.is_some(),
-    };
-    let svc = service_fn(move |req| {
+    let service = |conn: ConnInfo| {
         let gw = gw.clone();
-        async move { gw.handle(req, conn).await }
-    });
+        service_fn(move |req| {
+            let (gw, conn) = (gw.clone(), conn.clone());
+            async move { gw.handle(req, &conn).await }
+        })
+    };
     let header_read = Duration::from_millis(limits.header_read_timeout_ms);
     let ka_interval = Duration::from_millis(limits.h2_keepalive_interval_ms);
     let ka_timeout = Duration::from_millis(limits.h2_keepalive_timeout_ms);
@@ -97,7 +96,7 @@ async fn connection(
     let served = match acceptor {
         Some(a) => {
             let handshake = Duration::from_millis(limits.tls_handshake_timeout_ms);
-            let tls = match tokio::time::timeout(handshake, a.accept(stream)).await {
+            let (tls, shook) = match tokio::time::timeout(handshake, a.accept(stream)).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::debug!(error = %e, %peer, "tls handshake failed");
@@ -108,6 +107,7 @@ async fn connection(
                     return;
                 }
             };
+            let svc = service(ConnInfo::tls(peer, shook));
             // ALPN, not `auto`'s preface sniffing, which has no timeout.
             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
             let io = TokioIo::new(tls);
@@ -130,6 +130,7 @@ async fn connection(
             }
         }
         None => {
+            let svc = service(ConnInfo::plain(peer));
             // `auto` sniffs the preface without a timeout: bound the first byte here.
             let mut first = [0u8; 1];
             match tokio::time::timeout(header_read, stream.peek(&mut first)).await {

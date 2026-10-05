@@ -40,6 +40,9 @@ pub struct Route {
     /// HTTPRoute filters; the config file has none.
     #[serde(skip)]
     pub filters: Filters,
+    /// Its hostname asks the client for a certificate.
+    #[serde(skip)]
+    pub client_cert: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -158,6 +161,7 @@ pub const DEFAULT_STRIP_HEADERS: &[&str] = &[
     "x-user",
     "x-email",
     "x-real-ip",
+    "x-forwarded-client-cert",
 ];
 
 fn default_strip() -> Vec<String> {
@@ -573,6 +577,7 @@ routes:
                 port: 1,
             }),
             filters: Filters::default(),
+            client_cert: false,
         }
     }
 

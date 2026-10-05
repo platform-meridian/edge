@@ -11,6 +11,7 @@ mod status;
 #[cfg(test)]
 mod testutil;
 mod tls;
+mod xfcc;
 
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -50,7 +51,10 @@ async fn serve(cfg: config::Config) -> anyhow::Result<()> {
         ));
         tls::acceptor(resolver)
     });
-    let gw = proxy::Gateway::new(cfg.clone(), routes.clone())?;
+    let mut gw = proxy::Gateway::new(cfg.clone(), routes.clone())?;
+    if let Some(a) = &acceptor {
+        gw = gw.with_tls(a.clone());
+    }
 
     let listener = bind(&cfg.listen).await;
     tracing::info!(
@@ -68,6 +72,7 @@ async fn serve(cfg: config::Config) -> anyhow::Result<()> {
             bound_port: listen_port(&cfg.listen),
         },
         cfg.routes.clone(),
+        acceptor.clone(),
     );
 
     for r in routes.load().iter() {

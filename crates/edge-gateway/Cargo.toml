@@ -29,6 +29,10 @@ k8s-openapi.workspace = true
 futures.workspace = true
 arc-swap.workspace = true
 notify = { version = "8", default-features = false }
+x509-parser = "0.18"
+sha2 = "0.11"
+percent-encoding = "2"
+base64 = "0.22"
 
 [dev-dependencies]
 proptest = "1"

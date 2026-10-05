@@ -19,6 +19,9 @@ use std::collections::{BTreeSet, HashSet};
 /// Absent means authz is required. Stands in for GEP-1494 `ExternalAuth`.
 const AUTHZ_ANNOTATION: &str = "edge.meridian/authz";
 const REWRITE_HOST_ANNOTATION: &str = "edge.meridian/rewrite-host";
+/// `request`: the route's hostnames ask the client for a certificate. Ours: the
+/// API sets validation per port, and a browser asked shows a picker.
+pub(super) const CLIENT_CERT_ANNOTATION: &str = "edge.meridian/client-certificate";
 
 pub(super) struct Ctx<'a> {
     pub gateway: &'a GatewayRef,
@@ -104,6 +107,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
         _ => Authz::Required,
     };
     let rewrite_host = annotation(REWRITE_HOST_ANNOTATION);
+    let client_cert = annotation(CLIENT_CERT_ANNOTATION).as_deref() == Some("request");
 
     let mut unsupported = Vec::new();
     let mut unresolved = Vec::new();
@@ -144,6 +148,7 @@ pub(super) fn convert(o: &DynamicObject, ctx: &Ctx) -> Option<Outcome> {
                     rewrite_host: rewrite_host.clone(),
                     backend: backend.clone(),
                     filters: filters.clone(),
+                    client_cert,
                 });
             }
         }
@@ -291,7 +296,12 @@ fn resolve_backend(b: &BackendRef, route_ns: &str, ctx: &Ctx) -> Result<Backend,
     };
     let ns = b.namespace.as_deref().unwrap_or(route_ns);
     // Checked before existence, so a route cannot probe another namespace's Services.
-    if ns != route_ns && !ctx.grants.iter().any(|g| g.permits(route_ns, ns, &b.name)) {
+    if ns != route_ns
+        && !ctx
+            .grants
+            .iter()
+            .any(|g| g.permits("HTTPRoute", route_ns, "Service", ns, &b.name))
+    {
         return Err(problem(
             "RefNotPermitted",
             format!("backendRef {ns}/{} needs a ReferenceGrant in {ns}", b.name),

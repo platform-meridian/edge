@@ -219,15 +219,24 @@ impl ReferenceGrant {
         })
     }
 
-    pub fn permits(&self, route_ns: &str, service_ns: &str, service: &str) -> bool {
-        self.namespace == service_ns
-            && self.from.iter().any(|f| {
-                f.group == GATEWAY_GROUP && f.kind == "HTTPRoute" && f.namespace == route_ns
-            })
+    /// `from_kind` is a Gateway API kind, `to_kind` a core one.
+    pub fn permits(
+        &self,
+        from_kind: &str,
+        from_ns: &str,
+        to_kind: &str,
+        to_ns: &str,
+        to_name: &str,
+    ) -> bool {
+        self.namespace == to_ns
+            && self
+                .from
+                .iter()
+                .any(|f| f.group == GATEWAY_GROUP && f.kind == from_kind && f.namespace == from_ns)
             && self.to.iter().any(|t| {
                 t.group.is_empty()
-                    && t.kind == "Service"
-                    && t.name.as_deref().is_none_or(|n| n == service)
+                    && t.kind == to_kind
+                    && t.name.as_deref().is_none_or(|n| n == to_name)
             })
     }
 }

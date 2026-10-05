@@ -2,7 +2,9 @@
 
 use super::GatewayRef;
 use super::convert::{Ctx, Outcome, convert};
+use super::frontend::{Derived, derive};
 use super::schema::{Listener, ReferenceGrant};
+use super::trust::{Sources, thin_configmap};
 use crate::config::Route;
 use kube::ResourceExt;
 use kube::api::DynamicObject;
@@ -16,6 +18,8 @@ pub(super) enum Kind {
     Gateway,
     Service,
     Grant,
+    ConfigMap,
+    TrustBundle,
 }
 
 // Consumed one at a time, never stored; boxing would only allocate.
@@ -86,11 +90,14 @@ pub(super) struct State {
     gateways: Store,
     services: Store,
     grants: Store,
+    configmaps: Store,
+    bundles: Store,
 }
 
 pub(super) struct Built {
     pub table: Vec<Route>,
     pub outcomes: Vec<(DynamicObject, Outcome)>,
+    pub frontend: Derived,
 }
 
 impl State {
@@ -100,6 +107,8 @@ impl State {
             Kind::Gateway => &mut self.gateways,
             Kind::Service => &mut self.services,
             Kind::Grant => &mut self.grants,
+            Kind::ConfigMap => &mut self.configmaps,
+            Kind::TrustBundle => &mut self.bundles,
         }
     }
 
@@ -107,7 +116,11 @@ impl State {
     pub fn apply(&mut self, msg: Msg) -> bool {
         match msg {
             Msg::Event(k, ev) => {
-                let ev = if k == Kind::Service { thin(ev) } else { ev };
+                let ev = match k {
+                    Kind::Service => thin(ev),
+                    Kind::ConfigMap => thin_with(ev, thin_configmap),
+                    _ => ev,
+                };
                 let changes = !matches!(ev, Event::Init | Event::InitApply(_));
                 self.store(k).event(ev);
                 changes
@@ -121,16 +134,28 @@ impl State {
             && self.gateways.phase == Phase::Listed
             && self.services.phase != Phase::AwaitingFirstList
             && self.grants.phase != Phase::AwaitingFirstList
+            && self.configmaps.phase != Phase::AwaitingFirstList
+            && self.bundles.phase != Phase::AwaitingFirstList
+    }
+
+    fn sources(&self) -> Sources<'_> {
+        fn listed(s: &Store) -> Option<&BTreeMap<Key, DynamicObject>> {
+            (s.phase == Phase::Listed).then_some(&s.live)
+        }
+        Sources {
+            configmaps: listed(&self.configmaps),
+            bundles: listed(&self.bundles),
+        }
     }
 
     /// Without Services the existence check is skipped (the route would only
     /// 502); without ReferenceGrants every cross-namespace backend is refused.
     pub fn build(&self, gateway: &GatewayRef, statics: &[Route]) -> Built {
-        let listeners = self
+        let our_gateway = self
             .gateways
             .live
-            .get(&(gateway.namespace.clone(), gateway.name.clone()))
-            .map(Listener::all_of);
+            .get(&(gateway.namespace.clone(), gateway.name.clone()));
+        let listeners = our_gateway.map(Listener::all_of);
         let services: Option<BTreeSet<Key>> = (self.services.phase == Phase::Listed)
             .then(|| self.services.live.keys().cloned().collect());
         let grants: Vec<ReferenceGrant> = self
@@ -159,7 +184,12 @@ impl State {
         }
         // Stable sort: on a tie, statics then the oldest route win.
         table.sort_by(Route::precedence);
-        Built { table, outcomes }
+        let frontend = derive(our_gateway, gateway, &self.sources(), &grants, &table);
+        Built {
+            table,
+            outcomes,
+            frontend,
+        }
     }
 
     /// Gateway API conflict resolution: oldest first, then namespace/name.
@@ -175,15 +205,20 @@ impl State {
 
 /// Only a Service's existence matters; drop the rest to save memory.
 pub(super) fn thin(ev: Event<DynamicObject>) -> Event<DynamicObject> {
-    let identity_only = |mut o: DynamicObject| {
-        o.data = Value::Null;
+    thin_with(ev, |o| o.data = Value::Null)
+}
+
+fn thin_with(ev: Event<DynamicObject>, keep: fn(&mut DynamicObject)) -> Event<DynamicObject> {
+    let thinned = |mut o: DynamicObject| {
+        keep(&mut o);
         o.metadata.managed_fields = None;
+        o.metadata.annotations = None;
         o
     };
     match ev {
-        Event::Apply(o) => Event::Apply(identity_only(o)),
-        Event::Delete(o) => Event::Delete(identity_only(o)),
-        Event::InitApply(o) => Event::InitApply(identity_only(o)),
+        Event::Apply(o) => Event::Apply(thinned(o)),
+        Event::Delete(o) => Event::Delete(thinned(o)),
+        Event::InitApply(o) => Event::InitApply(thinned(o)),
         e => e,
     }
 }
@@ -299,6 +334,7 @@ mod tests {
                 port: 1,
             }),
             filters: Default::default(),
+            client_cert: false,
         }
     }
 
@@ -313,6 +349,7 @@ mod tests {
                 port,
             }),
             filters: Default::default(),
+            client_cert: false,
         }
     }
 
@@ -349,6 +386,8 @@ mod tests {
             c.list(Kind::Gateway, vec![gateway_obj(listeners)]);
             c.fail(Kind::Service);
             c.fail(Kind::Grant);
+            c.fail(Kind::ConfigMap);
+            c.fail(Kind::TrustBundle);
             c
         }
 
@@ -467,6 +506,13 @@ mod tests {
             "ReferenceGrants have neither listed nor failed"
         );
         c.fail(Kind::Grant);
+        c.fail(Kind::ConfigMap);
+        assert_eq!(
+            c.table(),
+            file,
+            "ClusterTrustBundles have neither listed nor failed"
+        );
+        c.fail(Kind::TrustBundle);
         assert_eq!(c.table().len(), 2);
     }
 
@@ -624,6 +670,8 @@ mod tests {
         c.list(Kind::Gateway, vec![]);
         c.fail(Kind::Service);
         c.fail(Kind::Grant);
+        c.fail(Kind::ConfigMap);
+        c.fail(Kind::TrustBundle);
         let (t, c) = c.one(svc_spec(), json!({}));
         assert!(t.is_empty());
         assert_eq!(verdicts(c.outcome("t")).0, no_parent, "missing Gateway");
@@ -768,6 +816,8 @@ mod tests {
             let mut c = Cluster::new(vec![]);
             c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
             c.fail(Kind::Service);
+            c.fail(Kind::ConfigMap);
+            c.fail(Kind::TrustBundle);
             c.list(Kind::Grant, grants);
             let (t, c) = c.one(
                 backend_ref(json!({ "name": "db", "namespace": "data", "port": 80 })),
@@ -791,6 +841,8 @@ mod tests {
         c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
         c.list(Kind::Service, vec![service("apps", "present")]);
         c.fail(Kind::Grant);
+        c.fail(Kind::ConfigMap);
+        c.fail(Kind::TrustBundle);
         let route = |name, svc| {
             http_route(
                 "apps",
@@ -1328,5 +1380,243 @@ mod tests {
             json!({ "name": "edge", "namespace": "edge", "kind": "Gateway", "group": GATEWAY_GROUP })
         );
         assert_eq!(o.accepted.message, "1 route(s) served");
+    }
+
+    fn ca_pem() -> String {
+        crate::testutil::ClientCa::new("operators").pem
+    }
+
+    fn configmap(ns: &str, name: &str, ca: &str) -> DynamicObject {
+        let mut o = obj("v1", "ConfigMap", ns, name, T0, json!({}), json!(null));
+        o.data = json!({ "data": { "ca.crt": ca, "other": "dropped" } });
+        o
+    }
+
+    fn gateway_with_tls(tls: Value) -> DynamicObject {
+        let mut g = gateway_obj(all_ns());
+        g.data["spec"]["tls"] = tls;
+        g
+    }
+
+    fn validation(mode: &str, refs: Value) -> Value {
+        json!({ "validation": { "mode": mode, "caCertificateRefs": refs } })
+    }
+
+    fn cm(name: &str) -> Value {
+        json!({ "group": "", "kind": "ConfigMap", "name": name })
+    }
+
+    fn frontend_cluster(
+        tls: Value,
+        cms: Vec<DynamicObject>,
+        grants: Vec<DynamicObject>,
+    ) -> Cluster {
+        let mut c = Cluster::new(vec![]);
+        c.list(Kind::Gateway, vec![gateway_with_tls(tls)]);
+        c.fail(Kind::Service);
+        c.list(Kind::Grant, grants);
+        c.list(Kind::ConfigMap, cms);
+        c.fail(Kind::TrustBundle);
+        let marked = http_route(
+            "apps",
+            "elf",
+            T0,
+            json!({ "edge.meridian/client-certificate": "request" }),
+            json!({ "hostnames": ["ELF.example"], "rules": [{ "backendRefs": [{ "name": "jel", "port": 443 }] }] }),
+        );
+        let other = http_route(
+            "apps",
+            "ui",
+            T0,
+            json!({ "edge.meridian/client-certificate": "yes" }),
+            json!({ "hostnames": ["ui.example"], "rules": [{ "backendRefs": [{ "name": "ui", "port": 80 }] }] }),
+        );
+        c.list(Kind::Route, vec![marked, other]);
+        c
+    }
+
+    fn derived(c: &Cluster) -> &crate::controller::frontend::Derived {
+        &c.last.as_ref().unwrap().frontend
+    }
+
+    #[test]
+    fn frontend_from_gateway_and_annotated_routes() {
+        use crate::tls::Mode;
+        let pem = ca_pem();
+        let c = frontend_cluster(
+            json!({ "frontend": { "default": validation("AllowInsecureFallback", json!([cm("operators")])) } }),
+            vec![configmap("edge", "operators", &pem)],
+            vec![],
+        );
+        let f = derived(&c).frontend.clone().unwrap();
+        assert_eq!(f.mode, Mode::AllowInsecureFallback);
+        assert_eq!(f.ca_pem.trim(), pem.trim());
+        assert_eq!(
+            f.names,
+            ["elf.example".to_string()].into(),
+            "only `request` marks"
+        );
+        assert!(
+            derived(&c).problems.is_empty(),
+            "{:?}",
+            derived(&c).problems
+        );
+        let elf = c
+            .table()
+            .into_iter()
+            .find(|r| r.hostname.as_deref() == Some("elf.example"));
+        assert!(elf.unwrap().client_cert);
+    }
+
+    #[test]
+    fn frontend_per_port_outranks_default() {
+        use crate::tls::Mode;
+        let (a, b) = (ca_pem(), ca_pem());
+        let tls = |port: u16| {
+            json!({ "frontend": {
+                "default": validation("AllowInsecureFallback", json!([cm("a")])),
+                "perPort": [{ "port": port, "tls": validation("AllowValidOnly", json!([cm("b")])) }],
+            } })
+        };
+        let cms = || vec![configmap("edge", "a", &a), configmap("edge", "b", &b)];
+        let c = frontend_cluster(tls(8443), cms(), vec![]);
+        let f = derived(&c).frontend.clone().unwrap();
+        assert_eq!((f.mode, f.ca_pem.trim()), (Mode::AllowValidOnly, b.trim()));
+        let c = frontend_cluster(tls(9443), cms(), vec![]);
+        let f = derived(&c).frontend.clone().unwrap();
+        assert_eq!(
+            (f.mode, f.ca_pem.trim()),
+            (Mode::AllowInsecureFallback, a.trim())
+        );
+        let c = frontend_cluster(json!({}), cms(), vec![]);
+        assert_eq!(derived(&c).frontend, None);
+        let c = frontend_cluster(
+            json!({ "frontend": { "default": { "validation": { "caCertificateRefs": [cm("a")] } } } }),
+            cms(),
+            vec![],
+        );
+        assert_eq!(
+            derived(&c).frontend.clone().unwrap().mode,
+            Mode::AllowValidOnly,
+            "the default mode"
+        );
+    }
+
+    #[test]
+    fn frontend_follows_configmap_changes() {
+        let (a, b) = (ca_pem(), ca_pem());
+        let mut c = frontend_cluster(
+            json!({ "frontend": { "default": validation("AllowInsecureFallback", json!([cm("operators")])) } }),
+            vec![],
+            vec![],
+        );
+        let pem = |c: &Cluster| derived(c).frontend.clone().unwrap().ca_pem;
+        assert_eq!(pem(&c), "");
+        assert_eq!(derived(&c).problems.len(), 2, "{:?}", derived(&c).problems);
+        c.apply(Kind::ConfigMap, configmap("edge", "operators", &a));
+        assert_eq!(pem(&c).trim(), a.trim());
+        c.apply(Kind::ConfigMap, configmap("edge", "operators", &b));
+        assert_eq!(pem(&c).trim(), b.trim(), "a changed ConfigMap reloads");
+        c.delete(Kind::ConfigMap, configmap("edge", "operators", &b));
+        assert_eq!(pem(&c), "");
+    }
+
+    #[test]
+    fn frontend_refs_resolve_or_say_why() {
+        let pem = ca_pem();
+        let grant_cm = |from_ns: &str| {
+            obj(
+                "gateway.networking.k8s.io/v1beta1",
+                "ReferenceGrant",
+                "pki",
+                "g",
+                T0,
+                json!({}),
+                json!({ "from": [{ "group": GATEWAY_GROUP, "kind": "Gateway", "namespace": from_ns }],
+                        "to": [{ "group": "", "kind": "ConfigMap" }] }),
+            )
+        };
+        let other_ns =
+            json!([{ "group": "", "kind": "ConfigMap", "name": "cas", "namespace": "pki" }]);
+        for (what, refs, grants, ok, problem) in [
+            (
+                "cross-namespace with a grant",
+                other_ns.clone(),
+                vec![grant_cm("edge")],
+                true,
+                None,
+            ),
+            (
+                "cross-namespace without",
+                other_ns.clone(),
+                vec![],
+                false,
+                Some("ReferenceGrant"),
+            ),
+            (
+                "grant from elsewhere",
+                other_ns,
+                vec![grant_cm("apps")],
+                false,
+                Some("ReferenceGrant"),
+            ),
+            (
+                "a Secret",
+                json!([{ "group": "", "kind": "Secret", "name": "x" }]),
+                vec![],
+                false,
+                Some("only ConfigMap"),
+            ),
+            (
+                "missing",
+                json!([cm("nope")]),
+                vec![],
+                false,
+                Some("does not exist"),
+            ),
+            (
+                "one good one bad",
+                json!([cm("nope"), cm("here")]),
+                vec![],
+                true,
+                Some("does not exist"),
+            ),
+        ] {
+            let c = frontend_cluster(
+                json!({ "frontend": { "default": validation("AllowValidOnly", refs) } }),
+                vec![
+                    configmap("pki", "cas", &pem),
+                    configmap("edge", "here", &pem),
+                ],
+                grants,
+            );
+            let d = derived(&c);
+            let f = d.frontend.clone().unwrap();
+            assert_eq!(!f.ca_pem.is_empty(), ok, "{what}");
+            match problem {
+                None => assert!(d.problems.is_empty(), "{what}: {:?}", d.problems),
+                Some(p) => assert!(
+                    d.problems.iter().any(|x| x.contains(p)),
+                    "{what}: {:?}",
+                    d.problems
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn configmaps_kept_to_ca_crt() {
+        let mut c = frontend_cluster(json!({}), vec![], vec![]);
+        c.apply(Kind::ConfigMap, configmap("edge", "x", "pem"));
+        let kept = &c.state.configmaps.live[&("edge".to_string(), "x".to_string())];
+        assert_eq!(kept.data, json!({ "data": { "ca.crt": "pem" } }));
+        c.apply(
+            Kind::ConfigMap,
+            obj("v1", "ConfigMap", "edge", "y", T0, json!({}), json!(null)),
+        );
+        assert_eq!(
+            c.state.configmaps.live[&("edge".to_string(), "y".to_string())].data,
+            Value::Null
+        );
     }
 }

@@ -8,14 +8,31 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConnInfo {
     pub peer: SocketAddr,
     /// Decides the forwarded scheme; nothing the client sends does.
     pub tls: bool,
+    pub handshake: crate::tls::Handshake,
 }
 
 impl ConnInfo {
+    pub fn plain(peer: SocketAddr) -> Self {
+        Self {
+            peer,
+            tls: false,
+            handshake: Default::default(),
+        }
+    }
+
+    pub fn tls(peer: SocketAddr, handshake: crate::tls::Handshake) -> Self {
+        Self {
+            peer,
+            tls: true,
+            handshake,
+        }
+    }
+
     pub(super) fn scheme(&self) -> &'static str {
         if self.tls { "https" } else { "http" }
     }
@@ -203,10 +220,7 @@ mod tests {
     #[test]
     fn ipv6_peer_bracketed() {
         let mut h = HeaderMap::new();
-        let conn = ConnInfo {
-            peer: "[2001:db8::1]:443".parse().unwrap(),
-            tls: true,
-        };
+        let conn = ConnInfo::tls("[2001:db8::1]:443".parse().unwrap(), Default::default());
         set_forwarded(&mut h, &conn, None);
         assert_eq!(h["forwarded"], "for=\"[2001:db8::1]\";proto=https");
         assert_eq!(h["x-forwarded-for"], "2001:db8::1");
