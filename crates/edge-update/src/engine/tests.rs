@@ -91,6 +91,8 @@ pub(crate) struct World {
     apply_refused: bool,
     no_store: bool,
     install_fails: bool,
+    /// Reboot requests are taken but the unit stays up.
+    reboot_hangs: bool,
 
     /// Every change to the unit, in order.
     log: Vec<String>,
@@ -163,6 +165,7 @@ impl World {
             apid_down: false,
             apiserver_down: false,
             registry_free: 1 << 40,
+            reboot_hangs: false,
         }
     }
 
@@ -395,7 +398,9 @@ impl Talos for FakeTalos {
     async fn reboot(&self) -> anyhow::Result<()> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        w.power_cycle();
+        if !w.reboot_hangs {
+            w.power_cycle();
+        }
         w.change("reboot".into())
     }
     async fn rollback(&self) -> anyhow::Result<()> {
@@ -1915,6 +1920,30 @@ async fn step_until(h: &mut Harness, at: impl Fn(&Phase) -> bool) {
         }
     }
     panic!("never reached the phase");
+}
+
+#[tokio::test]
+async fn a_reboot_underway_is_not_requested_again() {
+    let mut h = Harness::new();
+    h.w().reboot_hangs = true;
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| matches!(p, Phase::Rebooting { .. })).await;
+    let reboots = |h: &Harness| h.w().log.iter().filter(|l| *l == "reboot").count();
+    let start = h.clock.load(Ordering::SeqCst);
+    while h.clock.load(Ordering::SeqCst) - start <= 2 * REBOOT {
+        let Tick::Wait(d) = h.e().step().await.unwrap() else {
+            panic!("left the phase");
+        };
+        assert_eq!(reboots(&h), 1, "requested again while rebooting");
+        h.clock.fetch_add(d.as_secs() as i64, Ordering::SeqCst);
+        h.reopen();
+    }
+    h.e().step().await.unwrap();
+    assert_eq!(
+        reboots(&h),
+        2,
+        "a reboot that never came is not requested again"
+    );
 }
 
 async fn applied(h: &mut Harness, s: &Spec) {

@@ -65,6 +65,8 @@ pub enum Phase {
     Installing,
     Rebooting {
         boot_id: String,
+        /// When the reboot was last requested.
+        asked: Option<i64>,
     },
     Trial,
     Settling,
@@ -768,7 +770,7 @@ impl Engine {
             Phase::Snapshotting => self.snapshotting().await?,
             Phase::Staging => self.staging().await?,
             Phase::Installing => self.installing().await?,
-            Phase::Rebooting { boot_id } => self.rebooting(&boot_id).await?,
+            Phase::Rebooting { boot_id, asked } => self.rebooting(boot_id, asked).await?,
             Phase::Trial => self.trial().await?,
             Phase::Settling => self.settling().await?,
             Phase::Seeding => self.seeding().await?,
@@ -1566,6 +1568,7 @@ impl Engine {
         {
             return Ok(Go(Phase::Rebooting {
                 boot_id: self.boot_id().await?,
+                asked: None,
             }));
         }
         let rel = self.release()?.clone();
@@ -1602,12 +1605,22 @@ impl Engine {
         }
         Ok(Go(Phase::Rebooting {
             boot_id: self.boot_id().await?,
+            asked: None,
         }))
     }
 
-    async fn rebooting(&mut self, before: &str) -> anyhow::Result<Next> {
+    async fn rebooting(&mut self, before: String, asked: Option<i64>) -> anyhow::Result<Next> {
         if self.boot_id().await? == before {
-            self.talos.reboot().await?;
+            // A second request cancels a reboot underway, as it stops pods.
+            let now = (self.now)();
+            if asked.is_none_or(|t| now - t > 2 * self.reboot_secs().max(REBOOT)) {
+                self.talos.reboot().await?;
+                self.record.phase = Phase::Rebooting {
+                    boot_id: before,
+                    asked: Some(now),
+                };
+                self.save()?;
+            }
             return poll(30, "rebooting into the new OS");
         }
         if self.left_old_os().await? {
