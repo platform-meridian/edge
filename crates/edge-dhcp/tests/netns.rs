@@ -330,7 +330,8 @@ fn inside() {
         recorded,
         "the restart forgot the lease"
     );
-    assert!(laptop.dhcp("laptop", 15, &[]));
+    // Rebooting for the whole run: a slow reply must not send dhcpcd back to DISCOVER.
+    assert!(laptop.dhcp("laptop", 15, &["--reboot", "15"]));
     assert_eq!(laptop.addr("laptop").as_deref(), Some("10.51.0.150/24"));
     dhcp.wait_for("addr=10.51.0.150");
     assert!(

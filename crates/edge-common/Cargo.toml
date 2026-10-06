@@ -16,6 +16,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "socket", "net"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 tempfile = "3"

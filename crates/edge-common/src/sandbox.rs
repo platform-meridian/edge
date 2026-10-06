@@ -323,6 +323,7 @@ mod tests {
 
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -421,16 +422,26 @@ mod tests {
         std::fs::remove_file(&b)
     }
 
+    /// SO_REUSEPORT: a port the test holds stays bindable to the child, and no
+    /// other process can take it in between.
     fn bind(port: u16) -> io::Result<TcpListener> {
-        TcpListener::bind(("127.0.0.1", port))
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, setsockopt, socket, sockopt,
+        };
+        let fd = socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        setsockopt(&fd, sockopt::ReusePort, &true)?;
+        nix::sys::socket::bind(fd.as_raw_fd(), &SockaddrIn::new(127, 0, 0, 1, port))?;
+        nix::sys::socket::listen(&fd, Backlog::MAXCONN)?;
+        Ok(fd.into())
     }
 
     fn dial(port: u16) -> io::Result<TcpStream> {
         TcpStream::connect(("127.0.0.1", port))
-    }
-
-    fn free_port() -> u16 {
-        bind(0).unwrap().local_addr().unwrap().port()
     }
 
     fn listening() -> (TcpListener, u16) {
@@ -488,7 +499,7 @@ mod tests {
         std::fs::write(&config, "listen: x\n").unwrap();
         projected(&d.join("tls"), "..v1", "tls.crt", "one");
         let (cert, key) = (d.join("tls/tls.crt"), d.join("tls/tls.key"));
-        let (listen, other) = (free_port(), free_port());
+        let ((_listen, listen), (_other, other)) = (listening(), listening());
         let (_backend, backend) = listening();
 
         // The kubelet, outside the sandbox, rotates the secret once the child is restricted.
@@ -530,7 +541,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         let secret = outside(d);
-        let (listen, other) = (free_port(), free_port());
+        let ((_listen, listen), (_other, other)) = (listening(), listening());
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
         sandboxed(
@@ -561,7 +572,7 @@ mod tests {
         std::fs::create_dir_all(d.join("pki")).unwrap();
         std::fs::write(d.join("pki/server.crt"), b"c").unwrap();
         let (cert, key) = (d.join("pki/server.crt"), d.join("pki/server.key"));
-        let (listen, other) = (free_port(), free_port());
+        let ((_listen, listen), (_other, other)) = (listening(), listening());
         let (_peer, peer) = listening();
         sandboxed(
             || state(&log, &[&cert, &key], &format!("0.0.0.0:{listen}")),
@@ -603,7 +614,7 @@ mod tests {
         let _other = UnixListener::bind(d.join("elsewhere/x.sock")).unwrap();
         let (_probe, probe) = listening();
         let open_rw = |p: &Path| std::fs::OpenOptions::new().write(true).open(p);
-        let port = free_port();
+        let (_port, port) = listening();
         sandboxed(
             || {
                 watch(Watch {
@@ -659,7 +670,7 @@ mod tests {
         let _machined = UnixListener::bind(d.join("machined/machine.sock")).unwrap();
         let _other = UnixListener::bind(d.join("elsewhere/x.sock")).unwrap();
         let (_tcp, tcp) = listening();
-        let port = free_port();
+        let (_port, port) = listening();
         sandboxed(
             || {
                 scope(Scope {
@@ -709,7 +720,7 @@ mod tests {
         std::fs::create_dir_all(d.join("cg/pod")).unwrap();
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
-        let (port, health) = (free_port(), free_port());
+        let ((_port, port), (_health, health)) = (listening(), listening());
         sandboxed(
             || {
                 set_api_port(api);
@@ -739,7 +750,7 @@ mod tests {
         let secret = outside(d);
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
-        let (port, health) = (free_port(), free_port());
+        let ((_port, port), (_health, health)) = (listening(), listening());
         sandboxed(
             || {
                 set_api_port(api);
@@ -763,7 +774,7 @@ mod tests {
         let secret = outside(d);
         let root = d.join("store");
         std::fs::create_dir_all(root.join("blobs")).unwrap();
-        let (listen, other) = (free_port(), free_port());
+        let ((_listen, listen), (_other, other)) = (listening(), listening());
         let (_upstream, upstream) = listening();
         let (_tcp, tcp) = listening();
         sandboxed(
@@ -802,7 +813,7 @@ mod tests {
         let d = tmp.path();
         let secret = outside(d);
         let (_tcp, tcp) = listening();
-        let port = free_port();
+        let (_port, port) = listening();
         sandboxed(
             || dhcp(None),
             || {
@@ -831,7 +842,7 @@ mod tests {
         std::fs::write(registry.join("blobs/layer"), b"l").unwrap();
         let (root, state) = (d.join("lib/containerd"), d.join("lib/edge-layers"));
         let (_tcp, tcp) = listening();
-        let port = free_port();
+        let (_port, port) = listening();
         sandboxed(
             || layers(&root, &state, &d.join("imagecache"), &registry),
             || {
@@ -860,7 +871,7 @@ mod tests {
         let (bpf, bin, conf) = (d.join("bpf"), d.join("bin"), d.join("net.d"));
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
-        let port = free_port();
+        let (_port, port) = listening();
         sandboxed(
             || {
                 set_api_port(api);
