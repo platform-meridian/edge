@@ -1,5 +1,5 @@
 # Meridian Edge's workloads. The consumer supplies, before applying:
-#   @OPERATOR_DOMAIN@, @OPERATOR_ADDR@  the domain and address the unit is reached by
+#   @OPERATOR_DOMAIN@                   the domain the unit is reached by
 #   @APISERVER_HOST@, @APISERVER_PORT@  the node's own apiserver
 #   @CLUSTER_DNS@                       the kubelet's clusterDNS address
 #   the Gateway API CRDs

@@ -13,6 +13,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use time::OffsetDateTime;
 use x509_parser::certificate::X509Certificate;
+use x509_parser::extensions::GeneralName;
 
 const EPHEMERAL_LIFETIME: i64 = 10 * 365 * 86_400;
 /// The shortest leaf kube-apiserver accepts: a CA with less left cannot sign.
@@ -23,6 +24,47 @@ pub struct Ca {
     certs: Vec<String>,
     chain_not_after: i64,
     ephemeral: bool,
+    ip_constraints: Vec<IpConstraints>,
+}
+
+/// One certificate's iPAddress name constraints, each an address then its mask.
+struct IpConstraints {
+    permitted: Option<Vec<Vec<u8>>>,
+    excluded: Vec<Vec<u8>>,
+}
+
+impl IpConstraints {
+    fn of(c: &X509Certificate) -> Self {
+        let nc = c.name_constraints().ok().flatten().map(|e| e.value);
+        let ips = |subtrees: Option<&Vec<x509_parser::extensions::GeneralSubtree>>| {
+            subtrees
+                .into_iter()
+                .flatten()
+                .filter_map(|t| match t.base {
+                    GeneralName::IPAddress(b) => Some(b.to_vec()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let permitted = ips(nc.and_then(|n| n.permitted_subtrees.as_ref()));
+        Self {
+            permitted: (!permitted.is_empty()).then_some(permitted),
+            excluded: ips(nc.and_then(|n| n.excluded_subtrees.as_ref())),
+        }
+    }
+
+    fn permit(&self, ip: &[u8]) -> bool {
+        let within = |t: &Vec<u8>| {
+            t.len() == 2 * ip.len()
+                && ip
+                    .iter()
+                    .zip(&t[..ip.len()])
+                    .zip(&t[ip.len()..])
+                    .all(|((i, a), m)| i & m == a & m)
+        };
+        self.permitted.as_ref().is_none_or(|p| p.iter().any(within))
+            && !self.excluded.iter().any(within)
+    }
 }
 
 pub struct Leaf {
@@ -125,7 +167,18 @@ impl Ca {
             certs: pems,
             chain_not_after: not_after,
             ephemeral: false,
+            ip_constraints: certs.iter().map(IpConstraints::of).collect(),
         })
+    }
+
+    /// A leaf naming an address the chain's name constraints exclude is
+    /// invalid whole.
+    pub fn permits(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V4(a) => a.octets().to_vec(),
+            IpAddr::V6(a) => a.octets().to_vec(),
+        };
+        self.ip_constraints.iter().all(|c| c.permit(&ip))
     }
 
     pub fn root(&self) -> &str {
@@ -180,6 +233,30 @@ impl Ca {
             not_after,
         })
     }
+}
+
+/// The IP addresses the chain's leaf names.
+pub fn leaf_addresses(chain: &str) -> Vec<IpAddr> {
+    let Ok(der) = CertificateDer::from_pem_slice(chain.as_bytes()) else {
+        return Vec::new();
+    };
+    let Ok((_, leaf)) = x509_parser::parse_x509_certificate(&der) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = leaf.subject_alternative_name() else {
+        return Vec::new();
+    };
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|n| match n {
+            GeneralName::IPAddress(b) => <[u8; 4]>::try_from(*b)
+                .map(IpAddr::from)
+                .or_else(|_| <[u8; 16]>::try_from(*b).map(IpAddr::from))
+                .ok(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn certificate_blocks(text: &str) -> Vec<String> {
@@ -482,7 +559,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn intermediate(by: &TestCert) -> TestCert {
+    pub fn intermediate(by: &TestCert) -> TestCert {
         let mut p = params(
             "unit CA",
             IsCa::Ca(BasicConstraints::Constrained(0)),
@@ -623,6 +700,62 @@ pub(crate) mod tests {
             verify(alone, &r.pem, "example.lan", NOW + 60).is_err(),
             "the intermediate is needed"
         );
+    }
+
+    #[test]
+    fn permits_only_addresses_the_chain_allows() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let unconstrained = file_ca(NOW);
+        for a in ["10.42.0.1", "192.0.2.1", "2001:db8::1"] {
+            assert!(unconstrained.permits(ip(a)), "{a}");
+        }
+
+        let r = root("operator root", NOW - 60, NOW + 20 * YEAR);
+        let i = intermediate(&r);
+        let ca = Ca::parse(file(&i, &[&i, &r]).as_bytes(), NOW).unwrap();
+        assert!(ca.permits(ip("127.0.0.1")));
+        assert!(!ca.permits(ip("10.42.0.1")));
+        assert!(!ca.permits(ip("::1")), "v4 subtrees bar v6");
+
+        let mut p = params(
+            "unit CA",
+            IsCa::Ca(BasicConstraints::Constrained(0)),
+            NOW - 60,
+            NOW + YEAR,
+        );
+        p.name_constraints = Some(NameConstraints {
+            permitted_subtrees: vec![GeneralSubtree::DnsName("example.lan".into())],
+            excluded_subtrees: vec![GeneralSubtree::IpAddress(rcgen::CidrSubnet::V4(
+                [10, 42, 0, 0],
+                [255, 255, 0, 0],
+            ))],
+        });
+        let i = make_cert(p, &PKCS_ECDSA_P256_SHA256, Some(&r));
+        let ca = Ca::parse(file(&i, &[&i, &r]).as_bytes(), NOW).unwrap();
+        assert!(!ca.permits(ip("10.42.7.1")));
+        assert!(ca.permits(ip("10.43.0.1")));
+        assert!(ca.permits(ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn leaf_addresses_read_back() {
+        let ca = file_ca(NOW);
+        let ips: Vec<IpAddr> = ["10.42.0.1", "2001:db8::1", "127.0.0.1"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let (_, csr) = csr(&PKCS_ECDSA_P256_SHA256);
+        let leaf = ca
+            .issue(
+                &requested_key(&csr).unwrap(),
+                &["example.lan".into()],
+                &ips,
+                NOW,
+                3600,
+            )
+            .unwrap();
+        assert_eq!(leaf_addresses(&leaf.chain), ips);
+        assert!(leaf_addresses("not a chain").is_empty());
     }
 
     #[test]

@@ -76,7 +76,7 @@ spec:
                   credentialBundlePath: credentialbundle.pem
                   userAnnotations:
                     edge.meridian/dns-names: "*.@OPERATOR_DOMAIN@,@OPERATOR_DOMAIN@,localhost"
-                    edge.meridian/ip-addresses: "@OPERATOR_ADDR@,127.0.0.1"
+                    edge.meridian/ip-addresses: "node,127.0.0.1"
 ---
 apiVersion: v1
 kind: ServiceAccount

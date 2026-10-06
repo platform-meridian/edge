@@ -1093,6 +1093,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "nix 0.31.3",
  "rcgen",
  "rustls",
  "rustls-pki-types",

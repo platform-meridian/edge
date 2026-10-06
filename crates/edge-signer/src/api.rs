@@ -23,6 +23,8 @@ pub struct Spec {
     pub pod_name: String,
     #[serde(default, rename = "podUID")]
     pub pod_uid: String,
+    #[serde(default)]
+    pub node_name: String,
     pub max_expiration_seconds: Option<i32>,
     #[serde(rename = "stubPKCS10Request")]
     pub stub_pkcs10_request: ByteString,
@@ -96,6 +98,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(pending.spec.pod_uid, "u");
+        assert_eq!(pending.spec.node_name, "n");
         assert_eq!(pending.spec.stub_pkcs10_request.0, [1, 2, 3]);
         assert_eq!(pending.spec.max_expiration_seconds, Some(864000));
         assert_eq!(pending.spec.unverified_user_annotations.len(), 1);

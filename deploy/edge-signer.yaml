@@ -96,7 +96,8 @@ spec:
           image: "ghcr.io/platform-meridian/edge-signer"
           env:
             - { name: EDGE_SIGNER_DOMAIN, value: "@OPERATOR_DOMAIN@" }
-            - { name: EDGE_SIGNER_ADDRESSES, value: "@OPERATOR_ADDR@" }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
           ports:
             - { name: healthz, containerPort: 9750, protocol: TCP }
           resources:

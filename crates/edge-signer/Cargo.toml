@@ -20,6 +20,7 @@ anyhow.workspace = true
 tracing.workspace = true
 rcgen = { version = "0.14", features = ["x509-parser"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+nix = { workspace = true, features = ["net"] }
 time = "0.3"
 x509-parser = "0.18"
 

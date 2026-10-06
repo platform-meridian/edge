@@ -4,7 +4,10 @@
 //! A pod asks with its projection's `userAnnotations`:
 //!   edge.meridian/dns-names     comma-separated: localhost, the unit's domain,
 //!                               *.<domain> or <label>.<domain>
-//!   edge.meridian/ip-addresses  comma-separated: loopback or this unit's own
+//!   edge.meridian/ip-addresses  comma-separated: loopback, an address the
+//!                               node holds, or `node` for every one it holds;
+//!                               the signer has a `node` certificate reissued
+//!                               once the node gains an address
 
 use std::net::IpAddr;
 
@@ -13,19 +16,21 @@ use crate::api::Spec;
 pub const SIGNER: &str = "edge.meridian/node";
 const DNS_NAMES: &str = "edge.meridian/dns-names";
 const IP_ADDRESSES: &str = "edge.meridian/ip-addresses";
+const NODE: &str = "node";
 /// kube-apiserver's default when the pod names none.
 const DEFAULT_LIFETIME: i64 = 86_400;
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Unit {
     pub domain: Option<String>,
+    /// What the node holds now, as far as the CA may name it.
     pub addresses: Vec<IpAddr>,
 }
 
 impl Unit {
-    /// A bad entry is dropped, not fatal: requests naming it are denied and
+    /// A bad domain is dropped, not fatal: requests naming it are denied and
     /// say why.
-    pub fn new(domain: &str, addresses: &str) -> Self {
+    pub fn new(domain: &str) -> Self {
         let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let domain = if domain.is_empty() {
             None
@@ -35,23 +40,18 @@ impl Unit {
             tracing::error!(domain, "EDGE_SIGNER_DOMAIN: not a domain name; ignored");
             None
         };
-        let addresses = addresses
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| {
-                s.parse()
-                    .inspect_err(|_| {
-                        tracing::error!(
-                            address = s,
-                            "EDGE_SIGNER_ADDRESSES: not an address; ignored"
-                        )
-                    })
-                    .ok()
-            })
-            .collect();
-        Self { domain, addresses }
+        Self {
+            domain,
+            addresses: Vec::new(),
+        }
     }
+}
+
+/// Whether the request's addresses are whatever the node holds.
+pub fn follows_node(spec: &Spec) -> bool {
+    spec.unverified_user_annotations
+        .get(IP_ADDRESSES)
+        .is_some_and(|v| v.split(',').any(|s| s.trim().eq_ignore_ascii_case(NODE)))
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,13 +112,19 @@ pub fn decide(spec: &Spec, unit: &Unit) -> Decision {
     }
     let mut ips = Vec::new();
     for raw in annotation_list(IP_ADDRESSES) {
-        match raw.parse::<IpAddr>() {
-            Ok(ip) if ip.is_loopback() || unit.addresses.contains(&ip) => ips.push(ip),
+        let named = match raw.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() || unit.addresses.contains(&ip) => vec![ip],
+            Err(_) if raw == NODE => unit.addresses.clone(),
             _ => {
                 return invalid(format!(
-                    "{raw} is not a loopback address or one of this node's {:?}",
+                    "{raw} is not {NODE}, a loopback address or one of this node's {:?}",
                     unit.addresses
                 ));
+            }
+        };
+        for ip in named {
+            if !ips.contains(&ip) {
+                ips.push(ip);
             }
         }
     }
@@ -173,7 +179,10 @@ mod tests {
     }
 
     fn unit() -> Unit {
-        Unit::new("example.lan", "10.42.0.1")
+        Unit {
+            addresses: vec!["10.42.0.1".parse().unwrap()],
+            ..Unit::new("example.lan")
+        }
     }
 
     fn issue(annotations: &[(&str, &str)]) -> (Vec<String>, Vec<IpAddr>) {
@@ -305,7 +314,7 @@ mod tests {
             Decision::Issue { dns, .. } => Ok(dns),
             Decision::Deny { reason, message } => Err((reason, message)),
         };
-        let site = Unit::new(" Site.Example. ", "");
+        let site = Unit::new(" Site.Example. ");
         assert_eq!(site.domain.as_deref(), Some("site.example"));
         assert_eq!(
             names(
@@ -325,32 +334,45 @@ mod tests {
         assert!(message.contains("site.example"), "{message}");
         assert!(names(&site, "a.example.lan").is_err());
 
-        for none in [
-            Unit::new("", ""),
-            Unit::new("bad_domain", ""),
-            Unit::new("-a.lan", ""),
-        ] {
+        for none in [Unit::new(""), Unit::new("bad_domain"), Unit::new("-a.lan")] {
             assert_eq!(none.domain, None);
             assert_eq!(names(&none, "localhost").unwrap(), ["localhost"]);
             assert!(names(&none, "example.lan").is_err());
             assert!(names(&none, "a.example.lan").is_err());
         }
         assert_eq!(
-            Unit::new(&"a.".repeat(127), "").domain,
+            Unit::new(&"a.".repeat(127)).domain,
             Some("a.".repeat(126) + "a")
         );
-        assert_eq!(Unit::new(&("a.".repeat(126) + "ab"), "").domain, None);
+        assert_eq!(Unit::new(&("a.".repeat(126) + "ab")).domain, None);
     }
 
     #[test]
-    fn bad_addresses_are_dropped() {
+    fn node_names_every_address_it_holds() {
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let mut unit = unit();
+        unit.addresses.push(v6);
+        let ips =
+            |unit: &Unit, value: &str| match decide(&spec(&[(IP_ADDRESSES, value)], None), unit) {
+                Decision::Issue { ips, .. } => ips,
+                d => panic!("{value}: {d:?}"),
+            };
+        let own: IpAddr = "10.42.0.1".parse().unwrap();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(ips(&unit, "Node,127.0.0.1"), [own, v6, lo]);
+        assert_eq!(ips(&unit, "10.42.0.1, node"), [own, v6]);
+        assert!(follows_node(&spec(
+            &[(IP_ADDRESSES, "127.0.0.1, Node ")],
+            None
+        )));
+        assert!(!follows_node(&spec(&[(IP_ADDRESSES, "10.42.0.1")], None)));
+        assert!(!follows_node(&spec(&[(DNS_NAMES, "node")], None)));
+
+        unit.addresses.clear();
+        assert_eq!(ips(&unit, "node,127.0.0.1"), [lo]);
         assert_eq!(
-            Unit::new("", " 10.42.0.1, nope,,::1 ").addresses,
-            [
-                "10.42.0.1".parse::<IpAddr>().unwrap(),
-                "::1".parse().unwrap()
-            ]
+            denied(&[(IP_ADDRESSES, "nodes")]),
+            "InvalidUnverifiedUserAnnotations"
         );
-        assert!(Unit::new("", "").addresses.is_empty());
     }
 }

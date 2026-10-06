@@ -2,6 +2,7 @@
 //! a ClusterTrustBundle. A certificate issued while the clock ran ahead starts in the
 //! future once the clock steps back, and kubelet renews it only at its equally future
 //! refresh time, so the signer deletes that pod for its controller to recreate.
+//! It does the same when the node gains an address a `node` certificate lacks.
 
 mod api;
 mod ca;
@@ -9,6 +10,7 @@ mod kubelet;
 mod policy;
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use edge_common::health::Heartbeat;
@@ -47,11 +49,16 @@ const CLOCK_SKEW_SECS: i64 = 300;
 fn main() -> anyhow::Result<()> {
     edge_common::init_tracing();
     let env = |name| std::env::var(name).unwrap_or_default();
-    let unit = Unit::new(&env("EDGE_SIGNER_DOMAIN"), &env("EDGE_SIGNER_ADDRESSES"));
+    let node = env("NODE_NAME");
+    anyhow::ensure!(
+        !node.is_empty(),
+        "NODE_NAME: unset; set it from spec.nodeName"
+    );
+    let unit = Unit::new(&env("EDGE_SIGNER_DOMAIN"));
     let health =
         std::env::var("EDGE_SIGNER_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:9750".into());
     edge_common::sandbox::restrict(&edge_common::sandbox::signer(&health));
-    run(health, &unit)
+    run(health, &node, &unit)
 }
 
 fn now() -> i64 {
@@ -61,7 +68,7 @@ fn now() -> i64 {
 }
 
 #[tokio::main]
-async fn run(health: String, unit: &Unit) -> anyhow::Result<()> {
+async fn run(health: String, node: &str, unit: &Unit) -> anyhow::Result<()> {
     let mut term = edge_common::Terminator::new();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let heartbeat = Heartbeat::default();
@@ -74,6 +81,7 @@ async fn run(health: String, unit: &Unit) -> anyhow::Result<()> {
         signer = SIGNER,
         bundle = BUNDLE_NAME,
         ca = ca::SECRET,
+        node,
         ?unit,
         "edge-signer: ready"
     );
@@ -92,7 +100,7 @@ async fn run(health: String, unit: &Unit) -> anyhow::Result<()> {
         }
     };
     tokio::select! {
-        r = serve(client, unit, &heartbeat) => r,
+        r = serve(client, node, unit, host_addresses, &heartbeat) => r,
         _ = term.wait() => Ok(()),
     }
 }
@@ -135,9 +143,42 @@ impl CaSecret {
     }
 }
 
+/// Every address a client could reach the host on. Polled, as edge-cni polls
+/// its node addresses: a link change is seen within a tick.
+fn host_addresses() -> nix::Result<Vec<IpAddr>> {
+    let mut out: Vec<IpAddr> = nix::ifaddrs::getifaddrs()?
+        .filter_map(|i| {
+            let a = i.address?;
+            a.as_sockaddr_in()
+                .map(|s| IpAddr::V4(s.ip()))
+                .or_else(|| a.as_sockaddr_in6().map(|s| IpAddr::V6(s.ip())))
+        })
+        .filter(reachable)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn reachable(ip: &IpAddr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && match ip {
+            IpAddr::V4(a) => !a.is_link_local() && !a.is_broadcast(),
+            IpAddr::V6(a) => !a.is_unicast_link_local(),
+        }
+}
+
 /// Beats only from the loop itself, so a wedged loop goes stale while an
 /// apiserver outage does not.
-async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Result<()> {
+async fn serve(
+    client: Client,
+    node: &str,
+    unit: &Unit,
+    host: impl Fn() -> nix::Result<Vec<IpAddr>>,
+    heartbeat: &Heartbeat,
+) -> anyhow::Result<()> {
     let requests: Api<PodCertificateRequest> = Api::all(client.clone());
     let secrets: Api<Secret> = Api::default_namespaced(client.clone());
     let csrs: Api<CertificateSigningRequest> = Api::all(client.clone());
@@ -173,12 +214,15 @@ async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Re
     let mut status_outage = edge_common::Outage::default();
     let mut pod_outage = edge_common::Outage::default();
     let mut approval_outage = edge_common::Outage::default();
+    let mut address_outage = edge_common::Outage::default();
+    let mut unit = unit.clone();
+    let mut held = Vec::new();
     let mut tick = tokio::time::interval(RETRY_INTERVAL);
     loop {
         heartbeat.beat();
         tokio::select! {
             ev = events.next() => match ev {
-                Some(Ok(ev)) => apply_event(&mut pending, &mut issued, ev),
+                Some(Ok(ev)) => apply_event(node, &mut pending, &mut issued, ev),
                 Some(Err(_)) => continue,
                 None => events = watch_requests(),
             },
@@ -209,6 +253,21 @@ async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Re
             }
             None => source.insert(Source::new(known, now)?),
         };
+        let r = host();
+        address_outage.observe("node addresses", &r);
+        if let Ok(now_held) = r {
+            held = now_held;
+        }
+        let permitted: Vec<IpAddr> = held
+            .iter()
+            .copied()
+            .filter(|ip| source.ca.permits(*ip))
+            .collect();
+        if permitted != unit.addresses {
+            tracing::info!(addresses = ?permitted, ?held, "node addresses");
+            unit.addresses = permitted;
+        }
+
         let root = source.ca.root();
         if bundle_due(&published, root) {
             let r = bounded(publish(&bundles, root)).await;
@@ -221,7 +280,7 @@ async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Re
 
         let mut settled = Vec::new();
         for (key, pcr) in &pending {
-            let status = settle(pcr, &source.ca, unit, now);
+            let status = settle(pcr, &source.ca, &unit, now);
             let requests = Api::<PodCertificateRequest>::namespaced(client.clone(), &key.0);
             let r = bounded(requests.patch_status(
                 &key.1,
@@ -240,8 +299,10 @@ async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Re
             pending.remove(&key);
         }
 
-        let mut recreated = Vec::new();
-        for (key, cert) in issued.iter().filter(|(_, c)| c.dated_ahead(now)) {
+        for (key, why) in due(&issued, &unit.addresses, now) {
+            let Some(cert) = issued.get(&key) else {
+                continue;
+            };
             let pods = Api::<Pod>::namespaced(client.clone(), &key.0);
             let r = bounded(recreate(&pods, cert)).await;
             heartbeat.beat();
@@ -252,16 +313,42 @@ async fn serve(client: Client, unit: &Unit, heartbeat: &Heartbeat) -> anyhow::Re
                         namespace = key.0,
                         pod = cert.pod,
                         not_before = %time(cert.not_before).0,
-                        "certificate dated ahead of the clock: pod deleted for recreation"
+                        addresses = ?cert.ips,
+                        "{why}: pod deleted for recreation"
                     );
                 }
-                recreated.push(key.clone());
+                let uid = cert.uid.clone();
+                issued.retain(|_, c| c.uid != uid);
             }
         }
-        for key in recreated {
-            issued.remove(&key);
-        }
     }
+}
+
+/// The certificates whose pods are due for recreation, and why. Only a gained
+/// address counts, so an address that comes and goes costs no restart.
+fn due(
+    issued: &BTreeMap<RequestKey, Issued>,
+    addresses: &[IpAddr],
+    now: i64,
+) -> Vec<(RequestKey, &'static str)> {
+    let newest = |c: &Issued| {
+        !issued
+            .values()
+            .any(|o| o.follows && o.uid == c.uid && o.not_before > c.not_before)
+    };
+    issued
+        .iter()
+        .filter_map(|(k, c)| {
+            let why = if c.dated_ahead(now) {
+                "certificate dated ahead of the clock"
+            } else if c.follows && addresses.iter().any(|a| !c.ips.contains(a)) && newest(c) {
+                "certificate lacks a node address"
+            } else {
+                return None;
+            };
+            Some((k.clone(), why))
+        })
+        .collect()
 }
 
 /// A request that is not the kubelet's own stays pending: its Node may yet
@@ -327,6 +414,8 @@ struct Issued {
     pod: String,
     uid: String,
     not_before: i64,
+    follows: bool,
+    ips: Vec<IpAddr>,
 }
 
 impl Issued {
@@ -335,6 +424,8 @@ impl Issued {
             pod: pcr.spec.pod_name.clone(),
             uid: pcr.spec.pod_uid.clone(),
             not_before: pcr.status.not_before.as_ref()?.0.as_second(),
+            follows: policy::follows_node(&pcr.spec),
+            ips: ca::leaf_addresses(pcr.status.certificate_chain.as_deref().unwrap_or_default()),
         })
     }
 
@@ -389,8 +480,10 @@ async fn publish(bundles: &Api<DynamicObject>, pem: &str) -> kube::Result<()> {
 type RequestKey = (String, String);
 
 /// A relist re-delivers every live request, so it starts both maps afresh and a
-/// request deleted during a disconnect drops out.
+/// request deleted during a disconnect drops out. Only this node's requests are
+/// answered: their addresses are its own.
 fn apply_event(
+    node: &str,
     pending: &mut BTreeMap<RequestKey, PodCertificateRequest>,
     issued: &mut BTreeMap<RequestKey, Issued>,
     ev: Event<PodCertificateRequest>,
@@ -405,7 +498,7 @@ fn apply_event(
             let k = key(&p);
             pending.remove(&k);
             issued.remove(&k);
-            if p.spec.signer_name == SIGNER {
+            if p.spec.signer_name == SIGNER && p.spec.node_name == node {
                 if !p.is_settled() {
                     pending.insert(k, p);
                 } else if let Some(cert) = Issued::of(&p) {
@@ -488,13 +581,13 @@ fn log_verdict(pcr: &PodCertificateRequest, status: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ca::tests::{NOW, TestCert, csr, file_ca, root, rsa_csr, secret};
+    use crate::ca::tests::{NOW, TestCert, csr, file_ca, intermediate, root, rsa_csr, secret};
     use rcgen::PKCS_ECDSA_P256_SHA256;
     use rustls_pki_types::pem::PemObject;
     use x509_parser::prelude::*;
 
     fn unit() -> Unit {
-        Unit::new("example.lan", "")
+        Unit::new("example.lan")
     }
 
     fn request(csr: Vec<u8>, annotations: &[(&str, &str)], max: i32) -> PodCertificateRequest {
@@ -508,6 +601,7 @@ mod tests {
                 signer_name: SIGNER.into(),
                 pod_name: "p".into(),
                 pod_uid: "u".into(),
+                node_name: "n".into(),
                 max_expiration_seconds: Some(max),
                 stub_pkcs10_request: k8s_openapi::ByteString(csr),
                 unverified_user_annotations: annotations
@@ -704,26 +798,33 @@ mod tests {
             p
         };
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Apply(mk("a", SIGNER, false)),
         );
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Apply(mk("other", "example.com/x", false)),
         );
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Apply(mk("done", SIGNER, true)),
         );
+        let mut elsewhere = mk("elsewhere", SIGNER, false);
+        elsewhere.spec.node_name = "m".into();
+        apply_event("n", &mut pending, &mut issued, Event::Apply(elsewhere));
         assert_eq!(
             pending.keys().map(|k| k.1.as_str()).collect::<Vec<_>>(),
             ["a"]
         );
 
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Apply(mk("a", SIGNER, true)),
@@ -731,11 +832,13 @@ mod tests {
         assert!(pending.is_empty(), "settled elsewhere");
 
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Apply(mk("b", SIGNER, false)),
         );
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Delete(mk("b", SIGNER, false)),
@@ -743,17 +846,19 @@ mod tests {
         assert!(pending.is_empty(), "deleted");
 
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Apply(mk("gone", SIGNER, false)),
         );
-        apply_event(&mut pending, &mut issued, Event::Init);
+        apply_event("n", &mut pending, &mut issued, Event::Init);
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::InitApply(mk("c", SIGNER, false)),
         );
-        apply_event(&mut pending, &mut issued, Event::InitDone);
+        apply_event("n", &mut pending, &mut issued, Event::InitDone);
         assert_eq!(
             pending.keys().map(|k| k.1.as_str()).collect::<Vec<_>>(),
             ["c"]
@@ -792,9 +897,10 @@ mod tests {
             issued_to("foreign", "example.com/x", NOW + 365 * 86_400),
             issued_to("gone", SIGNER, NOW + 365 * 86_400),
         ] {
-            apply_event(&mut pending, &mut issued, Event::InitApply(p));
+            apply_event("n", &mut pending, &mut issued, Event::InitApply(p));
         }
         apply_event(
+            "n",
             &mut pending,
             &mut issued,
             Event::Delete(issued_to("gone", SIGNER, NOW + 365 * 86_400)),
@@ -813,6 +919,8 @@ mod tests {
                         pod: "pod-ahead".into(),
                         uid: "uid-ahead".into(),
                         not_before: NOW + CLOCK_SKEW_SECS + 1,
+                        follows: false,
+                        ips: vec![],
                     }
                 ),
                 (
@@ -821,14 +929,83 @@ mod tests {
                         pod: "pod-year".into(),
                         uid: "uid-year".into(),
                         not_before: NOW + 365 * 86_400,
+                        follows: false,
+                        ips: vec![],
                     }
                 ),
             ]
         );
         assert!(pending.is_empty());
 
-        apply_event(&mut pending, &mut issued, Event::Init);
+        apply_event("n", &mut pending, &mut issued, Event::Init);
         assert!(issued.is_empty(), "a relist starts afresh");
+    }
+
+    #[test]
+    fn recreates_newest_node_certificate_lacking_a_gained_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let cert = |uid: &str, not_before: i64, follows: bool, ips: &[&str]| Issued {
+            pod: format!("pod-{uid}"),
+            uid: uid.into(),
+            not_before,
+            follows,
+            ips: ips.iter().map(|a| ip(a)).collect(),
+        };
+        let key = |name: &str| ("edge".to_string(), name.to_string());
+        let issued: BTreeMap<_, _> = [
+            (key("gw-1"), cert("gw", NOW - 600, true, &["192.0.2.1"])),
+            (
+                key("gw-2"),
+                cert("gw", NOW, true, &["192.0.2.1", "127.0.0.1"]),
+            ),
+            (key("fixed"), cert("fixed", NOW, false, &["192.0.2.1"])),
+            (key("refreshed-1"), cert("refreshed", NOW - 600, true, &[])),
+            (
+                key("refreshed-2"),
+                cert("refreshed", NOW, true, &["192.0.2.1", "192.0.2.2"]),
+            ),
+        ]
+        .into();
+        let due_for = |addresses: &[&str]| {
+            let addresses: Vec<IpAddr> = addresses.iter().map(|a| ip(a)).collect();
+            due(&issued, &addresses, NOW)
+                .into_iter()
+                .map(|(k, why)| (k.1, why))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(due_for(&[]), []);
+        assert_eq!(
+            due_for(&["192.0.2.1"]),
+            [],
+            "a lost address costs no restart"
+        );
+        assert_eq!(
+            due_for(&["192.0.2.1", "192.0.2.2"]),
+            [("gw-2".to_string(), "certificate lacks a node address")]
+        );
+    }
+
+    #[test]
+    fn reachable_addresses_exclude_loopback_and_link_local() {
+        for a in ["10.42.0.1", "192.0.2.1", "2001:db8::1", "fd00::1"] {
+            assert!(reachable(&a.parse().unwrap()), "{a}");
+        }
+        for a in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "::",
+            "169.254.1.1",
+            "fe80::1",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ] {
+            assert!(!reachable(&a.parse().unwrap()), "{a}");
+        }
+        let held = host_addresses().unwrap();
+        assert!(held.iter().all(reachable), "{held:?}");
+        assert!(held.is_sorted());
     }
 
     #[test]
@@ -1022,7 +1199,11 @@ mod tests {
     }
 
     fn ca_secret(r: &TestCert) -> serde_json::Value {
-        let mut s = serde_json::to_value(secret(r, &[r])).unwrap();
+        chain_secret(r, &[r])
+    }
+
+    fn chain_secret(key: &TestCert, chain: &[&TestCert]) -> serde_json::Value {
+        let mut s = serde_json::to_value(secret(key, chain)).unwrap();
         s["metadata"] = serde_json::json!({
             "name": ca::SECRET, "namespace": "default", "resourceVersion": "2",
         });
@@ -1051,11 +1232,21 @@ mod tests {
         })
     }
 
+    type Held = std::sync::Arc<std::sync::Mutex<Vec<IpAddr>>>;
+
     fn start(url: &str) -> (tokio::task::JoinHandle<anyhow::Result<()>>, Heartbeat) {
+        start_holding(url, Held::default())
+    }
+
+    fn start_holding(
+        url: &str,
+        held: Held,
+    ) -> (tokio::task::JoinHandle<anyhow::Result<()>>, Heartbeat) {
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
         let hb = Heartbeat::default();
         let beat = hb.clone();
-        let task = tokio::spawn(async move { serve(client, &unit(), &beat).await });
+        let host = move || Ok(held.lock().unwrap().clone());
+        let task = tokio::spawn(async move { serve(client, "n", &unit(), host, &beat).await });
         (task, hb)
     }
 
@@ -1316,6 +1507,126 @@ mod tests {
         assert_eq!(body["preconditions"], serde_json::json!({ "uid": "old" }));
     }
 
+    #[tokio::test]
+    async fn deletes_pod_once_node_gains_address() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let pcr = |name: &str, pod: &str, uid: &str, status: serde_json::Value| {
+            let mut p = pcr_json(name, pod, uid, csr(&PKCS_ECDSA_P256_SHA256).1, status);
+            p["spec"]["unverifiedUserAnnotations"]["edge.meridian/ip-addresses"] =
+                "node,127.0.0.1".into();
+            p
+        };
+        let r = root("r", now() - 60, now() + 86_400 * 365);
+        let ca = Ca::from_secret(Some(&secret(&r, &[&r])), now()).unwrap();
+        let before = Unit {
+            addresses: vec![ip("192.0.2.1")],
+            ..unit()
+        };
+        let old = serde_json::to_value(settle(
+            &serde_json::from_value(pcr("gw-a-1", "gw-a", "old", serde_json::json!({}))).unwrap(),
+            &ca,
+            &before,
+            now(),
+        ))
+        .unwrap();
+        let (url, writes, watch) = fake_apiserver(World {
+            pcrs: vec![pcr("gw-a-1", "gw-a", "old", old)],
+            secret: Some(ca_secret(&r)),
+            ..World::default()
+        })
+        .await;
+        let held = Held::new(vec![ip("192.0.2.1")].into());
+        let (task, _hb) = start_holding(&url, held.clone());
+        let deletes = |w: &[(String, String, serde_json::Value)]| {
+            w.iter()
+                .filter(|w| w.0 == "DELETE")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        wait_for_writes(&writes, |w| !bundles(w).is_empty()).await;
+        tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
+        assert_eq!(deletes(&writes.lock().unwrap()), [], "nothing gained");
+
+        held.lock().unwrap().push(ip("192.0.2.2"));
+        wait_for_writes(&writes, |w| !deletes(w).is_empty()).await;
+        let replacement = pcr("gw-b-1", "gw-b", "new", serde_json::json!({}));
+        watch
+            .pcrs
+            .send(serde_json::json!({ "type": "ADDED", "object": replacement }))
+            .unwrap();
+        wait_for_writes(&writes, |w| w.iter().any(|w| w.1.contains("gw-b-1/status"))).await;
+        let issued = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|w| w.1.contains("gw-b-1/status"))
+            .unwrap()
+            .2["status"]
+            .clone();
+        assert_eq!(
+            ca::leaf_addresses(issued["certificateChain"].as_str().unwrap()),
+            [ip("192.0.2.1"), ip("192.0.2.2"), ip("127.0.0.1")]
+        );
+        let mut answered = replacement.clone();
+        answered["status"] = issued;
+        answered["metadata"]["resourceVersion"] = "2".into();
+        watch
+            .pcrs
+            .send(serde_json::json!({ "type": "MODIFIED", "object": answered }))
+            .unwrap();
+
+        // Long enough for the retry tick to delete twice if it would.
+        tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
+        task.abort();
+        let deletes = deletes(&writes.lock().unwrap());
+        assert_eq!(deletes.len(), 1, "{deletes:?}");
+        let (_, uri, body) = &deletes[0];
+        assert!(
+            uri.starts_with("/api/v1/namespaces/edge/pods/gw-a?"),
+            "{uri}"
+        );
+        assert_eq!(body["preconditions"], serde_json::json!({ "uid": "old" }));
+    }
+
+    #[tokio::test]
+    async fn address_the_ca_cannot_name_costs_no_restart() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let r = root("r", now() - 60, now() + 86_400 * 365);
+        let i = intermediate(&r);
+        let ca = Ca::from_secret(Some(&secret(&i, &[&i, &r])), now()).unwrap();
+        let mut p = pcr_json(
+            "gw-a-1",
+            "gw-a",
+            "old",
+            csr(&PKCS_ECDSA_P256_SHA256).1,
+            serde_json::json!({}),
+        );
+        p["spec"]["unverifiedUserAnnotations"]["edge.meridian/ip-addresses"] =
+            "node,127.0.0.1".into();
+        p["status"] = serde_json::to_value(settle(
+            &serde_json::from_value(p.clone()).unwrap(),
+            &ca,
+            &unit(),
+            now(),
+        ))
+        .unwrap();
+        let (url, writes, _watch) = fake_apiserver(World {
+            pcrs: vec![p],
+            secret: Some(chain_secret(&i, &[&i, &r])),
+            ..World::default()
+        })
+        .await;
+        let held = Held::new(vec!["192.0.2.1".parse().unwrap()].into());
+        let (task, _hb) = start_holding(&url, held);
+        wait_for_writes(&writes, |w| !bundles(w).is_empty()).await;
+        tokio::time::sleep(RETRY_INTERVAL + Duration::from_secs(1)).await;
+        task.abort();
+        let writes = writes.lock().unwrap();
+        assert!(writes.iter().all(|w| w.0 != "DELETE"), "{writes:?}");
+    }
+
     async fn max_heartbeat_age(hb: &Heartbeat, span: Duration) -> Duration {
         let mut oldest = Duration::ZERO;
         let until = tokio::time::Instant::now() + span;
@@ -1375,7 +1686,7 @@ mod tests {
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
         let hb = Heartbeat::default();
         let unit = unit();
-        let mut serving = std::pin::pin!(serve(client, &unit, &hb));
+        let mut serving = std::pin::pin!(serve(client, "n", &unit, || Ok(vec![]), &hb));
         let poll = Duration::from_millis(500);
 
         let beating = poll * 2;
