@@ -7,8 +7,7 @@ use anyhow::{Context, ensure};
 use k8s_openapi::api::core::v1::Secret;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, PublicKeyData, SanType,
-    SubjectPublicKeyInfo,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType, SubjectPublicKeyInfo,
 };
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -265,17 +264,120 @@ fn unusable(why: &str) {
     );
 }
 
-pub fn requested_key(csr_der: &[u8]) -> anyhow::Result<SubjectPublicKeyInfo> {
+/// The API's `keyType`s this signer issues for.
+pub const KEY_TYPES: &str = "ECDSAP256, RSA3072 or RSA4096";
+/// kube-apiserver's bound on `stubPKCS10Request`.
+const MAX_REQUEST: usize = 10 * 1024;
+
+#[derive(Debug, PartialEq)]
+pub struct Refusal {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+/// The stub CSR's key, once its self-signature verifies: the proof of
+/// possession kube-apiserver also checks.
+pub fn requested_key(csr_der: &[u8]) -> Result<SubjectPublicKeyInfo, Refusal> {
     use x509_parser::prelude::FromDer;
-    let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
-        .context("unparsable certificate request")?;
-    let spki = SubjectPublicKeyInfo::from_der(csr.certification_request_info.subject_pki.raw)
-        .context("unsupported key type")?;
-    ensure!(
-        spki.algorithm() == &PKCS_ECDSA_P256_SHA256,
-        "unsupported key type"
-    );
-    Ok(spki)
+    let invalid = |message: &str| Refusal {
+        reason: "InvalidStubPKCS10Request",
+        message: message.into(),
+    };
+    if csr_der.len() > MAX_REQUEST {
+        return Err(invalid("the certificate request is too large"));
+    }
+    let Ok((_, csr)) =
+        x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
+    else {
+        return Err(invalid("unparsable certificate request"));
+    };
+    let info = &csr.certification_request_info;
+    let spki = &info.subject_pki;
+    let key_alg = sequence(spki.raw).and_then(sequence).unwrap_or_default();
+    key_type(key_alg, spki).map_err(|found| Refusal {
+        reason: "UnsupportedKeyType",
+        message: format!("{found} is not supported: use keyType {KEY_TYPES}"),
+    })?;
+    let signature_alg = sequence(csr_der)
+        .and_then(element)
+        .and_then(|(_, rest)| sequence(rest))
+        .unwrap_or_default();
+    let verifies = rustls::crypto::ring::default_provider()
+        .signature_verification_algorithms
+        .all
+        .iter()
+        .find(|a| {
+            a.public_key_alg_id().as_ref() == key_alg
+                && a.signature_alg_id().as_ref() == signature_alg
+        })
+        .is_some_and(|a| {
+            a.verify_signature(
+                &spki.subject_public_key.data,
+                info.raw,
+                &csr.signature_value.data,
+            )
+            .is_ok()
+        });
+    if !verifies {
+        return Err(invalid(
+            "the certificate request is not signed by its own key",
+        ));
+    }
+    SubjectPublicKeyInfo::from_der(spki.raw).map_err(|_| invalid("unreadable subject public key"))
+}
+
+/// The key's `keyType`, or what it is instead.
+fn key_type(
+    alg: &[u8],
+    spki: &x509_parser::x509::SubjectPublicKeyInfo,
+) -> Result<&'static str, String> {
+    use rustls_pki_types::alg_id;
+    use x509_parser::public_key::PublicKey;
+    if alg == alg_id::ECDSA_P256.as_ref() {
+        return Ok("ECDSAP256");
+    }
+    if alg == alg_id::RSA_ENCRYPTION.as_ref() {
+        let Ok(PublicKey::RSA(rsa)) = spki.parsed() else {
+            return Err("an unreadable RSA key".into());
+        };
+        // In bytes, as kube-apiserver measures it.
+        let size = rsa.modulus.iter().skip_while(|b| **b == 0).count();
+        return match size * 8 {
+            3072 => Ok("RSA3072"),
+            4096 => Ok("RSA4096"),
+            bits => Err(format!("a {bits}-bit RSA key")),
+        };
+    }
+    Err(match alg {
+        a if a == alg_id::ECDSA_P384.as_ref() => "an ECDSA P-384 key",
+        a if a == alg_id::ECDSA_P521.as_ref() => "an ECDSA P-521 key",
+        a if a == alg_id::ED25519.as_ref() => "an Ed25519 key",
+        _ => "the key type",
+    }
+    .into())
+}
+
+/// The contents of the DER element `der` starts with, and what follows it.
+fn element(der: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (&len, rest) = der.get(1..)?.split_first()?;
+    let (len, rest) = match len {
+        0..=0x7f => (usize::from(len), rest),
+        0x81..=0x82 => {
+            let (bytes, rest) = rest.split_at_checked(usize::from(len & 0x7f))?;
+            (bytes.iter().fold(0, |n, b| n << 8 | usize::from(*b)), rest)
+        }
+        _ => return None,
+    };
+    let (content, rest) = rest.split_at_checked(len)?;
+    Some((content, rest))
+}
+
+/// The contents of the SEQUENCE `der` starts with.
+fn sequence(der: &[u8]) -> Option<&[u8]> {
+    (der.first() == Some(&0x30))
+        .then(|| element(der))
+        .flatten()
+        .map(|(content, _)| content)
 }
 
 fn datetime(unix: i64) -> anyhow::Result<OffsetDateTime> {
@@ -315,7 +417,22 @@ pub(crate) mod tests {
     }
 
     pub fn csr(alg: &'static rcgen::SignatureAlgorithm) -> (KeyPair, Vec<u8>) {
-        let key = KeyPair::generate_for(alg).unwrap();
+        request_by(KeyPair::generate_for(alg).unwrap())
+    }
+
+    /// ring cannot generate RSA keys: these are fixed, for tests only.
+    pub fn rsa_csr(bits: u32) -> (KeyPair, Vec<u8>) {
+        let der: &[u8] = match bits {
+            2048 => include_bytes!("../testdata/rsa2048.pk8"),
+            3072 => include_bytes!("../testdata/rsa3072.pk8"),
+            4096 => include_bytes!("../testdata/rsa4096.pk8"),
+            _ => unreachable!(),
+        };
+        let der = rustls_pki_types::PrivatePkcs8KeyDer::from(der);
+        request_by(KeyPair::from_pkcs8_der_and_sign_algo(&der, &rcgen::PKCS_RSA_SHA256).unwrap())
+    }
+
+    fn request_by(key: KeyPair) -> (KeyPair, Vec<u8>) {
         let mut p = CertificateParams::default();
         p.distinguished_name = DistinguishedName::new();
         let der = p.serialize_request(&key).unwrap().der().to_vec();
@@ -756,8 +873,12 @@ pub(crate) mod tests {
         assert_ne!(Ca::ephemeral(NOW).unwrap().root(), ca.root());
     }
 
-    fn issued_with_key(ca: &Ca, dns: &str, now: i64) -> (Vec<CertificateDer<'static>>, KeyPair) {
-        let (key, csr) = csr(&PKCS_ECDSA_P256_SHA256);
+    fn issued_with_key(
+        ca: &Ca,
+        (key, csr): (KeyPair, Vec<u8>),
+        dns: &str,
+        now: i64,
+    ) -> (Vec<CertificateDer<'static>>, KeyPair) {
         let leaf = ca
             .issue(
                 &requested_key(&csr).unwrap(),
@@ -774,6 +895,19 @@ pub(crate) mod tests {
     /// trusts the node CA, as Java's and OpenSSL's clients check it.
     #[test]
     fn leaf_authenticates_as_a_tls_client() {
+        let p256 = || csr(&PKCS_ECDSA_P256_SHA256);
+        handshake(p256(), p256());
+    }
+
+    /// An RSA key under the ECDSA CA, as server and as client.
+    #[test]
+    fn rsa_leaf_authenticates_both_ways() {
+        handshake(rsa_csr(3072), rsa_csr(3072));
+        handshake(rsa_csr(4096), csr(&PKCS_ECDSA_P256_SHA256));
+        handshake(csr(&PKCS_ECDSA_P256_SHA256), rsa_csr(3072));
+    }
+
+    fn handshake(server: (KeyPair, Vec<u8>), client: (KeyPair, Vec<u8>)) {
         use rustls::pki_types::PrivateKeyDer;
         // The handshake checks validity on the wall clock.
         let now = std::time::SystemTime::now()
@@ -789,8 +923,10 @@ pub(crate) mod tests {
         let roots = std::sync::Arc::new(roots);
         let key = |k: &KeyPair| PrivateKeyDer::try_from(k.serialize_der()).unwrap();
 
-        let (server_chain, server_key) = issued_with_key(&ca, "broker.example.lan", now - 60);
-        let (client_chain, client_key) = issued_with_key(&ca, "client.example.lan", now - 60);
+        let (server_chain, server_key) =
+            issued_with_key(&ca, server, "broker.example.lan", now - 60);
+        let (client_chain, client_key) =
+            issued_with_key(&ca, client, "client.example.lan", now - 60);
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
             roots.clone(),
             provider.clone(),
@@ -843,9 +979,15 @@ pub(crate) mod tests {
 
     #[test]
     fn leaf_carries_names_and_key() {
+        leaf_carries_names_and(csr(&PKCS_ECDSA_P256_SHA256));
+        for bits in [3072, 4096] {
+            leaf_carries_names_and(rsa_csr(bits));
+        }
+    }
+
+    fn leaf_carries_names_and((key, csr): (KeyPair, Vec<u8>)) {
         let r = root("r", NOW - 60, NOW + 10 * YEAR);
         let ca = Ca::parse(file(&r, &[&r]).as_bytes(), NOW).unwrap();
-        let (key, csr) = csr(&PKCS_ECDSA_P256_SHA256);
         let leaf = ca
             .issue(
                 &requested_key(&csr).unwrap(),
@@ -895,12 +1037,93 @@ pub(crate) mod tests {
         assert!(ku.digital_signature() && !ku.key_cert_sign());
     }
 
+    fn refusal(csr: &[u8]) -> Refusal {
+        requested_key(csr).map(drop).unwrap_err()
+    }
+
     #[test]
-    fn accepts_only_p256_requests() {
+    fn accepts_the_api_key_types() {
         assert!(requested_key(&csr(&PKCS_ECDSA_P256_SHA256).1).is_ok());
-        for alg in [&rcgen::PKCS_ECDSA_P384_SHA384, &rcgen::PKCS_ED25519] {
-            assert!(requested_key(&csr(alg).1).is_err(), "{alg:?}");
+        for bits in [3072, 4096] {
+            assert!(requested_key(&rsa_csr(bits).1).is_ok());
         }
-        assert!(requested_key(b"").is_err());
+        for (csr, found) in [
+            (rsa_csr(2048).1, "a 2048-bit RSA key"),
+            (csr(&rcgen::PKCS_ECDSA_P384_SHA384).1, "an ECDSA P-384 key"),
+            (csr(&rcgen::PKCS_ED25519).1, "an Ed25519 key"),
+        ] {
+            assert_eq!(
+                refusal(&csr),
+                Refusal {
+                    reason: "UnsupportedKeyType",
+                    message: format!(
+                        "{found} is not supported: use keyType ECDSAP256, RSA3072 or RSA4096"
+                    ),
+                }
+            );
+        }
+        let padded = [csr(&PKCS_ECDSA_P256_SHA256).1, vec![0; MAX_REQUEST]].concat();
+        for bad in [&b""[..], &[0x30, 0x82, 0xff, 0xff], &padded] {
+            assert_eq!(refusal(bad).reason, "InvalidStubPKCS10Request");
+        }
+    }
+
+    /// A CSR's parts: request info, signature algorithm, signature.
+    fn parts(csr: &[u8]) -> [Vec<u8>; 3] {
+        let mut rest = sequence(csr).unwrap();
+        [(); 3].map(|()| {
+            let (_, next) = element(rest).unwrap();
+            let whole = rest[..rest.len() - next.len()].to_vec();
+            rest = next;
+            whole
+        })
+    }
+
+    fn csr_of([info, alg, sig]: [&Vec<u8>; 3]) -> Vec<u8> {
+        let body = [&info[..], alg, sig].concat();
+        let len = u16::try_from(body.len()).unwrap().to_be_bytes();
+        [&[0x30, 0x82][..], &len, &body].concat()
+    }
+
+    #[test]
+    fn denies_requests_their_key_did_not_sign() {
+        let p256 = csr(&PKCS_ECDSA_P256_SHA256).1;
+        let rsa3072 = rsa_csr(3072).1;
+        let rsa4096 = rsa_csr(4096).1;
+        let [p256, rsa3072, rsa4096] = [&p256, &rsa3072, &rsa4096].map(|c| parts(c));
+        assert!(requested_key(&csr_of([&rsa3072[0], &rsa3072[1], &rsa3072[2]])).is_ok());
+
+        let mut flipped = rsa3072[2].clone();
+        *flipped.last_mut().unwrap() ^= 1;
+        let mut flipped_ec = p256[2].clone();
+        flipped_ec[10] ^= 1;
+        for (what, forged) in [
+            (
+                "RSA signature altered",
+                [&rsa3072[0], &rsa3072[1], &flipped],
+            ),
+            ("ECDSA signature altered", [&p256[0], &p256[1], &flipped_ec]),
+            (
+                "another RSA key's signature",
+                [&rsa3072[0], &rsa4096[1], &rsa4096[2]],
+            ),
+            (
+                "an ECDSA signature on an RSA key",
+                [&rsa3072[0], &p256[1], &p256[2]],
+            ),
+            (
+                "an RSA signature on an ECDSA key",
+                [&p256[0], &rsa3072[1], &rsa3072[2]],
+            ),
+        ] {
+            assert_eq!(
+                refusal(&csr_of(forged)),
+                Refusal {
+                    reason: "InvalidStubPKCS10Request",
+                    message: "the certificate request is not signed by its own key".into(),
+                },
+                "{what}"
+            );
+        }
     }
 }

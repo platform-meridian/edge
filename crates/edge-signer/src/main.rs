@@ -432,13 +432,9 @@ fn settle(pcr: &PodCertificateRequest, ca: &Ca, unit: &Unit, now: i64) -> Status
     };
     let key = match ca::requested_key(&pcr.spec.stub_pkcs10_request.0) {
         Ok(k) => k,
-        Err(e) => {
+        Err(ca::Refusal { reason, message }) => {
             return Status {
-                conditions: vec![condition(
-                    "Denied",
-                    "UnsupportedKeyType",
-                    format!("{e}: use keyType ECDSAP256"),
-                )],
+                conditions: vec![condition("Denied", reason, message)],
                 ..Status::default()
             };
         }
@@ -492,7 +488,7 @@ fn log_verdict(pcr: &PodCertificateRequest, status: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ca::tests::{NOW, TestCert, csr, file_ca, root, secret};
+    use crate::ca::tests::{NOW, TestCert, csr, file_ca, root, rsa_csr, secret};
     use rcgen::PKCS_ECDSA_P256_SHA256;
     use rustls_pki_types::pem::PemObject;
     use x509_parser::prelude::*;
@@ -589,14 +585,51 @@ mod tests {
     }
 
     #[test]
+    fn rsa_requests_issued_others_told_what_is() {
+        let ca = file_ca(NOW);
+        let names = [("edge.meridian/dns-names", "example.lan")];
+        for bits in [3072, 4096] {
+            let (key, der) = rsa_csr(bits);
+            let s = settle(&request(der, &names, 3600), &ca, &unit(), NOW);
+            assert_eq!(s.conditions[0].type_, "Issued", "RSA{bits}");
+            let chain = s.certificate_chain.unwrap();
+            let der = rustls_pki_types::CertificateDer::from_pem_slice(chain.as_bytes()).unwrap();
+            let (_, leaf) = parse_x509_certificate(&der).unwrap();
+            assert_eq!(
+                leaf.public_key().subject_public_key.data.as_ref(),
+                key.public_key_raw()
+            );
+        }
+        let s = settle(&request(rsa_csr(2048).1, &names, 3600), &ca, &unit(), NOW);
+        let c = &s.conditions[0];
+        assert_eq!(
+            (c.type_.as_str(), c.reason.as_str()),
+            ("Denied", "UnsupportedKeyType")
+        );
+        assert_eq!(
+            c.message,
+            "a 2048-bit RSA key is not supported: use keyType ECDSAP256, RSA3072 or RSA4096"
+        );
+    }
+
+    #[test]
     fn denial_has_only_condition() {
         let ca = file_ca(NOW);
         let p384 = csr(&rcgen::PKCS_ECDSA_P384_SHA384).1;
         let p256 = csr(&PKCS_ECDSA_P256_SHA256).1;
+        let rsa2048 = rsa_csr(2048).1;
         for (pcr, reason) in [
             (
                 request(p384, &[("edge.meridian/dns-names", "example.lan")], 3600),
                 "UnsupportedKeyType",
+            ),
+            (
+                request(rsa2048, &[("edge.meridian/dns-names", "example.lan")], 3600),
+                "UnsupportedKeyType",
+            ),
+            (
+                request(vec![], &[("edge.meridian/dns-names", "example.lan")], 3600),
+                "InvalidStubPKCS10Request",
             ),
             (
                 request(p256, &[("edge.meridian/dns-names", "example.com")], 3600),
