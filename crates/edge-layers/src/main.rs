@@ -258,10 +258,11 @@ fn blobs_to_index(
     )
 }
 
-/// Snapshots whose blob is in no source, while no image cache is mounted yet: the
-/// host's own images keep their blobs only there.
+/// Snapshots whose blob is in no source, while no image cache is mounted yet and
+/// no edge-registry store holds the host's images: then only a cache keeps them.
 fn awaiting_image_cache(cov: &snapshots::Coverage, blobs: &Blobs) -> bool {
     blobs.has(Kind::ImageCache)
+        && blobs.present(Kind::Registry) == 0
         && blobs.present(Kind::ImageCache) == 0
         && !no_layer_blob(cov).is_empty()
 }
@@ -816,6 +817,19 @@ mod tests {
         execute(&at(d.path()), true, far(), Duration::ZERO).unwrap();
         appear.join().unwrap();
         assert!(std::fs::read(&kubelet).unwrap() == whole);
+    }
+
+    #[test]
+    fn registry_store_skips_image_cache_wait() {
+        let d = fixture_root();
+        let first = ca_blobs(d.path()).remove(0);
+        registry_from(d.path(), &d.path().join(REGISTRY), |l| l.contains(&first));
+        discard_layers(d.path());
+        std::fs::remove_dir_all(d.path().join(IMAGECACHE)).unwrap();
+
+        let start = Instant::now();
+        execute(&at(d.path()), false, far(), Duration::ZERO).unwrap();
+        assert!(start.elapsed() < STORE_WAIT_STEP * STORE_WAIT_TICKS / 2);
     }
 
     #[test]
