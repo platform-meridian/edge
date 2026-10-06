@@ -146,6 +146,43 @@ fn partial_index_imports() {
 }
 
 #[test]
+fn thin_layout_leaves_held_blobs_to_the_puller() {
+    let d = tempdir();
+    let mut layout = Layout::new(&d.path().join("layout"));
+    let app = layout.image("app", 1);
+    let held = layout.image("held", 2);
+    for b in [&held.config].into_iter().chain(&held.layers) {
+        std::fs::remove_file(layout.path(&b.digest)).unwrap();
+    }
+    layout.tag(&app, "ghcr.io/o/app:v2");
+    layout.tag(&held, "ghcr.io/o/held:v1");
+    let store = Store::open(d.path().join("store")).unwrap();
+
+    let e = store.import_layout(layout.write()).unwrap_err();
+    assert!(
+        format!("{e:#}").contains(&held.config.digest.to_string()),
+        "{e:#}"
+    );
+
+    let got = store.import_thin_layout(&layout.dir).unwrap();
+
+    assert_eq!(
+        got,
+        [
+            r(&format!("ghcr.io/o/app:v2@{}", app.manifest.digest)),
+            r(&format!("ghcr.io/o/held:v1@{}", held.manifest.digest)),
+        ]
+    );
+    let (_, bytes) = store.manifest(&held.manifest.digest).unwrap().unwrap();
+    assert_eq!(bytes, held.manifest.bytes);
+    assert!(!store.blob_path(&held.layers[0].digest).exists());
+    assert_eq!(
+        std::fs::read(store.blob_path(&app.layers[0].digest)).unwrap(),
+        app.layers[0].bytes
+    );
+}
+
+#[test]
 fn missing_top_level_manifest_fails() {
     let d = tempdir();
     let mut layout = Layout::new(&d.path().join("layout"));

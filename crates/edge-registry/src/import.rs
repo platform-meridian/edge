@@ -14,6 +14,17 @@ impl Store {
     /// Imports an OCI image layout, tagging each image whose index annotation is
     /// a full reference such as `registry.k8s.io/pause:3.10`. Returns the images tagged.
     pub fn import_layout(&self, layout: &Path) -> anyhow::Result<Vec<ImageRef>> {
+        self.import(layout, Blobs::Every)
+    }
+
+    /// [`Store::import_layout`] of a layout that carries some images by manifest
+    /// alone, for a puller that holds their blobs: a blob neither the layout nor
+    /// the store holds is left out. [`Store::repair`] drops what it leaves out.
+    pub fn import_thin_layout(&self, layout: &Path) -> anyhow::Result<Vec<ImageRef>> {
+        self.import(layout, Blobs::Carried)
+    }
+
+    fn import(&self, layout: &Path, blobs: Blobs) -> anyhow::Result<Vec<ImageRef>> {
         let _lock = self.lock()?;
         let marker: serde_json::Value = serde_json::from_slice(
             &std::fs::read(layout.join("oci-layout")).context("reading oci-layout")?,
@@ -28,7 +39,7 @@ impl Store {
             .context("parsing index.json")?;
         let mut tagged = Vec::new();
         for desc in &index.children {
-            self.import_manifest(layout, desc, true)?;
+            self.import_manifest(layout, desc, true, blobs)?;
             let Some(name) = NAME_ANNOTATIONS
                 .iter()
                 .find_map(|a| desc.annotations.get(*a))
@@ -64,6 +75,7 @@ impl Store {
         layout: &Path,
         desc: &Descriptor,
         required: bool,
+        blobs: Blobs,
     ) -> anyhow::Result<()> {
         let held = self.has_manifest(&desc.digest);
         let bytes = if held {
@@ -95,14 +107,20 @@ impl Store {
             .with_context(|| format!("parsing manifest {digest}"))?;
         for b in &m.blobs {
             if !self.has_blob(&b.digest) {
-                let from = std::fs::File::open(blob(layout, &b.digest))
-                    .with_context(|| format!("opening blob {}", b.digest))?;
+                let from = match std::fs::File::open(blob(layout, &b.digest)) {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound && blobs == Blobs::Carried =>
+                    {
+                        continue;
+                    }
+                    r => r.with_context(|| format!("opening blob {}", b.digest))?,
+                };
                 self.put_blob(b, from)
                     .with_context(|| format!("importing blob {}", b.digest))?;
             }
         }
         for child in &m.children {
-            self.import_manifest(layout, child, false)?;
+            self.import_manifest(layout, child, false, blobs)?;
         }
         if !held {
             self.put_manifest(&digest, &bytes)
@@ -110,6 +128,12 @@ impl Store {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Blobs {
+    Every,
+    Carried,
 }
 
 fn blob(layout: &Path, digest: &Digest) -> PathBuf {
