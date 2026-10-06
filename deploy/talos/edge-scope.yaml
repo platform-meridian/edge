@@ -4,6 +4,9 @@
 name: edge-scope
 depends:
   - path: /var/lib/containerd
+  # Stops with cri, before Talos unmounts volumes: the open rings would keep
+  # the evidence volume busy.
+  - service: cri
 restart: always
 container:
   entrypoint: /edge-scope
