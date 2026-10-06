@@ -6,7 +6,7 @@ require (
 	go.etcd.io/etcd/api/v3 v3.7.2
 	go.etcd.io/etcd/client/v3 v3.7.2
 	google.golang.org/grpc v1.84.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
