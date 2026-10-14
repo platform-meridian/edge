@@ -26,10 +26,10 @@ prost.workspace = true
 connectrpc = { version = "0.9", default-features = false, features = ["server", "client", "gzip"] }
 connectrpc-health = { version = "0.9", default-features = false }
 buffa = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 rustls.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
