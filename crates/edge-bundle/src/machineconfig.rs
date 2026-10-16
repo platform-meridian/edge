@@ -62,6 +62,9 @@ const HELD_KINDS: &[&str] = &[
     "RoutingRuleConfig",
 ];
 
+/// Named documents the unit keeps: edge-dhcp's, with the unit's LAN address and domain.
+const HELD_NAMED: &[(&str, &str)] = &[("ExtensionServiceConfig", "operator-lan")];
+
 /// Volumes a merge drops whole, keys and all, when the build stops rendering them.
 const DROPPED_WHOLE: &[&str] = &["UserVolumeConfig", "RawVolumeConfig", "SwapVolumeConfig"];
 
@@ -153,7 +156,8 @@ fn set(doc: &mut Value, path: &[&str], value: Value) -> anyhow::Result<()> {
 }
 
 fn held_kind(k: &Key) -> bool {
-    matches!(k, Key::Typed(kind, _) if HELD_KINDS.contains(&kind.as_str()))
+    matches!(k, Key::Typed(kind, name) if HELD_KINDS.contains(&kind.as_str())
+        || HELD_NAMED.contains(&(kind.as_str(), name.as_str())))
 }
 
 fn held_fields(k: &Key) -> impl Iterator<Item = &'static str> + '_ {
@@ -487,6 +491,11 @@ name: signer/ca.pem
 contents: unit-signer-ca-key
 ---
 apiVersion: v1alpha1
+kind: ExtensionServiceConfig
+name: operator-lan
+environment: [EDGE_DHCP_ADDR=10.50.0.1/24]
+---
+apiVersion: v1alpha1
 kind: KubePrismConfig
 port: 7445
 "#;
@@ -566,6 +575,7 @@ image: kubelet:new
         assert!(get(v1, &["machine", "network", "interfaces"]).is_some());
         assert!(doc(&out, "KubeAPIServerCAConfig", "").is_some());
         assert!(doc(&out, "EtcFileConfig", "signer/ca.pem").is_some());
+        assert!(doc(&out, "ExtensionServiceConfig", "operator-lan").is_some());
         let api = doc(&out, "KubeAPIServerConfig", "").unwrap();
         assert_eq!(s(get(api, &["certExtraSANs"])), "- unit-a\n- 10.50.0.1\n");
         let state = doc(&out, "VolumeConfig", "STATE").unwrap();
