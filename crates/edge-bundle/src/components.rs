@@ -687,7 +687,7 @@ mod tests {
     fn the_stack_is_its_base_with_the_sets_modules() {
         let d = tempfile::tempdir().unwrap();
         let layer = tgz(&[
-            ("base/kustomization.yaml", "resources:\n  - ../modules\n"),
+            ("base/kustomization.yaml", "components:\n  - ../modules\n"),
             ("./modules/old.yaml", "old"),
             ("modules/kustomization.yaml", "old"),
         ]);

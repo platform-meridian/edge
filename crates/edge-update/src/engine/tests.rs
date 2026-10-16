@@ -769,7 +769,7 @@ fn stack_artifact(blobs: &Path, tag: &str) -> serde_json::Value {
         format!("sha256:{h}")
     };
     let layer = gzip_tar(&[
-        ("base/kustomization.yaml", "resources:\n  - ../modules\n"),
+        ("base/kustomization.yaml", "components:\n  - ../modules\n"),
         ("base/tag", tag),
         ("modules/kustomization.yaml", "resources: []\n"),
     ]);
