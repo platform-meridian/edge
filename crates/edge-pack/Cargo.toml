@@ -1,0 +1,22 @@
+[package]
+name = "edge-pack"
+version.workspace = true
+description = "Meridian Edge: packs an app's deploy/ and images into the artifact a unit installs"
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+edge-bundle = { path = "../edge-bundle" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+flate2.workspace = true
+toml = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+
+[dev-dependencies]
+edge-bundle = { path = "../edge-bundle", features = ["testkit"] }
