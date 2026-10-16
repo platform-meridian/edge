@@ -110,6 +110,20 @@ impl crate::unit::Cluster for Kube {
         Ok(flux_version(&fi.data))
     }
 
+    async fn flux_components(&self, instance: &Ref) -> anyhow::Result<BTreeSet<String>> {
+        let fi = timed(self.dynamic(FLUX_INSTANCE, instance).get(&instance.name)).await?;
+        Ok(fi.data["spec"]["components"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.as_str().map(String::from))
+            .collect())
+    }
+
+    async fn kubernetes_version(&self) -> anyhow::Result<String> {
+        Ok(timed(self.client.apiserver_version()).await?.git_version)
+    }
+
     async fn sync(&self, instance: &Ref) -> anyhow::Result<(String, String)> {
         let fi = timed(self.dynamic(FLUX_INSTANCE, instance).get(&instance.name)).await?;
         let sync = &fi.data["spec"]["sync"];

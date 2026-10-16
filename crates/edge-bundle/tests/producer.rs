@@ -1,29 +1,31 @@
 //! What a build writes, read back as a unit reads it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use std::collections::BTreeSet;
-
-use edge_bundle::{
-    Contents, Manifest, SigningKey, Verifier, check, machineconfig, oci, read_head, release_refs,
-    unpack, write,
-};
+use edge_bundle::components::Components;
+use edge_bundle::{Contents, Manifest, Trust, check, machineconfig, oci, read_head, unpack, write};
 use sha2::{Digest, Sha256};
 
-const NS: &str = "test-update";
 const UNIT: &str = include_str!("fixtures/controlplane.yaml");
+const SIGNER: &str = "https://github.com/test/talos/.github/workflows/release.yml@refs/tags/v2";
 
-fn keygen(dir: &Path, name: &str, pass: &str) -> (String, String) {
-    let key = dir.join(name);
-    let st = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", pass, "-C", "test", "-f"])
-        .arg(&key)
-        .status()
-        .unwrap();
-    assert!(st.success());
-    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
-    (read(key.clone()), read(key.with_extension("pub")))
+/// A stand-in trust that takes `<signer> <sha256 of the sums>`.
+struct Signed;
+
+impl Trust for Signed {
+    fn verify(&self, sums: &[u8], signature: &[u8]) -> anyhow::Result<String> {
+        let (who, sha) = std::str::from_utf8(signature)?
+            .trim()
+            .rsplit_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("the signature is not a Sigstore bundle"))?;
+        anyhow::ensure!(sha == self::sha(sums), "the signature does not verify");
+        anyhow::ensure!(who == SIGNER, "{who} is not a signer this unit trusts");
+        Ok(who.into())
+    }
+}
+
+fn signed_as(who: &'static str) -> impl Fn(&[u8]) -> anyhow::Result<Vec<u8>> + Copy {
+    move |sums| Ok(format!("{who} {}", sha(sums)).into_bytes())
 }
 
 fn sha(b: &[u8]) -> String {
@@ -68,20 +70,17 @@ fn flat_cache(dir: &Path, refs: &[(&str, &str)]) -> Vec<String> {
 
 struct Build {
     dir: tempfile::TempDir,
-    key: SigningKey,
-    public: String,
     manifest: Manifest,
     patch: String,
     refs: Vec<String>,
-    /// Every ref the release runs: the carried ones and one the unit holds.
-    all: BTreeSet<String>,
+    /// A base running what its layout carries.
+    components: Components,
     images: PathBuf,
 }
 
 impl Build {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let (private, public) = keygen(dir.path(), "update", "");
         let refs = flat_cache(
             &dir.path().join("flat"),
             &[
@@ -90,16 +89,16 @@ impl Build {
             ],
         );
         oci::from_flat_cache(&dir.path().join("flat"), &dir.path().join("images"), &refs).unwrap();
-        let manifest = edge_bundle::parse_manifest(
-            "FORMAT=4\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=2000\n",
-        )
-        .unwrap();
+        let manifest =
+            edge_bundle::parse_manifest("FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=2000\n")
+                .unwrap();
         Self {
-            key: SigningKey::from_openssh(&private, NS).unwrap(),
-            public,
             manifest,
             patch: machineconfig::strip(&build_config()).unwrap(),
-            all: refs.iter().cloned().collect(),
+            components: Components {
+                base: Some(refs.iter().cloned().collect()),
+                ..Components::default()
+            },
             refs,
             images: dir.path().join("images"),
             dir,
@@ -116,23 +115,22 @@ impl Build {
             patch: Some(&self.patch),
             seed: Some("kind: ConfigMap\n"),
             images: &self.images,
-            refs: &self.all,
             notes: None,
             instance: None,
-            components: None,
+            components: &self.components,
         }
     }
 
     fn write(&self, out: &str) -> PathBuf {
         let out = self.path(out);
-        write(&self.contents(), &self.key, 2000, &out).unwrap();
+        write(&self.contents(), signed_as(SIGNER), 2000, &out).unwrap();
         out
     }
 
     fn open(&self, tar: &Path) -> anyhow::Result<Manifest> {
         let dest = self.path("unpacked");
         let _ = std::fs::remove_dir_all(&dest);
-        unpack(tar, &dest, &Verifier::new(&self.public, NS)?)
+        unpack(tar, &dest, &Signed).map(|u| u.manifest)
     }
 }
 
@@ -155,14 +153,14 @@ fn a_written_bundle_unpacks_as_a_unit_reads_it() {
     let b = Build::new();
     let tar = b.write("b.tar");
     let read = std::sync::atomic::AtomicU64::new(0);
-    let v = Verifier::new(&b.public, NS).unwrap();
-    edge_bundle::unpack_counting(&tar, &b.path("counted"), &v, &read).unwrap();
+    edge_bundle::unpack_counting(&tar, &b.path("counted"), &Signed, &read).unwrap();
     // All but the tar's closing padding.
     let (read, len) = (read.into_inner(), std::fs::metadata(&tar).unwrap().len());
     assert!(read <= len && read + 10240 >= len, "{read} of {len}");
     assert_eq!(b.open(&tar).unwrap(), b.manifest);
     let dest = b.path("unpacked");
-    let refs = check(&dest).unwrap();
+    let (components, refs) = check(&dest).unwrap();
+    assert_eq!(components, b.components);
     assert_eq!(refs.into_iter().collect::<Vec<_>>(), b.refs);
     assert_eq!(
         std::fs::read_to_string(dest.join(edge_bundle::PATCH)).unwrap(),
@@ -193,21 +191,17 @@ fn notes_ride_signed_and_the_head_reads_from_the_start_alone() {
     let mut c = b.contents();
     c.notes = Some("# 2.1\n\nFaster boots.\n");
     let tar = b.path("n.tar");
-    write(&c, &b.key, 2000, &tar).unwrap();
+    write(&c, signed_as(SIGNER), 2000, &tar).unwrap();
     b.open(&tar).unwrap();
     assert_eq!(edge_bundle::notes(&b.path("unpacked")).as_deref(), c.notes);
     assert_eq!(edge_bundle::notes(&b.path("nowhere")), None);
 
     let bytes = std::fs::read(&tar).unwrap();
-    let v = Verifier::new(&b.public, NS).unwrap();
+    let v = Signed;
     let head = read_head(bytes.as_slice(), &v).unwrap().unwrap();
     assert_eq!(head.manifest, b.manifest);
     assert_eq!(head.notes.as_deref(), c.notes);
-    assert!(
-        head.signer.starts_with("SHA256:") && head.signer.ends_with(" test"),
-        "{}",
-        head.signer
-    );
+    assert_eq!(head.signer, SIGNER);
     // The head is whole well before the images.
     let whole = (0..bytes.len())
         .step_by(512)
@@ -227,11 +221,9 @@ fn notes_ride_signed_and_the_head_reads_from_the_start_alone() {
     );
 
     // A stranger's bundle fails as soon as its signature has arrived.
-    let (other, _) = keygen(b.dir.path(), "other", "");
-    let other = SigningKey::from_openssh(&other, NS).unwrap();
-    write(&c, &other, 2000, &b.path("o.tar")).unwrap();
+    write(&c, signed_as("a stranger"), 2000, &b.path("o.tar")).unwrap();
     let o = std::fs::read(b.path("o.tar")).unwrap();
-    assert!(err(read_head(&o[..whole], &v)).contains("pinned update key"));
+    assert!(err(read_head(&o[..whole], &v)).contains("not a signer this unit trusts"));
     assert!(read_head(&b"not a tar at all".repeat(64)[..], &v).is_err());
 
     let mut bad = bytes.clone();
@@ -242,7 +234,7 @@ fn notes_ride_signed_and_the_head_reads_from_the_start_alone() {
     let mut c = b.contents();
     let long = "x".repeat(65 << 10);
     c.notes = Some(&long);
-    assert!(err(write(&c, &b.key, 0, &b.path("l.tar"))).contains("notes"));
+    assert!(err(write(&c, signed_as(SIGNER), 0, &b.path("l.tar"))).contains("notes"));
 }
 
 #[test]
@@ -259,40 +251,6 @@ fn the_same_inputs_make_the_same_tar() {
             (2000, 0, 0o644)
         );
     }
-}
-
-#[test]
-fn ssh_keygen_verifies_what_the_key_signs() {
-    let b = Build::new();
-    let msg = b.path("msg");
-    std::fs::write(&msg, "sums\n").unwrap();
-    std::fs::write(b.path("msg.sig"), b.key.sign(b"sums\n").unwrap()).unwrap();
-    let allowed = b.path("allowed");
-    std::fs::write(&allowed, format!("test {}", b.public)).unwrap();
-    let verify = |ns: &str| {
-        Command::new("ssh-keygen")
-            .args(["-Y", "verify", "-I", "test", "-n", ns, "-f"])
-            .arg(&allowed)
-            .arg("-s")
-            .arg(b.path("msg.sig"))
-            .stdin(std::fs::File::open(&msg).unwrap())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    };
-    assert!(verify(NS));
-    assert!(!verify("another"));
-    assert_eq!(b.key.public_key().unwrap(), b.public.trim_end());
-}
-
-#[test]
-fn a_key_needs_a_namespace_and_no_passphrase() {
-    let dir = tempfile::tempdir().unwrap();
-    let (locked, _) = keygen(dir.path(), "locked", "hunter22");
-    assert!(err(SigningKey::from_openssh(&locked, NS)).contains("encrypted"));
-    let (open, _) = keygen(dir.path(), "open", "");
-    assert!(err(SigningKey::from_openssh(&open, "")).contains("namespace"));
 }
 
 #[test]
@@ -314,7 +272,7 @@ fn a_build_refuses_what_a_unit_would() {
     let full = build_config();
     let mut c = b.contents();
     c.patch = Some(&full);
-    assert!(err(write(&c, &b.key, 0, &out)).contains("which the unit keeps"));
+    assert!(err(write(&c, signed_as(SIGNER), 0, &out)).contains("which the unit keeps"));
 
     let bad = Manifest::from([
         ("lower".into(), "x".into()),
@@ -322,25 +280,27 @@ fn a_build_refuses_what_a_unit_would() {
     ]);
     let mut c = b.contents();
     c.manifest = &bad;
-    assert!(err(write(&c, &b.key, 0, &out)).contains("is not KEY"));
+    assert!(err(write(&c, signed_as(SIGNER), 0, &out)).contains("is not KEY"));
 
     let empty = b.path("empty");
     std::fs::create_dir_all(&empty).unwrap();
     std::fs::write(empty.join("index.json"), r#"{"manifests":[]}"#).unwrap();
     let mut c = b.contents();
     c.images = &empty;
-    assert!(err(write(&c, &b.key, 0, &out)).contains("names no image"));
+    assert!(err(write(&c, signed_as(SIGNER), 0, &out)).contains("names no image"));
 
     std::os::unix::fs::symlink("/etc/passwd", b.path("images/link")).unwrap();
-    assert!(err(write(&b.contents(), &b.key, 0, &out)).contains("not a regular file"));
+    assert!(err(write(&b.contents(), signed_as(SIGNER), 0, &out)).contains("not a regular file"));
     assert!(!out.exists());
 }
 
 #[test]
 fn full_and_partial_bundles_round_trip_in_the_one_format() {
     let b = Build::new();
-    let mut all = b.all.clone();
-    all.insert("registry.example/base:v1".into());
+    let mut partial = b.components.clone();
+    if let Some(base) = partial.base.as_mut() {
+        base.insert("registry.example/base:v1".into());
+    }
     let unformatted: Manifest = b
         .manifest
         .iter()
@@ -348,18 +308,18 @@ fn full_and_partial_bundles_round_trip_in_the_one_format() {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let dest = b.path("unpacked");
-    for (name, refs) in [("full.tar", &b.all), ("partial.tar", &all)] {
+    for (name, components) in [("full.tar", &b.components), ("partial.tar", &partial)] {
         let mut c = b.contents();
-        c.refs = refs;
+        c.components = components;
         c.manifest = &unformatted;
         let out = b.path(name);
-        write(&c, &b.key, 0, &out).unwrap();
+        write(&c, signed_as(SIGNER), 0, &out).unwrap();
         let m = b.open(&out).unwrap();
         assert_eq!(m["FORMAT"], edge_bundle::FORMAT, "{name}");
         assert_eq!(m, b.manifest, "{name}");
-        let carried = check(&dest).unwrap();
+        let (read, carried) = check(&dest).unwrap();
         assert_eq!(carried.into_iter().collect::<Vec<_>>(), b.refs, "{name}");
-        assert_eq!(&release_refs(&dest).unwrap(), refs, "{name}");
+        assert_eq!(&read, components, "{name}");
     }
 }
 
@@ -367,13 +327,13 @@ fn full_and_partial_bundles_round_trip_in_the_one_format() {
 fn a_build_writes_no_other_format() {
     let b = Build::new();
     let out = b.path("b.tar");
-    for f in ["2", "3", ""] {
+    for f in ["3", "4", ""] {
         let mut m = b.manifest.clone();
         m.insert("FORMAT".into(), f.into());
         let mut c = b.contents();
         c.manifest = &m;
         assert!(
-            err(write(&c, &b.key, 0, &out)).contains("this writes 4"),
+            err(write(&c, signed_as(SIGNER), 0, &out)).contains("this writes 5"),
             "{f}"
         );
     }
@@ -381,16 +341,18 @@ fn a_build_writes_no_other_format() {
 }
 
 #[test]
-fn a_list_must_name_every_carried_image() {
+fn the_components_must_name_every_carried_image() {
     let b = Build::new();
     let out = b.path("b.tar");
-    let some: BTreeSet<String> = ["registry.example/base:v1".to_string()].into();
+    let some = Components {
+        base: Some(["registry.example/base:v1".to_string()].into()),
+        ..Components::default()
+    };
     let mut c = b.contents();
-    c.refs = &some;
-    assert!(err(write(&c, &b.key, 0, &out)).contains("leaves out images the layout carries"));
-    let none = BTreeSet::new();
-    c.refs = &none;
-    assert!(err(write(&c, &b.key, 0, &out)).contains("names no image"));
+    c.components = &some;
+    assert!(
+        err(write(&c, signed_as(SIGNER), 0, &out)).contains("leave out images the layout carries")
+    );
     assert!(!out.exists());
 }
 

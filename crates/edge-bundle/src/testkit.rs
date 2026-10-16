@@ -1,32 +1,44 @@
-//! Bundles sealed with ssh-keygen and packed by hand, as a build shell does:
-//! a producer independent of [`crate::write`], and one that can misbehave.
+//! Bundles packed by hand, independent of [`crate::write`], and signed for
+//! [`Trusted`]: a signature is `<signer> <sha256 of the sums>`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-pub const NAMESPACE: &str = "test-update";
+use anyhow::{Context, ensure};
+use sha2::Digest;
 
-pub fn keygen(dir: &Path, name: &str) -> (PathBuf, String) {
-    let key = dir.join(name);
-    let st = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
-        .arg(&key)
-        .status()
-        .expect("ssh-keygen");
-    assert!(st.success());
-    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
-    (key, public)
+use crate::{SIGNATURE, SUMS, Trust};
+
+/// The signer [`trust`] takes.
+pub const SIGNER: &str = "https://github.com/test/app/.github/workflows/release.yml@refs/tags/v1";
+
+pub struct Trusted(pub Vec<String>);
+
+/// A trust that takes [`SIGNER`].
+pub fn trust() -> Trusted {
+    Trusted(vec![SIGNER.into()])
 }
 
-pub fn sign(key: &Path, file: &Path, namespace: &str) {
-    let _ = std::fs::remove_file(file.with_extension("sig"));
-    let st = Command::new("ssh-keygen")
-        .args(["-q", "-Y", "sign", "-n", namespace, "-f"])
-        .arg(key)
-        .arg(file)
-        .status()
-        .expect("ssh-keygen");
-    assert!(st.success());
+impl Trust for Trusted {
+    fn verify(&self, sums: &[u8], signature: &[u8]) -> anyhow::Result<String> {
+        let (who, sha) = std::str::from_utf8(signature)
+            .ok()
+            .and_then(|s| s.trim().rsplit_once(' '))
+            .context("the signature is not a Sigstore bundle")?;
+        ensure!(
+            sha == hex::encode(sha2::Sha256::digest(sums)),
+            "the signature does not verify"
+        );
+        ensure!(
+            self.0.iter().any(|s| s == who),
+            "{who} is not a signer this unit trusts"
+        );
+        Ok(who.into())
+    }
+}
+
+/// `sums` signed as `signer`.
+pub fn sign(signer: &str, sums: &[u8]) -> Vec<u8> {
+    format!("{signer} {}\n", hex::encode(sha2::Sha256::digest(sums))).into_bytes()
 }
 
 const LAYOUT_INDEX: &str = r#"{"schemaVersion":2,"manifests":[
@@ -35,17 +47,17 @@ const LAYOUT_INDEX: &str = r#"{"schemaVersion":2,"manifests":[
 {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bb","size":1,
  "annotations":{"io.containerd.image.name":"registry.example/installer@sha256:bb"}}]}"#;
 
-/// A source tree as a build lays it out; `seal` sums and signs it.
+/// The components of [`tree`]: a base running what its layout carries.
+pub const COMPONENTS: &str =
+    r#"{"base":["registry.example/app:v2","registry.example/installer@sha256:bb"]}"#;
+
+/// A source tree of a base as a build lays it out; `seal` sums and signs it.
 pub fn tree(dir: &Path, manifest: &str) {
     std::fs::create_dir_all(dir.join("images/blobs/sha256")).unwrap();
     std::fs::write(dir.join("MANIFEST"), manifest).unwrap();
     std::fs::write(dir.join("config-patch.yaml"), "version: v1alpha1\n").unwrap();
     std::fs::write(dir.join("seed.yaml"), "").unwrap();
-    std::fs::write(
-        dir.join("refs"),
-        "registry.example/app:v2\nregistry.example/installer@sha256:bb\n",
-    )
-    .unwrap();
+    std::fs::write(dir.join(crate::components::COMPONENTS), COMPONENTS).unwrap();
     std::fs::write(
         dir.join("images/oci-layout"),
         r#"{"imageLayoutVersion":"1.0.0"}"#,
@@ -59,7 +71,7 @@ fn files(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for e in walk(dir) {
         let rel = e.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
-        if rel != "SHA256SUMS" && rel != "SHA256SUMS.sig" {
+        if rel != SUMS && rel != SIGNATURE {
             out.push(rel);
         }
     }
@@ -80,15 +92,21 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-pub fn seal(dir: &Path, key: &Path, namespace: &str) {
-    use sha2::Digest;
+/// Sums every file and signs the sums as `signer`.
+pub fn seal(dir: &Path, signer: &str) {
     let mut sums = String::new();
     for f in files(dir) {
         let h = sha2::Sha256::digest(std::fs::read(dir.join(&f)).unwrap());
         sums.push_str(&format!("{}  {f}\n", hex::encode(h)));
     }
-    std::fs::write(dir.join("SHA256SUMS"), sums).unwrap();
-    sign(key, &dir.join("SHA256SUMS"), namespace);
+    std::fs::write(dir.join(SUMS), &sums).unwrap();
+    resign(dir, signer);
+}
+
+/// Signs the sums as they stand.
+pub fn resign(dir: &Path, signer: &str) {
+    let sums = std::fs::read(dir.join(SUMS)).unwrap();
+    std::fs::write(dir.join(SIGNATURE), sign(signer, &sums)).unwrap();
 }
 
 /// The tar, `head` first, then every other file.
@@ -108,4 +126,4 @@ pub fn pack(dir: &Path, out: &Path, head: &[&str]) {
     b.finish().unwrap();
 }
 
-pub const HEAD: &[&str] = &["SHA256SUMS", "SHA256SUMS.sig"];
+pub const HEAD: &[&str] = &[SUMS, SIGNATURE];

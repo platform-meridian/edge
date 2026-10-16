@@ -24,11 +24,16 @@ Then provide:
   (`KubeTalosAPIAccessConfig`), the `edge-registry` user volume, a
   PersistentVolume of at least 16Gi for claim `edge/edge-update-state` (class
   `""`, e.g. a local PV on a user volume), and ConfigMap `edge-update` in
-  `edge` whose `config.yaml` names the key, the node's store and the stack:
+  `edge` holding Sigstore's `trusted_root.json` and a `config.yaml` naming
+  who may sign, the node's store and the stack:
 
   ```yaml
-  signingKey: ssh-ed25519 AAAA...     # signs every bundle
-  signatureNamespace: my-update       # ssh-keygen -Y sign -n
+  trustedRoot: /etc/edge-update/trusted_root.json
+  trustPolicy:                        # the signers whose bundles the unit takes
+    - issuer: https://token.actions.githubusercontent.com
+      workflow: https://github.com/my-org/my-app/.github/workflows/release.yml
+      ref: refs/tags/*
+  registryAuth: /etc/edge-update/docker-config.json  # optional: logins to pull apps
   store: /var/lib/etcd/state.log      # copied off before each update
   bless: /var/mnt/my-volume/blessed   # boot-commit's record of the boot it blessed
   stack:

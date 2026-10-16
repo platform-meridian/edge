@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# A reference bundle producer for tests, sealing with ssh-keygen.
+# A reference bundle producer for tests, sealing for a test trust.
 testkit = []
 
 [dependencies]
@@ -17,7 +17,10 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tar.workspace = true
 flate2.workspace = true
-ssh-key = { version = "0.6", features = ["ed25519", "std"] }
+# Offline only; aws-lc-rs is sigstore-crypto's only provider.
+sigstore-verify = { version = "=0.15.0", default-features = false, features = ["aws-lc-rs"] }
+sigstore-trust-root = { version = "=0.15.0", default-features = false, features = ["aws-lc-rs"] }
+sigstore-types = { version = "=0.15.0", default-features = false }
 sha2 = "0.10"
 hex = "0.4"
 nix = { workspace = true, features = ["fs"] }

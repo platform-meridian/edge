@@ -1,7 +1,7 @@
 [package]
 name = "edge-update"
 version.workspace = true
-description = "Meridian Edge: verifies and applies signed update bundles on the unit"
+description = "Meridian Edge: verifies and applies signed update bundles and apps on the unit"
 publish.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -30,6 +30,13 @@ sha2 = "0.10"
 hex = "0.4"
 rustls.workspace = true
 base64 = "0.22"
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "webpki-tokio"] }
+form_urlencoded = "1"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]

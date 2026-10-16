@@ -5,6 +5,9 @@
 //! module it does not mention stays as it is, and without a base the unit
 //! keeps its own. The stack a unit runs is its base's artifact with `modules/`
 //! rewritten from the set, one file of Flux objects per module.
+//!
+//! Anti-rollback is per part: the base by `BUILT_EPOCH`, each module by its
+//! `epoch`. The same part again is taken.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -28,7 +31,13 @@ const FLUX_CONTENT: &str = "application/vnd.cncf.flux.content.v1.tar+gzip";
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Module {
-    /// MANIFEST lines it adds while installed, such as its version.
+    #[serde(default)]
+    pub version: String,
+    /// Anti-rollback: a unit refuses one older than the one it runs.
+    pub epoch: i64,
+    #[serde(default)]
+    pub requires: Requires,
+    /// MANIFEST lines it adds while installed.
     #[serde(default)]
     pub manifest: Manifest,
     /// Every ref it runs.
@@ -39,6 +48,20 @@ pub struct Module {
     /// Machine-config documents it adds to the base's.
     #[serde(default)]
     pub machine: String,
+}
+
+/// What a module needs of the unit; empty needs nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requires {
+    /// Minimum versions, `vX.Y.Z`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub talos: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kubernetes: String,
+    /// As a FluxInstance's `spec.components` names them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flux: BTreeSet<String>,
 }
 
 /// A bundle's `components.json`.
@@ -97,17 +120,11 @@ impl Components {
             .collect()
     }
 
-    /// An unpacked bundle's, if it says what it brings.
-    pub fn read(dir: &Path) -> anyhow::Result<Option<Self>> {
-        let p = dir.join(COMPONENTS);
-        let text = match std::fs::read(&p) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).context("reading the components"),
-        };
+    pub fn read(dir: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read(dir.join(COMPONENTS)).context("reading the components")?;
         let c: Self = serde_json::from_slice(&text).context("the components are not JSON")?;
         c.check()?;
-        Ok(Some(c))
+        Ok(c)
     }
 
     /// The MANIFEST keys the bundle's modules bring.
@@ -125,6 +142,8 @@ impl Components {
 pub struct Base {
     /// The MANIFEST of the bundle that brought it, less its modules'.
     pub manifest: Manifest,
+    /// Its bundle's `BUILT_EPOCH`.
+    pub epoch: i64,
     /// Its machine config, less its modules'.
     pub patch: String,
     pub refs: BTreeSet<String>,
@@ -136,13 +155,10 @@ pub struct Base {
 pub struct Installed {
     pub base: Base,
     pub modules: BTreeMap<String, Module>,
-    /// The last bundle's, which a later one must exceed.
-    pub built_epoch: i64,
 }
 
 impl Installed {
-    /// `current` with a bundle installed: its `manifest` and, with a base, its
-    /// config `patch`. Without `current`, the bundle must bring a base.
+    /// `current` with a bundle installed. Without `current`, the bundle must bring a base.
     pub fn after(
         current: Option<&Installed>,
         manifest: &Manifest,
@@ -155,7 +171,12 @@ impl Installed {
                 let patch = patch.context("the bundle brings a base without its config patch")?;
                 let parts: Vec<&str> = c.modules.values().map(|m| m.machine.as_str()).collect();
                 let theirs = c.module_keys();
+                let epoch = manifest
+                    .get("BUILT_EPOCH")
+                    .and_then(|e| e.parse().ok())
+                    .context("the MANIFEST has no BUILT_EPOCH")?;
                 Base {
+                    epoch,
                     manifest: manifest
                         .iter()
                         .filter(|(k, _)| {
@@ -173,21 +194,39 @@ impl Installed {
                 "the bundle brings no base, and the unit's installed set is unknown: install a bundle with a base first"
             ),
         };
+        if let Some(cur) = current {
+            not_older(
+                "the unit's base",
+                (cur.base.epoch, &cur.base),
+                (base.epoch, &base),
+            )?;
+            for (name, m) in &c.modules {
+                if let Some(old) = cur.modules.get(name) {
+                    not_older(
+                        &format!("the unit's {name}"),
+                        (old.epoch, old),
+                        (m.epoch, m),
+                    )?;
+                }
+            }
+        }
         let mut modules = current.map(|c| c.modules.clone()).unwrap_or_default();
         for name in &c.remove {
             modules.remove(name);
         }
         modules.extend(c.modules.clone());
-        let epoch = manifest
-            .get("BUILT_EPOCH")
-            .and_then(|e| e.parse().ok())
-            .context("the MANIFEST has no BUILT_EPOCH")?;
-        let next = Self {
-            base,
-            modules,
-            built_epoch: epoch,
-        };
+        let next = Self { base, modules };
         next.patch()?;
+        Ok(next)
+    }
+
+    /// The set without the module `name`.
+    pub fn without(&self, name: &str) -> anyhow::Result<Self> {
+        let mut next = self.clone();
+        ensure!(
+            next.modules.remove(name).is_some(),
+            "{name} is not installed"
+        );
         Ok(next)
     }
 
@@ -227,6 +266,19 @@ impl Installed {
         }
         m
     }
+}
+
+/// A part is newer than the one installed, or that one again.
+fn not_older<T: PartialEq>(
+    what: &str,
+    (was, old): (i64, &T),
+    (now, new): (i64, &T),
+) -> anyhow::Result<()> {
+    ensure!(
+        now > was || (now == was && old == new),
+        "REFUSING A DOWNGRADE: {what} is version {was} and the bundle's is {now}"
+    );
+    Ok(())
 }
 
 /// The stack's `modules/`: a kustomization of each module's objects, and with
@@ -398,6 +450,9 @@ mod tests {
 
     fn module(name: &str, digest: &str) -> Module {
         Module {
+            version: "v1".into(),
+            epoch: 1,
+            requires: Requires::default(),
             manifest: [(
                 format!("MODULE_{}", name.to_uppercase()),
                 format!("r/modules/{name}:1@{digest}"),
@@ -467,7 +522,6 @@ mod tests {
         assert_eq!(next.base, i.base);
         assert_eq!(next.modules["a"], i.modules["a"]);
         assert!(next.modules.contains_key("b"));
-        assert_eq!(next.built_epoch, 2);
         let mf = next.manifest(&m, &c);
         assert_eq!(mf[MODULES_KEY], "a b");
         assert_eq!(mf["INSTALLER_REF"], "r/i:1@sha256:aa");
@@ -509,6 +563,50 @@ mod tests {
         assert_eq!(next.base.manifest["TALOS_VERSION"], "v1.15.0");
         assert!(!next.base.manifest.contains_key("INSTALLER_REF"));
         assert_eq!(next.modules, i.modules);
+    }
+
+    #[test]
+    fn an_older_part_is_refused_and_the_same_one_taken() {
+        let i = installed();
+        let mut a = i.modules["a"].clone();
+        let c = |a: &Module| Components {
+            modules: [("a".to_string(), a.clone())].into(),
+            ..Components::default()
+        };
+        Installed::after(Some(&i), &bundle(1), None, &c(&a)).unwrap();
+        a.flux.push_str("# changed\n");
+        let e = Installed::after(Some(&i), &bundle(1), None, &c(&a)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("REFUSING A DOWNGRADE: the unit's a is version 1"),
+            "{e:#}"
+        );
+        a.epoch = 2;
+        assert_eq!(
+            Installed::after(Some(&i), &bundle(1), None, &c(&a))
+                .unwrap()
+                .modules["a"],
+            a
+        );
+
+        let (m, base) = base_bundle();
+        let patch = format!("{PATCH}---\n{VOLUME}");
+        Installed::after(Some(&i), &m, Some(&patch), &base).unwrap();
+        let mut older = m.clone();
+        older.insert("BUILT_EPOCH".into(), "0".into());
+        let e = Installed::after(Some(&i), &older, Some(&patch), &base).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("the unit's base is version 1"),
+            "{e:#}"
+        );
+    }
+
+    #[test]
+    fn an_uninstall_drops_the_module_alone() {
+        let i = installed();
+        let next = i.without("a").unwrap();
+        assert!(next.modules.is_empty());
+        assert_eq!(next.base, i.base);
+        assert!(i.without("b").is_err());
     }
 
     #[test]

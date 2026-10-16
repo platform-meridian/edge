@@ -2,15 +2,15 @@
 //!
 //!   edge-update                 serve the update API and run the engine
 //!   edge-update strip-config    a full machine config on stdin, its patch on stdout
-//!   edge-update check-bundle <bundle.tar> <key.pub> <namespace> <scratch dir>
-//!                               what the unit checks before touching anything, and
-//!                               an import into a scratch registry store
+//!   edge-update check-bundle <bundle.tar> <settings.yaml> <scratch dir>
+//!                               a unit's checks, and an import into a scratch store
 
 mod api;
 mod cluster;
 mod diff;
 mod engine;
 mod judge;
+mod pull;
 mod registry;
 mod steps;
 mod talos;
@@ -47,21 +47,32 @@ fn main() -> anyhow::Result<()> {
             print!("{}", bundle::machineconfig::strip(&full)?);
             return Ok(());
         }
-        Some("check-bundle") if args.len() == 6 => return check_bundle(&args[2..]),
+        Some("check-bundle") if args.len() == 5 => return check_bundle(&args[2..]),
         _ => {}
     }
     edge_common::init_tracing();
     serve()
 }
 
-/// Signature, sums, patch and layout, as the unit checks them; prints the MANIFEST.
+fn settings(path: &str) -> anyhow::Result<unit::Settings> {
+    serde_yaml::from_str(&std::fs::read_to_string(path).context("read the settings")?)
+        .context("parse the settings")
+}
+
+fn trust(s: &unit::Settings) -> anyhow::Result<bundle::Sigstore> {
+    let root = std::fs::read_to_string(&s.trusted_root)
+        .with_context(|| format!("read {}", s.trusted_root.display()))?;
+    bundle::Sigstore::new(&root, s.trust_policy.clone())
+}
+
+/// Prints the signer and the MANIFEST of a bundle the unit would take.
 fn check_bundle(a: &[String]) -> anyhow::Result<()> {
-    let verifier = bundle::Verifier::new(&std::fs::read_to_string(&a[1])?, &a[2])?;
-    let dest = PathBuf::from(&a[3]).join("check-bundle");
+    let trust = trust(&settings(&a[1])?)?;
+    let dest = PathBuf::from(&a[2]).join("check-bundle");
     let _ = std::fs::remove_dir_all(&dest);
     let r = (|| {
-        let manifest = bundle::unpack(std::path::Path::new(&a[0]), &dest, &verifier)?;
-        let refs = bundle::check(&dest)?;
+        let u = bundle::unpack(std::path::Path::new(&a[0]), &dest, &trust)?;
+        let (_, refs) = bundle::check(&dest)?;
         let store = edge_registry::Store::open(dest.join("store"))?;
         let tagged = store.import_layout(&dest.join(bundle::IMAGES))?;
         // Images named by digest alone are held untagged, found by their digest.
@@ -77,7 +88,8 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
             "the registry tagged {} of the layout's {named} tagged images",
             tagged.len()
         );
-        for (k, v) in &manifest {
+        println!("SIGNER={}", u.signer);
+        for (k, v) in &u.manifest {
             println!("{k}={v}");
         }
         for r in refs {
@@ -98,11 +110,9 @@ async fn serve() -> anyhow::Result<()> {
         env("EDGE_UPDATE_HEALTH_LISTEN", "0.0.0.0:7444"),
         health_router,
     ));
-    let settings: unit::Settings = serde_yaml::from_str(
-        &std::fs::read_to_string(env("EDGE_UPDATE_CONFIG", "/etc/edge-update/config.yaml"))
-            .context("read the settings")?,
-    )
-    .context("parse the settings")?;
+    let settings = settings(&env("EDGE_UPDATE_CONFIG", "/etc/edge-update/config.yaml"))?;
+    let trust = Arc::new(trust(&settings)?);
+    let puller = pull::Puller::new(settings.registry_auth.as_deref())?;
     let state = PathBuf::from(env("EDGE_UPDATE_STATE", "/var/mnt/edge-update"));
     std::fs::create_dir_all(&state)?;
     // One engine per record, whatever the Deployment does.
@@ -124,6 +134,7 @@ async fn serve() -> anyhow::Result<()> {
     let mut engine = Engine::open(
         &state,
         settings,
+        trust,
         talos,
         kube,
         Arc::new(registry::Registry::open(&PathBuf::from(env(
@@ -135,7 +146,7 @@ async fn serve() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel(8);
     let (publish, status) = watch::channel(Snapshot::default());
-    let service = Arc::new(api::Service::new(tx, status, engine.uploads()));
+    let service = Arc::new(api::Service::new(tx, status, engine.uploads(), puller));
     let listen = env("EDGE_UPDATE_LISTEN", "127.0.0.1:7443");
     let rpc = connectrpc::ConnectRpcService::new(service.register(connectrpc::Router::new()))
         .with_limits(
@@ -249,10 +260,19 @@ async fn run(
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
                         }
-                        Some(Command::Apply(tag, by, reply)) => {
-                            let r = engine.request_apply(&tag, &by).await;
+                        Some(Command::Apply(id, by, reply)) => {
+                            let r = engine.request_apply(&id, &by).await;
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
+                        }
+                        Some(Command::Uninstall(name, by, reply)) => {
+                            let r = engine.request_uninstall(&name, &by).await;
+                            publish.send_replace(snap(engine));
+                            let _ = reply.send(r);
+                        }
+                        Some(Command::Apps(reply)) => {
+                            let _ = reply.send(engine.apps().await);
+                            continue;
                         }
                         Some(Command::Power(p, reply)) => {
                             let _ = reply.send(engine.power(p).await);

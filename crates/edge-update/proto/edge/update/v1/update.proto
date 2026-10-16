@@ -1,5 +1,6 @@
-// Updates the unit from bundles signed by the pinned update key. Every call is
-// safe to repeat; an update in progress survives a reboot or power cut.
+// Updates the unit from signed bundles, and installs and uninstalls apps.
+// Every call is safe to repeat; an update in progress survives a reboot or
+// power cut.
 syntax = "proto3";
 
 package edge.update.v1;
@@ -9,14 +10,20 @@ service UpdateService {
   rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
   // Stores one chunk. A chunk already held is accepted again.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
-  // Checks a complete upload against the pinned key and this unit, changing
+  // Checks a complete upload against the trust policy and this unit, changing
   // nothing. Refused while an update runs, except on a stack trial that is
   // unhealthy with no good release to roll back to: that trial is ended as
   // failed, and Apply then moves the stack off it. Uploads are taken then too.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
-  // Applies the verified bundle. Refused while the OS the unit booted is on
+  // Applies the verified release. Refused while the OS the unit booted is on
   // trial, since the update's own trial falls back to a blessed one.
   rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // Pulls an app by OCI reference into the upload, then verifies it as Verify does.
+  rpc Install(InstallRequest) returns (InstallResponse);
+  // Composes the installed set without an app and verifies it, for Apply.
+  rpc Uninstall(UninstallRequest) returns (UninstallResponse);
+  // The apps installed in the stack the unit runs.
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   // The status now, then every change to it.
   rpc WatchStatus(WatchStatusRequest) returns (stream WatchStatusResponse);
@@ -73,12 +80,12 @@ message Upload {
   string refused = 11;
 }
 
-// What a bundle says of itself, signed by the pinned key.
+// What a bundle says of itself, signed.
 message Head {
   map<string, string> manifest = 1;
   // Release notes, Markdown, if the bundle carries any.
   string notes = 2;
-  // The key it verified against: "SHA256:<fingerprint> <comment>".
+  // The workflow identity its Sigstore certificate names: "<workflow>@<ref>".
   string signer = 3;
   // What its MANIFEST says it brings: a base or none, its modules, and those it removes.
   bool brings_base = 4;
@@ -107,14 +114,52 @@ message VerifyResponse {
 }
 
 message ApplyRequest {
-  // The stack tag of the verified release, so a client applies what it saw.
-  string stack_tag = 1;
+  // The verified release's id.
+  string release_id = 1;
   // Who applies, as other clients see it.
   string by = 2;
 }
 
 message ApplyResponse {
   Status status = 1;
+}
+
+message InstallRequest {
+  // The app's OCI artifact: "ghcr.io/<owner>/<app>:<tag>" or "…@sha256:…".
+  string reference = 1;
+  // Who installs, as other clients see it.
+  string by = 2;
+}
+
+message InstallResponse {
+  Status status = 1;
+}
+
+message UninstallRequest {
+  string name = 1;
+  string by = 2;
+}
+
+message UninstallResponse {
+  Status status = 1;
+}
+
+message ListAppsRequest {}
+
+message ListAppsResponse {
+  repeated App apps = 1;
+}
+
+// An app installed: a module of the unit's installed set.
+message App {
+  string name = 1;
+  string version = 2;
+  int64 epoch = 3;
+  repeated string images = 4;
+  // The oldest Talos and Kubernetes, and the Flux components, it needs.
+  string requires_talos = 5;
+  string requires_kubernetes = 6;
+  repeated string requires_flux = 7;
 }
 
 message GetStatusRequest {}
@@ -415,24 +460,25 @@ message Unit {
 }
 
 message Release {
-  string stack_tag = 1;
+  // Minted by the unit; it tags the release's stack.
+  string id = 1;
   string talos_version = 2;
-  int64 built_epoch = 3;
-  // Every MANIFEST line, as signed.
-  map<string, string> manifest = 4;
-  bytes sha256 = 5;
-  string notes = 6;
-  // Head.signer.
-  string signer = 7;
+  // The installed set's MANIFEST.
+  map<string, string> manifest = 3;
+  // The bundle's; empty for an uninstall.
+  bytes sha256 = 4;
+  string notes = 5;
+  // Head.signer; empty for an uninstall.
+  string signer = 6;
   // What verification found, passed or not.
-  repeated Check checks = 8;
-  Diff diff = 9;
-  repeated Component components = 10;
+  repeated Check checks = 7;
+  Diff diff = 8;
+  repeated Component components = 9;
   // What the bundle itself brought, before it was merged into the unit's set:
   // a base or none, the modules it brought, and those it removed.
-  bool brings_base = 11;
-  repeated string modules = 12;
-  repeated string removes = 13;
+  bool brings_base = 10;
+  repeated string modules = 11;
+  repeated string removes = 12;
 }
 
 enum Outcome {

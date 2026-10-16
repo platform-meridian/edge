@@ -450,6 +450,14 @@ impl Cluster for FakeCluster {
     async fn flux_version(&self, _: &Ref) -> anyhow::Result<String> {
         Ok("v2.6.4".into())
     }
+    async fn flux_components(&self, _: &Ref) -> anyhow::Result<BTreeSet<String>> {
+        Ok(["source-controller", "kustomize-controller"]
+            .map(String::from)
+            .into())
+    }
+    async fn kubernetes_version(&self) -> anyhow::Result<String> {
+        Ok("v1.35.2".into())
+    }
     async fn sync(&self, _: &Ref) -> anyhow::Result<(String, String)> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
@@ -610,9 +618,9 @@ impl Registry for FakeRegistry {
 pub(crate) struct Harness {
     pub(crate) world: Shared,
     dir: tempfile::TempDir,
-    key: PathBuf,
-    public: String,
     clock: Arc<AtomicI64>,
+    /// The id the engine mints next: the tag of the spec uploaded last.
+    next: Arc<Mutex<String>>,
     pub(crate) engine: Option<Engine>,
 }
 
@@ -624,18 +632,23 @@ pub(crate) struct Spec {
     extra: String,
     patch: String,
     format: &'static str,
-    /// What the layout carries: by default the release's app and judge, and a shared base.
     carried: Vec<String>,
-    /// Every ref the release runs, signed as `refs`: by default what it carries.
-    refs: Option<Vec<String>>,
     notes: Option<String>,
     instance: Option<String>,
     /// What the bundle brings; with a base, a real stack artifact `reg/stack:<tag>`.
-    components: Option<Components>,
+    components: Components,
 }
 
 impl Spec {
+    /// A base, without modules, running its app and judge and a shared base.
     pub(crate) fn new(tag: &str) -> Self {
+        let carried = vec![
+            format!("reg/app:{tag}"),
+            format!("reg/judge:{tag}"),
+            BASE.into(),
+        ];
+        let mut runs: BTreeSet<String> = carried.iter().cloned().collect();
+        runs.insert(stack_ref(tag));
         Self {
             tag: tag.into(),
             epoch: 2000,
@@ -644,15 +657,13 @@ impl Spec {
             extra: "LOCK_PROFILE=edge\nSTACK_PATH=./base\n".into(),
             patch: patch(tag),
             format: crate::bundle::FORMAT,
-            carried: vec![
-                format!("reg/app:{tag}"),
-                format!("reg/judge:{tag}"),
-                BASE.into(),
-            ],
-            refs: None,
+            carried,
             notes: None,
             instance: None,
-            components: None,
+            components: Components {
+                base: Some(runs),
+                ..Components::default()
+            },
         }
     }
 
@@ -672,7 +683,7 @@ impl Spec {
         };
         Self {
             carried: c.refs().into_iter().collect(),
-            components: Some(c),
+            components: c,
             // The unit installs the installer the base names, and runs it after.
             patch: format!(
                 "{}---\napiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n  image: reg/installer:{tag}@{DIGEST}\n",
@@ -686,25 +697,28 @@ impl Spec {
     fn modules(tag: &str, epoch: i64, modules: &[&str], remove: &[&str]) -> Self {
         let c = Components {
             base: None,
-            modules: modules.iter().map(|m| (m.to_string(), module(m))).collect(),
+            modules: modules
+                .iter()
+                .map(|m| {
+                    let mut module = module(m);
+                    module.epoch = epoch;
+                    (m.to_string(), module)
+                })
+                .collect(),
             remove: remove.iter().map(|m| m.to_string()).collect(),
         };
         Self {
             epoch,
             carried: c.refs().into_iter().collect(),
-            components: Some(c),
+            components: c,
             ..Self::new(tag)
         }
     }
 
     /// Carries its app and judge, and relies on the shared base it lists.
     fn partial(tag: &str) -> Self {
-        let own = [format!("reg/app:{tag}"), format!("reg/judge:{tag}")];
-        let mut refs = own.to_vec();
-        refs.push(BASE.into());
         Self {
-            carried: own.to_vec(),
-            refs: Some(refs),
+            carried: vec![format!("reg/app:{tag}"), format!("reg/judge:{tag}")],
             ..Self::new(tag)
         }
     }
@@ -718,6 +732,9 @@ fn stack_ref(tag: &str) -> String {
 
 fn module(name: &str) -> crate::bundle::components::Module {
     crate::bundle::components::Module {
+        version: "1".into(),
+        epoch: 1,
+        requires: Default::default(),
         manifest: [(
             format!("MODULE_{}", name.to_uppercase()),
             format!("reg/modules/{name}:1@sha256:{name}"),
@@ -809,11 +826,12 @@ spec:
 
 const BLESS: &str = "/var/mnt/edge-evidence/boot-commit/blessed";
 
-fn settings(public: &str) -> Settings {
+fn settings() -> Settings {
     let r = |n: &str| Ref::try_from(format!("flux-system/{n}")).unwrap();
     Settings {
-        signing_key: public.into(),
-        signature_namespace: testkit::NAMESPACE.into(),
+        trusted_root: "/etc/edge-update/trusted_root.json".into(),
+        trust_policy: Vec::new(),
+        registry_auth: None,
         store: "/var/lib/etcd/state.log".into(),
         bless: BLESS.into(),
         stack: Stack {
@@ -831,13 +849,11 @@ fn settings(public: &str) -> Settings {
 impl Harness {
     pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let (key, public) = testkit::keygen(dir.path(), "update");
         let mut h = Self {
             world: Arc::new(Mutex::new(World::new())),
             dir,
-            key,
-            public,
             clock: Arc::new(AtomicI64::new(1_000_000)),
+            next: Arc::default(),
             engine: None,
         };
         h.reopen();
@@ -855,17 +871,19 @@ impl Harness {
     fn reopen(&mut self) {
         let w = self.world.clone();
         let clock = self.clock.clone();
-        self.engine = Some(
-            Engine::open(
-                &self.state(),
-                settings(&self.public),
-                Arc::new(FakeTalos(w.clone())),
-                Arc::new(FakeCluster(w.clone())),
-                Arc::new(FakeRegistry(w)),
-                Arc::new(move || clock.load(Ordering::SeqCst)),
-            )
-            .unwrap(),
-        );
+        let mut e = Engine::open(
+            &self.state(),
+            settings(),
+            Arc::new(testkit::trust()),
+            Arc::new(FakeTalos(w.clone())),
+            Arc::new(FakeCluster(w.clone())),
+            Arc::new(FakeRegistry(w)),
+            Arc::new(move || clock.load(Ordering::SeqCst)),
+        )
+        .unwrap();
+        let next = self.next.clone();
+        e.mint = Arc::new(move || next.lock().unwrap().clone());
+        self.engine = Some(e);
     }
 
     fn e(&mut self) -> &mut Engine {
@@ -878,55 +896,57 @@ impl Harness {
 
     /// Builds, signs and uploads a bundle; returns its sha256.
     fn upload(&mut self, s: &Spec) -> String {
-        self.upload_signed(s, &self.key.clone())
+        self.upload_signed(s, testkit::SIGNER)
     }
 
-    fn upload_signed(&mut self, s: &Spec, key: &Path) -> String {
+    fn upload_signed(&mut self, s: &Spec, signer: &str) -> String {
+        let r = &self.e().record;
+        let taken = r.release.iter().chain(
+            r.history
+                .iter()
+                .filter(|e| e.outcome != Outcome::Refused)
+                .filter_map(|e| e.release.as_ref()),
+        );
+        let id = match taken.map(|r| r.id.as_str()).any(|id| id == s.tag) {
+            false => s.tag.clone(),
+            true => format!("{}-again", s.tag),
+        };
+        *self.next.lock().unwrap() = id;
         let src = self.dir.path().join(format!("src-{}", s.tag));
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(src.join("images/blobs/sha256")).unwrap();
-        let base = s.components.as_ref().is_none_or(|c| c.base.is_some());
+        let c = &s.components;
+        let base = c.base.is_some();
         let mut manifests: Vec<serde_json::Value> = Vec::new();
-        let mut stack = DIGEST.to_string();
-        if s.components.is_some() && base {
+        let mut mf = format!("FORMAT={}\n", s.format);
+        if base {
             let e = stack_artifact(&src.join("images/blobs/sha256"), &s.tag);
-            stack = e["digest"].as_str().unwrap().into();
+            let stack = e["digest"].as_str().unwrap().to_string();
             manifests.push(e);
-        }
-        let mut mf = if base {
-            format!(
-                "FORMAT={}\nSTACK_TAG={}\nSTACK_DIGEST={stack}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
+            mf.push_str(&format!(
+                "STACK_DIGEST={stack}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
                  TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
-                s.format, s.tag, s.tag, s.talos, s.epoch, s.secureboot, s.extra
-            )
-        } else {
-            format!(
-                "FORMAT={}\nSTACK_TAG={}\nBUILT_EPOCH={}\nLOCK_PROFILE=edge\n",
-                crate::bundle::FORMAT,
-                s.tag,
-                s.epoch
-            )
-        };
-        if let Some(c) = &s.components {
-            for m in c.modules.values() {
-                for (k, v) in &m.manifest {
-                    mf.push_str(&format!("{k}={v}\n"));
-                }
-            }
-            let names: Vec<&str> = c.modules.keys().map(String::as_str).collect();
-            if !names.is_empty() {
-                mf.push_str(&format!("MODULES={}\n", names.join(" ")));
-            }
-            std::fs::write(
-                src.join(crate::bundle::components::COMPONENTS),
-                serde_json::to_vec(c).unwrap(),
-            )
-            .unwrap();
+                s.tag, s.talos, s.epoch, s.secureboot, s.extra
+            ));
         }
+        for m in c.modules.values() {
+            for (k, v) in &m.manifest {
+                mf.push_str(&format!("{k}={v}\n"));
+            }
+        }
+        let names: Vec<&str> = c.modules.keys().map(String::as_str).collect();
+        if !names.is_empty() {
+            mf.push_str(&format!("MODULES={}\n", names.join(" ")));
+        }
+        std::fs::write(
+            src.join(crate::bundle::components::COMPONENTS),
+            serde_json::to_vec(c).unwrap(),
+        )
+        .unwrap();
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
         if base {
             let mut patch = s.patch.clone();
-            for m in s.components.iter().flat_map(|c| c.modules.values()) {
+            for m in c.modules.values() {
                 patch.push_str(&format!("---\n{}", m.machine));
             }
             std::fs::write(src.join("config-patch.yaml"), patch).unwrap();
@@ -942,22 +962,13 @@ impl Harness {
         manifests.extend(
             s.carried
                 .iter()
-                .filter(|r| s.components.is_none() || **r != stack_ref(&s.tag))
+                .filter(|r| **r != stack_ref(&s.tag))
                 .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}})),
         );
         let index = serde_json::json!({ "manifests": manifests });
         std::fs::write(src.join("images/index.json"), index.to_string()).unwrap();
-        // A bundle of the formats before lists no refs.
-        if s.format == crate::bundle::FORMAT {
-            let refs = s.refs.as_ref().unwrap_or(&s.carried);
-            let mut refs: Vec<&String> = refs.iter().collect();
-            refs.sort();
-            refs.dedup();
-            let text: String = refs.iter().map(|r| format!("{r}\n")).collect();
-            std::fs::write(src.join(crate::bundle::REFS), text).unwrap();
-        }
         std::fs::write(src.join("images/blobs/sha256/aa"), &s.tag).unwrap();
-        testkit::seal(&src, key, testkit::NAMESPACE);
+        testkit::seal(&src, signer);
         let tar = self.dir.path().join("bundle.tar");
         testkit::pack(&src, &tar, testkit::HEAD);
         let data = std::fs::read(&tar).unwrap();
@@ -1012,7 +1023,8 @@ impl Harness {
             "refused: {:?}",
             self.e().record.history.first()
         );
-        self.e().request_apply(&s.tag, "").await.unwrap();
+        let id = self.e().release().unwrap().id.clone();
+        self.e().request_apply(&id, "").await.unwrap();
         self.run(interrupt).await;
         self.e().record.history[0].clone()
     }
@@ -1054,7 +1066,14 @@ async fn the_os_the_unit_runs_is_not_installed_again() {
     let w = h.w();
     assert_eq!(
         w.log,
-        ["import", "stage", "apply", "seed", "repoint update-new"]
+        [
+            "import",
+            "import",
+            "stage",
+            "apply",
+            "seed",
+            "repoint update-new"
+        ]
     );
     assert_eq!(w.boot_id, 1, "rebooted");
 }
@@ -1100,6 +1119,7 @@ async fn the_os_is_installed_unless_the_unit_runs_it_already() {
             h.w().log,
             [
                 "import",
+                "import",
                 "stage",
                 "install",
                 "reboot",
@@ -1128,6 +1148,7 @@ async fn an_update_commits_in_order() {
     assert_eq!(
         w.log,
         [
+            "import",
             "import",
             "stage",
             "install",
@@ -1252,8 +1273,8 @@ async fn a_new_os_that_does_not_stay_up_stops_the_update() {
 
 #[tokio::test]
 async fn cut_after_saving_keeps_unit_config() {
-    // The import, then the staging: the old OS boots on the update's config.
-    for n in [1, 2] {
+    // The imports, then the staging: the old OS boots on the update's config.
+    for n in [2, 3] {
         let mut h = Harness::new();
         {
             let mut w = h.w();
@@ -1369,6 +1390,8 @@ async fn registry_keeps_two_releases_and_what_runs() {
             "reg/base@sha256:shared",
             "reg/judge:update-b",
             "reg/judge:update-c",
+            "reg/stack:update-b",
+            "reg/stack:update-c",
         ]
         .into_iter()
         .map(String::from)
@@ -1439,12 +1462,12 @@ async fn a_partial_bundle_keeps_what_a_failed_release_left_it() {
 #[tokio::test]
 async fn a_bundle_of_an_old_format_is_refused_as_it_arrives() {
     let mut h = Harness::new();
-    for f in ["2", "3"] {
+    for f in ["3", "4"] {
         let mut s = Spec::new("update-new");
         s.format = f;
         let sha = h.upload(&s);
         let up = h.e().uploads().current().unwrap();
-        let want = format!("the bundle is format {f}, and only format 4 is read: rebuild it");
+        let want = format!("the bundle is format {f}, and only format 5 is read: rebuild it");
         assert!(up.refused.contains(&want), "{}", up.refused);
         assert!(h.e().request_verify(&sha).await.is_err());
         assert!(h.w().log.is_empty());
@@ -1601,10 +1624,13 @@ async fn an_unreadable_bless_record_is_no_bless() {
 #[tokio::test]
 async fn a_bundle_signed_by_another_key_is_refused_before_any_call() {
     let mut h = Harness::new();
-    let (other, _) = testkit::keygen(h.dir.path(), "other");
-    let sha = h.upload_signed(&Spec::new("update-new"), &other);
+    let sha = h.upload_signed(&Spec::new("update-new"), "a stranger");
     let up = h.e().uploads().current().unwrap();
-    assert!(up.refused.contains("pinned update key"), "{}", up.refused);
+    assert!(
+        up.refused.contains("not a signer this unit trusts"),
+        "{}",
+        up.refused
+    );
     assert!(h.e().request_verify(&sha).await.is_err());
     assert!(h.e().record.history.is_empty());
     assert_eq!(
@@ -1830,8 +1856,8 @@ async fn a_cut_between_install_and_its_record_does_not_install_twice() {
     let mut h = Harness::new();
     {
         let mut w = h.w();
-        // import, stage, install: the cut lands straight after the install.
-        w.crash_at = Some(3);
+        // Two imports, stage, install: the cut lands straight after the install.
+        w.crash_at = Some(4);
         w.cut_on_crash = true;
     }
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
@@ -2168,7 +2194,7 @@ async fn verification_says_what_applying_changes() {
             ("downtime", CheckState::Note),
         ]
     );
-    assert!(r.signer.starts_with("SHA256:"));
+    assert_eq!(r.signer, testkit::SIGNER);
     let d = r.diff.unwrap();
     assert_eq!(
         d.stack,
@@ -2195,11 +2221,12 @@ async fn verification_says_what_applying_changes() {
             ("reg/app", diff::Change::Changed),
             ("reg/base", diff::Change::Unchanged),
             ("reg/judge", diff::Change::Changed),
+            ("reg/stack", diff::Change::Changed),
         ]
     );
     assert_eq!(
         h.e().unit.components.len(),
-        3,
+        4,
         "the running release names what runs"
     );
 }
@@ -2325,11 +2352,11 @@ async fn storage_counts_what_a_collection_frees() {
     h.w().held.insert("reg/app:stale".into());
     h.e().refresh_unit().await;
     let s = h.e().storage().await.unwrap();
-    // The fake holds 100 bytes an image: the previous release's app and judge.
-    assert_eq!((s.reclaimable, s.previous), (100, 200));
+    // The fake holds 100 bytes an image: the previous release's app, judge and stack.
+    assert_eq!((s.reclaimable, s.previous), (100, 300));
     assert_eq!(h.e().collect(false).await.unwrap(), 100);
     assert!(h.w().held.contains("reg/app:update-new"));
-    assert_eq!(h.e().collect(true).await.unwrap(), 200);
+    assert_eq!(h.e().collect(true).await.unwrap(), 300);
     assert!(!h.w().held.contains("reg/app:update-new"));
     assert!(h.w().held.contains("reg/app:update-newer"));
     let e = h
@@ -2841,4 +2868,94 @@ async fn the_units_modules_are_its_releases_else_as_its_stack_records_them() {
     h.w().modules = BTreeMap::from([("MODULES".into(), "stale".into())]);
     h.e().refresh_unit().await;
     assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
+}
+
+#[tokio::test]
+async fn an_uninstall_needs_no_bundle_and_drops_the_app_alone() {
+    let mut h = with_a().await;
+    assert_eq!(
+        h.e().apps().await.unwrap().keys().collect::<Vec<_>>(),
+        ["a"]
+    );
+    let e = h.e().request_uninstall("b", "ann").await.unwrap_err();
+    assert!(e.to_string().contains("b is not installed"), "{e}");
+    *h.next.lock().unwrap() = "update-gone".into();
+    h.e().request_uninstall("a", "ann").await.unwrap();
+    let r = h.e().release().unwrap().clone();
+    assert_eq!((r.id.as_str(), r.signer.as_str()), ("update-gone", ""));
+    assert_eq!(r.removes, BTreeSet::from(["a".to_string()]));
+    assert!(!r.refs.contains("reg/a:1"));
+    h.w().log.clear();
+    h.e().request_apply("update-gone", "ann").await.unwrap();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    assert!(!manifest_of(&e).contains_key("MODULES"));
+    assert!(h.e().apps().await.unwrap().is_empty());
+    let stack = composed_stack(&h, "update-gone");
+    assert_eq!(stack["base/tag"], "update-a");
+    assert!(!stack.contains_key("modules/a.yaml"));
+    let w = h.w();
+    assert_eq!(w.tag, "update-gone");
+    assert!(!w.active.contains("name: a-data"));
+    assert!(
+        !w.log.iter().any(|l| l == "install" || l == "seed"),
+        "{:?}",
+        w.log
+    );
+}
+
+#[tokio::test]
+async fn an_app_older_than_the_one_installed_is_refused() {
+    let mut h = with_a().await;
+    let e = h
+        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |_, _| {})
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.w().log.clear();
+    refused(
+        &mut h,
+        &Spec::modules("update-c", 2999, &["b"], &[]),
+        "REFUSING A DOWNGRADE: the unit's b is version 3000",
+    )
+    .await;
+    // The same app again is taken.
+    let e = h
+        .update(&Spec::modules("update-d", 3000, &["b"], &[]), |_, _| {})
+        .await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+}
+
+#[tokio::test]
+async fn an_app_needing_what_the_unit_lacks_is_refused() {
+    let mut h = with_a().await;
+    let needs = |set: &dyn Fn(&mut crate::bundle::components::Requires)| {
+        let mut s = Spec::modules("update-b", 3000, &["b"], &[]);
+        set(&mut s.components.modules.get_mut("b").unwrap().requires);
+        s
+    };
+    for (s, why) in [
+        (
+            needs(&|r| r.talos = "v1.15.0".into()),
+            "b requires Talos v1.15.0 and the unit would run v1.14.1",
+        ),
+        (
+            needs(&|r| r.kubernetes = "v1.36.0".into()),
+            "b requires Kubernetes v1.36.0 and the unit runs v1.35.2",
+        ),
+        (
+            needs(&|r| r.flux = ["helm-controller".to_string()].into()),
+            "b requires Flux's helm-controller",
+        ),
+    ] {
+        h.w().log.clear();
+        refused(&mut h, &s, why).await;
+    }
+    let s = needs(&|r| {
+        r.talos = "v1.14.0".into();
+        r.kubernetes = "v1.35.2".into();
+        r.flux = ["source-controller".to_string()].into();
+    });
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
 }

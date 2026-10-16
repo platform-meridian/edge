@@ -1,24 +1,21 @@
-//! A bundle is one tar: `SHA256SUMS`, then its SSH signature, then every file
-//! the sums name. Nothing past the first two entries is written anywhere until
-//! the signature has verified against the pinned key.
+//! A bundle is one tar: `SHA256SUMS`, then its Sigstore signature
+//! (`SHA256SUMS.sigstore.json`), then every file the sums name. Nothing past
+//! the first two entries is written anywhere until the signature has verified
+//! against the unit's [`Trust`].
 //!
-//! - `MANIFEST`: `KEY=value` lines. `FORMAT=4` ([`FORMAT`]), `STACK_TAG`, `STACK_DIGEST`,
-//!   `INSTALLER_REF` (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version
-//!   anti-rollback compares), `SECUREBOOT`; optionally `STACK_PATH`, and
-//!   `LOCK_<KEY>=v`, which the unit's stack lock must match.
-//! - `config-patch.yaml`: the machine config without what the unit keeps
-//!   (`machineconfig`).
-//! - `seed.yaml`: objects applied server-side before the stack moves.
-//! - `images/`: an OCI image layout holding every image, the installer and the
-//!   stack artifact, each named in its index by `io.containerd.image.name`
-//!   (`oci`).
-//! - `refs`: every ref the release runs, one per line. The layout carries
-//!   some or all of them; the unit must already hold the rest.
-//! - `components.json`, optional: what the bundle brings, the base or not and
-//!   modules, and what it removes ([`components`]). With it, installing merges
-//!   the bundle into the unit's installed set. A bundle without a base (its
-//!   MANIFEST names no `STACK_DIGEST`) has no config patch, seed or stack of
-//!   its own, and its `refs` may be empty.
+//! - `MANIFEST`: `KEY=value` lines. `FORMAT=5` ([`FORMAT`]); with a base,
+//!   `STACK_DIGEST`, `INSTALLER_REF` (by digest), `TALOS_VERSION`,
+//!   `BUILT_EPOCH` (the version the base's anti-rollback compares),
+//!   `SECUREBOOT`, optionally `STACK_PATH`, and `LOCK_<KEY>=v`, which the
+//!   unit's stack lock must match. A bundle without a base names neither.
+//! - `components.json`: what the bundle brings and removes ([`components`]).
+//! - `config-patch.yaml`, with a base: the machine config without what the
+//!   unit keeps (`machineconfig`).
+//! - `seed.yaml`, with a base: objects applied server-side before the stack moves.
+//! - `images/`: an OCI image layout holding images the components run, the
+//!   installer and the stack artifact, each named in its index by
+//!   `io.containerd.image.name` (`oci`). The unit must already hold any ref
+//!   it leaves out.
 //! - `NOTES.md`, optional: release notes for a person, at most 64 KiB.
 //! - `fluxinstance.yaml`, optional: the FluxInstance the release runs on,
 //!   applied once the stack has brought the operator that knows it.
@@ -27,12 +24,16 @@
 //! `COMPONENT_<NAME>=<ref> <digest> <version> dirty=<bool>` line each
 //! ([`components`]).
 //!
+//! An app is a bundle without a base that brings one module, also published
+//! as an OCI artifact whose one layer is the tar ([`APP_ARTIFACT`]).
+//!
 //! A build writes one with [`write`]; a unit reads one with [`unpack`] and
 //! [`check`], or its signed head alone, as it arrives, with [`read_head`].
 
 pub mod components;
 pub mod machineconfig;
 pub mod oci;
+pub mod sigstore;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
@@ -44,22 +45,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
-use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 
 pub use oci::{layout_images, layout_refs};
+pub use sigstore::{Signer, Sigstore, Trust};
 
 pub const SUMS: &str = "SHA256SUMS";
-pub const SIG: &str = "SHA256SUMS.sig";
+pub const SIGNATURE: &str = "SHA256SUMS.sigstore.json";
 pub const MANIFEST: &str = "MANIFEST";
 pub const PATCH: &str = "config-patch.yaml";
 pub const SEED: &str = "seed.yaml";
 pub const IMAGES: &str = "images";
-pub const REFS: &str = "refs";
 pub const NOTES: &str = "NOTES.md";
 pub const INSTANCE: &str = "fluxinstance.yaml";
 
+/// An app's OCI `artifactType`, and the media type of its one layer, the tar.
+pub const APP_ARTIFACT: &str = "application/vnd.meridian.app.v1";
+pub const APP_LAYER: &str = "application/vnd.meridian.bundle.v1.tar";
+
 /// The one layout read and written: any other `FORMAT` is refused.
-pub const FORMAT: &str = "4";
+pub const FORMAT: &str = "5";
 
 /// The bundle brings a base: its MANIFEST names the stack.
 pub fn has_base(m: &Manifest) -> bool {
@@ -67,78 +71,9 @@ pub fn has_base(m: &Manifest) -> bool {
 }
 
 const MAX_SUMS: u64 = 64 << 20;
-const MAX_SIG: u64 = 64 << 10;
+const MAX_SIGNATURE: u64 = 64 << 10;
 const MAX_MANIFEST: u64 = 1 << 20;
 const MAX_NOTES: u64 = 64 << 10;
-
-/// The pinned key a unit checks a bundle's signature against.
-#[derive(Clone)]
-pub struct Verifier {
-    key: PublicKey,
-    namespace: String,
-}
-
-impl Verifier {
-    pub fn new(openssh: &str, namespace: &str) -> anyhow::Result<Self> {
-        let key = PublicKey::from_openssh(openssh.trim()).context("the pinned update key")?;
-        ensure!(!namespace.is_empty(), "no signature namespace");
-        Ok(Self {
-            key,
-            namespace: namespace.into(),
-        })
-    }
-
-    /// The pinned key as a person checks it: `SHA256:<fingerprint> <comment>`.
-    pub fn signer(&self) -> String {
-        let fp = self.key.fingerprint(HashAlg::Sha256).to_string();
-        match self.key.comment() {
-            "" => fp,
-            c => format!("{fp} {c}"),
-        }
-    }
-
-    pub fn verify(&self, msg: &[u8], armored: &[u8]) -> anyhow::Result<()> {
-        let sig = SshSig::from_pem(armored).context("the signature is not an SSH signature")?;
-        self.key.verify(&self.namespace, msg, &sig).map_err(|e| {
-            anyhow::anyhow!("the signature does not verify against the pinned update key: {e}")
-        })
-    }
-}
-
-/// The build's private key: signs as `ssh-keygen -Y sign` does.
-pub struct SigningKey {
-    key: PrivateKey,
-    namespace: String,
-}
-
-impl SigningKey {
-    /// An unencrypted OpenSSH private key.
-    pub fn from_openssh(pem: &str, namespace: &str) -> anyhow::Result<Self> {
-        let key = PrivateKey::from_openssh(pem.trim()).context("the update signing key")?;
-        ensure!(
-            !key.is_encrypted(),
-            "the update signing key is encrypted; sign with an unencrypted copy"
-        );
-        ensure!(!namespace.is_empty(), "no signature namespace");
-        Ok(Self {
-            key,
-            namespace: namespace.into(),
-        })
-    }
-
-    /// The public half, as a unit pins it.
-    pub fn public_key(&self) -> anyhow::Result<String> {
-        Ok(self.key.public_key().to_openssh()?)
-    }
-
-    pub fn sign(&self, msg: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let sig = self
-            .key
-            .sign(&self.namespace, HashAlg::Sha512, msg)
-            .map_err(|e| anyhow::anyhow!("signing: {e}"))?;
-        Ok(sig.to_pem(LineEnding::LF)?.into_bytes())
-    }
-}
 
 pub type Manifest = BTreeMap<String, String>;
 
@@ -187,7 +122,7 @@ fn parse_sums(text: &str) -> anyhow::Result<BTreeMap<PathBuf, [u8; 32]>> {
             .with_context(|| format!("{SUMS}: {hash:?} is not a sha256"))?;
         let path = safe(Path::new(path))?;
         ensure!(
-            path != Path::new(SUMS) && path != Path::new(SIG),
+            path != Path::new(SUMS) && path != Path::new(SIGNATURE),
             "{SUMS} names itself or its signature"
         );
         ensure!(
@@ -218,22 +153,30 @@ fn read_small(entry: &mut impl Read, size: u64, max: u64, what: &str) -> anyhow:
     Ok(buf)
 }
 
-/// Verifies `tar` against `verifier` and unpacks it into `dest`, which must
+/// Verifies `tar` against `trust` and unpacks it into `dest`, which must
 /// not exist. On any failure `dest` is removed.
-pub fn unpack(tar: &Path, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
-    unpack_counting(tar, dest, verifier, &AtomicU64::new(0))
+pub fn unpack(tar: &Path, dest: &Path, trust: &dyn Trust) -> anyhow::Result<Unpacked> {
+    unpack_counting(tar, dest, trust, &AtomicU64::new(0))
+}
+
+/// A bundle verified and unpacked: its MANIFEST, and who signed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unpacked {
+    pub manifest: Manifest,
+    /// [`Trust::verify`]'s signer.
+    pub signer: String,
 }
 
 /// [`unpack`], adding to `read` each byte of the bundle as it is read.
 pub fn unpack_counting(
     tar: &Path,
     dest: &Path,
-    verifier: &Verifier,
+    trust: &dyn Trust,
     read: &AtomicU64,
-) -> anyhow::Result<Manifest> {
+) -> anyhow::Result<Unpacked> {
     ensure!(!dest.exists(), "{} already exists", dest.display());
     let file = File::open(tar).context("open the bundle")?;
-    let r = unpack_into(Counting { inner: file, read }, dest, verifier);
+    let r = unpack_into(Counting { inner: file, read }, dest, trust);
     if r.is_err() {
         let _ = std::fs::remove_dir_all(dest);
     }
@@ -242,11 +185,11 @@ pub fn unpack_counting(
 
 type Sums = BTreeMap<PathBuf, [u8; 32]>;
 
-/// The first two entries, the sums and their signature, verified.
+/// The first two entries, the sums and their signature, verified; and the signer.
 fn signed_sums<R: Read>(
     entries: &mut tar::Entries<'_, R>,
-    verifier: &Verifier,
-) -> anyhow::Result<Sums> {
+    trust: &dyn Trust,
+) -> anyhow::Result<(Sums, String)> {
     let mut next = |want: &str, max: u64| -> anyhow::Result<Vec<u8>> {
         let mut e = entries
             .next()
@@ -254,21 +197,21 @@ fn signed_sums<R: Read>(
         let path = e.path()?.into_owned();
         ensure!(
             path == Path::new(want) && e.header().entry_type().is_file(),
-            "the bundle must start with {SUMS} then {SIG}, not {}",
+            "the bundle must start with {SUMS} then {SIGNATURE}, not {}",
             path.display()
         );
         let size = e.size();
         read_small(&mut e, size, max, want)
     };
     let sums_bytes = next(SUMS, MAX_SUMS)?;
-    let sig = next(SIG, MAX_SIG)?;
-    verifier.verify(&sums_bytes, &sig)?;
+    let sig = next(SIGNATURE, MAX_SIGNATURE)?;
+    let signer = trust.verify(&sums_bytes, &sig)?;
     let sums = parse_sums(std::str::from_utf8(&sums_bytes).context("the sums are not text")?)?;
     ensure!(
         sums.contains_key(Path::new(MANIFEST)),
         "the signed sums do not cover {MANIFEST}"
     );
-    Ok(sums)
+    Ok((sums, signer))
 }
 
 /// What a bundle says of itself, signed: readable before the rest has arrived.
@@ -276,19 +219,18 @@ fn signed_sums<R: Read>(
 pub struct Head {
     pub manifest: Manifest,
     pub notes: Option<String>,
-    /// [`Verifier::signer`] of the key it verified against.
+    /// [`Trust::verify`]'s signer.
     pub signer: String,
 }
 
 /// The signed head of a bundle from as much of its start as is at hand:
-/// `Ok(None)` until enough has arrived, an error as soon as what has arrived
-/// is not a bundle signed by the pinned key.
-pub fn read_head(start: impl Read, verifier: &Verifier) -> anyhow::Result<Option<Head>> {
+/// `Ok(None)` until enough has arrived.
+pub fn read_head(start: impl Read, trust: &dyn Trust) -> anyhow::Result<Option<Head>> {
     let mut start = Start {
         inner: start,
         ended: false,
     };
-    let r = head_of(&mut start, verifier);
+    let r = head_of(&mut start, trust);
     match r {
         Err(_) if start.ended => Ok(None),
         r => r.map(Some),
@@ -311,12 +253,12 @@ impl<R: Read> Read for Start<R> {
     }
 }
 
-fn head_of(start: &mut impl Read, verifier: &Verifier) -> anyhow::Result<Head> {
+fn head_of(start: &mut impl Read, trust: &dyn Trust) -> anyhow::Result<Head> {
     let mut archive = tar::Archive::new(start);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let sums = signed_sums(&mut entries, verifier)?;
+    let (sums, signer) = signed_sums(&mut entries, trust)?;
     let mut head = Head {
-        signer: verifier.signer(),
+        signer,
         ..Head::default()
     };
     let (mut manifest, want_notes) = (None, sums.contains_key(Path::new(NOTES)));
@@ -352,11 +294,24 @@ fn head_of(start: &mut impl Read, verifier: &Verifier) -> anyhow::Result<Head> {
 
 fn format_check(m: &Manifest) -> anyhow::Result<&'static [&'static str]> {
     match m.get("FORMAT").map(String::as_str) {
-        Some(FORMAT) if has_base(m) => Ok(&[PATCH, SEED, REFS]),
-        Some(FORMAT) => Ok(&[components::COMPONENTS, REFS]),
+        Some(FORMAT) => {}
         Some(f) => bail!("the bundle is format {f}, and only format {FORMAT} is read: rebuild it"),
         None => bail!("the bundle names no FORMAT, and only format {FORMAT} is read: rebuild it"),
     }
+    ensure!(
+        !m.contains_key("STACK_TAG"),
+        "the MANIFEST names a STACK_TAG: the unit names its releases"
+    );
+    if has_base(m) {
+        return Ok(&[components::COMPONENTS, PATCH, SEED]);
+    }
+    if let Some(k) = m
+        .keys()
+        .find(|k| *k == "BUILT_EPOCH" || k.starts_with("LOCK_"))
+    {
+        bail!("a bundle without a base names {k}: only a base does");
+    }
+    Ok(&[components::COMPONENTS])
 }
 
 /// A bundle of another format is refused as that, before what it lacks for this one.
@@ -387,10 +342,10 @@ impl<R: Read> Read for Counting<'_, R> {
     }
 }
 
-fn unpack_into(tar: impl Read, dest: &Path, verifier: &Verifier) -> anyhow::Result<Manifest> {
+fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result<Unpacked> {
     let mut archive = tar::Archive::new(tar);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let sums = signed_sums(&mut entries, verifier)?;
+    let (sums, signer) = signed_sums(&mut entries, trust)?;
 
     std::fs::create_dir_all(dest)?;
     let mut seen = BTreeSet::new();
@@ -440,7 +395,7 @@ fn unpack_into(tar: impl Read, dest: &Path, verifier: &Verifier) -> anyhow::Resu
     sync_fs(dest)?;
     let manifest = parse_manifest(&std::fs::read_to_string(dest.join(MANIFEST))?)?;
     signed_format(&sums, &manifest)?;
-    Ok(manifest)
+    Ok(Unpacked { manifest, signer })
 }
 
 /// An unpacked bundle's FluxInstance, if it carries one.
@@ -496,52 +451,34 @@ fn sync_fs(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What a unit checks of an unpacked bundle before it moves: a patch that
-/// carries nothing the unit keeps, and a layout naming at least one image,
-/// each of them in `refs`. Returns the layout's refs.
-pub fn check(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
-    let base = components::Components::read(dir)?.is_none_or(|c| c.base.is_some());
-    if base {
+/// What a unit checks of an unpacked bundle before it moves. Returns the
+/// components and the layout's refs.
+pub fn check(dir: &Path) -> anyhow::Result<(components::Components, BTreeSet<String>)> {
+    let c = components::Components::read(dir)?;
+    let manifest = parse_manifest(&std::fs::read_to_string(dir.join(MANIFEST))?)?;
+    ensure!(
+        has_base(&manifest) == c.base.is_some(),
+        "a bundle's MANIFEST names a STACK_DIGEST exactly when it brings a base"
+    );
+    if c.base.is_some() {
         machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
     }
     let carried = layout_refs(&dir.join(IMAGES))?;
+    carries(&c, &carried)?;
+    Ok((c, carried))
+}
+
+/// A carried image the components leave out would be imported, then collected.
+fn carries(c: &components::Components, carried: &BTreeSet<String>) -> anyhow::Result<()> {
     ensure!(
-        !base || !carried.is_empty(),
+        c.base.is_none() || !carried.is_empty(),
         "the image layout names no image"
     );
-    unlisted(&carried, &release_refs(dir)?)?;
-    Ok(carried)
-}
-
-/// Every ref the release runs: an unpacked bundle's `refs`, which only a
-/// bundle without a base may leave empty.
-pub fn release_refs(dir: &Path) -> anyhow::Result<BTreeSet<String>> {
-    let text = std::fs::read_to_string(dir.join(REFS)).context("reading the refs")?;
-    if text.is_empty() && components::Components::read(dir)?.is_some_and(|c| c.base.is_none()) {
-        return Ok(BTreeSet::new());
-    }
-    parse_refs(&text)
-}
-
-fn parse_refs(text: &str) -> anyhow::Result<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
-    for r in text.lines() {
-        ensure!(
-            !r.is_empty() && !r.contains(char::is_whitespace),
-            "{REFS} line {r:?} is not one ref"
-        );
-        ensure!(out.insert(r.to_string()), "{REFS} names {r} twice");
-    }
-    ensure!(!out.is_empty(), "{REFS} names no image");
-    Ok(out)
-}
-
-/// A carried image the list leaves out would be imported and then collected.
-fn unlisted(carried: &BTreeSet<String>, listed: &BTreeSet<String>) -> anyhow::Result<()> {
-    let missing: Vec<&str> = carried.difference(listed).map(String::as_str).collect();
+    let runs = c.refs();
+    let missing: Vec<&str> = carried.difference(&runs).map(String::as_str).collect();
     ensure!(
         missing.is_empty(),
-        "{REFS} leaves out images the layout carries: {}",
+        "the components leave out images the layout carries: {}",
         missing.join(", ")
     );
     Ok(())
@@ -555,14 +492,12 @@ pub struct Contents<'a> {
     pub seed: Option<&'a str>,
     /// An OCI image layout ([`oci::from_flat_cache`]).
     pub images: &'a Path,
-    /// Every ref the release runs: `images` carries some or all of them.
-    pub refs: &'a BTreeSet<String>,
     /// Release notes for a person: [`NOTES`].
     pub notes: Option<&'a str>,
     /// The FluxInstance the release runs on: [`INSTANCE`].
     pub instance: Option<&'a str>,
     /// What the bundle brings: [`components::COMPONENTS`].
-    pub components: Option<&'a components::Components>,
+    pub components: &'a components::Components,
 }
 
 enum Source {
@@ -586,23 +521,22 @@ impl Source {
     }
 }
 
-/// Writes `contents` as a bundle to `out`, signed with `key`, every entry
-/// root's and dated `mtime` so the same inputs make the same tar. Refuses
-/// what a unit would refuse.
-pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> anyhow::Result<()> {
-    let base = contents.components.is_none_or(|c| c.base.is_some());
+/// Writes `contents` as a bundle to `out`, reproducibly, every entry dated
+/// `mtime`. `sign` returns the sums' Sigstore bundle.
+pub fn write(
+    contents: &Contents,
+    sign: impl FnOnce(&[u8]) -> anyhow::Result<Vec<u8>>,
+    mtime: u64,
+    out: &Path,
+) -> anyhow::Result<()> {
+    let c = contents.components;
+    c.check()?;
+    let base = c.base.is_some();
     match (contents.patch, contents.seed) {
         (Some(p), Some(_)) if base => machineconfig::check_patch(p)?,
         (None, None) if !base => {}
         _ if base => bail!("a bundle with a base carries its config patch and seed"),
         _ => bail!("a bundle without a base carries no config patch or seed"),
-    }
-    if let Some(c) = contents.components {
-        c.check()?;
-        ensure!(
-            &c.refs() == contents.refs,
-            "{REFS} is not every ref the components run"
-        );
     }
     if let Some(n) = contents.notes {
         ensure!(
@@ -611,17 +545,7 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
             n.len()
         );
     }
-    let carried = layout_refs(contents.images)?;
-    ensure!(
-        !base || !carried.is_empty(),
-        "the image layout names no image"
-    );
-    let refs: String = contents.refs.iter().map(|r| format!("{r}\n")).collect();
-    let listed = match refs.is_empty() && !base {
-        true => BTreeSet::new(),
-        false => parse_refs(&refs)?,
-    };
-    unlisted(&carried, &listed)?;
+    carries(c, &layout_refs(contents.images)?)?;
     ensure!(
         has_base(contents.manifest) == base,
         "a bundle's MANIFEST names a STACK_DIGEST exactly when it brings a base"
@@ -633,6 +557,7 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
             "the MANIFEST says FORMAT={f}; this writes {FORMAT}"
         );
     }
+    format_check(&manifest)?;
     let mut files = BTreeMap::new();
     files.insert(
         MANIFEST.to_string(),
@@ -644,13 +569,10 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
     if let Some(s) = contents.seed {
         files.insert(SEED.into(), Source::Bytes(s.as_bytes().into()));
     }
-    if let Some(c) = contents.components {
-        files.insert(
-            components::COMPONENTS.into(),
-            Source::Bytes(serde_json::to_vec_pretty(c)?),
-        );
-    }
-    files.insert(REFS.into(), Source::Bytes(refs.into_bytes()));
+    files.insert(
+        components::COMPONENTS.into(),
+        Source::Bytes(serde_json::to_vec_pretty(c)?),
+    );
     if let Some(i) = contents.instance {
         files.insert(INSTANCE.into(), Source::Bytes(i.as_bytes().into()));
     }
@@ -669,7 +591,7 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
         std::io::copy(&mut src.open()?, &mut hash)?;
         sums.push_str(&format!("{}  {name}\n", hex::encode(hash.finalize())));
     }
-    let sig = key.sign(sums.as_bytes())?;
+    let sig = sign(sums.as_bytes()).context("signing the sums")?;
 
     let r = (|| {
         let mut tar = tar::Builder::new(std::io::BufWriter::new(File::create(out)?));
@@ -684,7 +606,7 @@ pub fn write(contents: &Contents, key: &SigningKey, mtime: u64, out: &Path) -> a
             tar.append_data(&mut h, name, data)
         };
         append(SUMS, sums.len() as u64, &mut sums.as_bytes())?;
-        append(SIG, sig.len() as u64, &mut sig.as_slice())?;
+        append(SIGNATURE, sig.len() as u64, &mut sig.as_slice())?;
         for (name, src) in &files {
             append(name, src.len()?, &mut src.open()?)?;
         }
@@ -722,33 +644,37 @@ mod tests {
     use super::testkit::*;
     use super::*;
 
-    const MF: &str = "FORMAT=4\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\n";
+    const MF: &str = "FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=2\n";
 
     struct Case {
         dir: tempfile::TempDir,
-        public: String,
-        key: PathBuf,
     }
 
     impl Case {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let (key, public) = keygen(dir.path(), "good");
             tree(&dir.path().join("src"), MF);
-            seal(&dir.path().join("src"), &key, NAMESPACE);
-            Self { dir, public, key }
+            seal(&dir.path().join("src"), SIGNER);
+            Self { dir }
         }
         fn src(&self) -> PathBuf {
             self.dir.path().join("src")
         }
-        fn open(&self, head: &[&str]) -> anyhow::Result<Manifest> {
-            self.open_with(head, &self.public, NAMESPACE)
-        }
-        fn open_with(&self, head: &[&str], public: &str, ns: &str) -> anyhow::Result<Manifest> {
+        fn tar(&self, head: &[&str]) -> PathBuf {
             let t = self.dir.path().join("b.tar");
             pack(&self.src(), &t, head);
+            t
+        }
+        fn open(&self, head: &[&str]) -> anyhow::Result<Manifest> {
+            self.open_with(head, &trust())
+        }
+        fn open_with(&self, head: &[&str], trust: &dyn Trust) -> anyhow::Result<Manifest> {
+            let t = self.tar(head);
             let _ = std::fs::remove_dir_all(self.out());
-            unpack(&t, &self.out(), &Verifier::new(public, ns)?)
+            unpack(&t, &self.out(), trust).map(|u| u.manifest)
+        }
+        fn head(&self) -> anyhow::Result<Option<Head>> {
+            read_head(File::open(self.tar(HEAD)).unwrap(), &trust())
         }
         fn out(&self) -> PathBuf {
             self.dir.path().join("out")
@@ -764,15 +690,17 @@ mod tests {
     #[test]
     fn a_signed_bundle_unpacks() {
         let c = Case::new();
-        let m = c.open(HEAD).unwrap();
-        assert_eq!(m["STACK_TAG"], "t2");
+        let u = unpack(&c.tar(HEAD), &c.out(), &trust()).unwrap();
+        assert_eq!(u.signer, SIGNER);
+        assert_eq!(u.manifest["BUILT_EPOCH"], "2");
         assert_eq!(
             std::fs::read(c.out().join("images/blobs/sha256/aa")).unwrap(),
             b"layer"
         );
-        let refs = layout_refs(&c.out().join(IMAGES)).unwrap();
+        let (components, carried) = check(&c.out()).unwrap();
+        assert_eq!(carried, components.refs());
         assert_eq!(
-            refs.into_iter().collect::<Vec<_>>(),
+            carried.into_iter().collect::<Vec<_>>(),
             [
                 "registry.example/app:v2",
                 "registry.example/installer@sha256:bb"
@@ -781,37 +709,27 @@ mod tests {
     }
 
     #[test]
-    fn another_key_is_refused() {
+    fn another_signer_is_refused() {
         let c = Case::new();
-        let (_, other) = keygen(c.dir.path(), "other");
+        let other = Trusted(vec!["someone else".into()]);
         refused(
             &c,
-            c.open_with(HEAD, &other, NAMESPACE),
-            "pinned update key",
-        );
-    }
-
-    #[test]
-    fn another_namespace_is_refused() {
-        let c = Case::new();
-        refused(
-            &c,
-            c.open_with(HEAD, &c.public, "another"),
-            "pinned update key",
+            c.open_with(HEAD, &other),
+            "not a signer this unit trusts",
         );
     }
 
     #[test]
     fn unsigned_is_refused() {
         let c = Case::new();
-        std::fs::remove_file(c.src().join(SIG)).unwrap();
+        std::fs::remove_file(c.src().join(SIGNATURE)).unwrap();
         refused(&c, c.open(HEAD), "must start with");
     }
 
     #[test]
     fn signature_first_is_refused() {
         let c = Case::new();
-        refused(&c, c.open(&[SIG, SUMS]), "must start with");
+        refused(&c, c.open(&[SIGNATURE, SUMS]), "must start with");
     }
 
     #[test]
@@ -826,12 +744,19 @@ mod tests {
         let c = Case::new();
         std::fs::write(
             c.src().join(MANIFEST),
-            "FORMAT=4\nSTACK_TAG=t9\nSTACK_DIGEST=sha256:00\n",
+            "FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=9\n",
         )
         .unwrap();
-        let (other, _) = keygen(c.dir.path(), "attacker");
-        seal(&c.src(), &other, NAMESPACE);
-        refused(&c, c.open(HEAD), "pinned update key");
+        seal(&c.src(), "an attacker");
+        refused(&c, c.open(HEAD), "not a signer this unit trusts");
+    }
+
+    #[test]
+    fn edited_sums_under_the_old_signature_are_refused() {
+        let c = Case::new();
+        let sums = std::fs::read_to_string(c.src().join(SUMS)).unwrap();
+        std::fs::write(c.src().join(SUMS), sums.replace("  MANIFEST", "  MANIFESX")).unwrap();
+        refused(&c, c.open(HEAD), "does not verify");
     }
 
     #[test]
@@ -858,7 +783,7 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         std::fs::write(c.src().join(SUMS), kept).unwrap();
-        sign(&c.key, &c.src().join(SUMS), NAMESPACE);
+        resign(&c.src(), SIGNER);
         refused(&c, c.open(HEAD), "do not cover MANIFEST");
     }
 
@@ -873,44 +798,44 @@ mod tests {
         let t = c.dir.path().join("link.tar");
         let mut b = tar::Builder::new(File::create(&t).unwrap());
         b.append_path_with_name(c.src().join(SUMS), SUMS).unwrap();
-        b.append_path_with_name(c.src().join(SIG), SIG).unwrap();
+        b.append_path_with_name(c.src().join(SIGNATURE), SIGNATURE)
+            .unwrap();
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Symlink);
         h.set_size(0);
         b.append_link(&mut h, MANIFEST, "/etc/shadow").unwrap();
         b.finish().unwrap();
         drop(b);
-        let r = unpack(&t, &c.out(), &Verifier::new(&c.public, NAMESPACE).unwrap());
+        let r = unpack(&t, &c.out(), &trust()).map(|u| u.manifest);
         refused(&c, r, "not a regular file");
     }
 
     #[test]
-    fn a_units_list_must_name_what_the_layout_carries() {
+    fn the_components_must_name_what_the_layout_carries() {
         let c = Case::new();
-        std::fs::write(c.src().join(REFS), "registry.example/base:v1\n").unwrap();
-        seal(&c.src(), &c.key, NAMESPACE);
-        c.open(HEAD).unwrap();
-        let e = format!("{:#}", check(&c.out()).unwrap_err());
-        assert!(e.contains("registry.example/app:v2"), "{e}");
-
         std::fs::write(
-            c.src().join(REFS),
-            "registry.example/app:v2\nregistry.example/installer@sha256:bb\nregistry.example/base:v1\n",
+            c.src().join(components::COMPONENTS),
+            r#"{"base":["registry.example/app:v2"]}"#,
         )
         .unwrap();
-        seal(&c.src(), &c.key, NAMESPACE);
+        seal(&c.src(), SIGNER);
         c.open(HEAD).unwrap();
-        assert_eq!(check(&c.out()).unwrap().len(), 2);
-        assert_eq!(release_refs(&c.out()).unwrap().len(), 3);
+        let e = format!("{:#}", check(&c.out()).unwrap_err());
+        assert!(e.contains("registry.example/installer@sha256:bb"), "{e}");
+
+        std::fs::write(
+            c.src().join(components::COMPONENTS),
+            r#"{"base":["registry.example/app:v2","registry.example/installer@sha256:bb","registry.example/base:v1"]}"#,
+        )
+        .unwrap();
+        seal(&c.src(), SIGNER);
+        c.open(HEAD).unwrap();
+        let (components, carried) = check(&c.out()).unwrap();
+        assert_eq!((carried.len(), components.refs().len()), (2, 3));
     }
 
-    #[test]
-    fn a_bundle_without_a_base_carries_no_patch_seed_or_image() {
-        let d = tempfile::tempdir().unwrap();
-        let (key, public) = keygen(d.path(), "k");
-        let sk =
-            SigningKey::from_openssh(&std::fs::read_to_string(&key).unwrap(), NAMESPACE).unwrap();
-        let images = d.path().join("images");
+    fn empty_layout(dir: &Path) -> PathBuf {
+        let images = dir.join("images");
         std::fs::create_dir_all(images.join("blobs/sha256")).unwrap();
         std::fs::write(
             images.join("index.json"),
@@ -918,36 +843,46 @@ mod tests {
         )
         .unwrap();
         std::fs::write(images.join("oci-layout"), "{}").unwrap();
+        images
+    }
+
+    fn module() -> components::Module {
+        components::Module {
+            version: "v1.2.0".into(),
+            epoch: 7,
+            flux: "kind: Kustomization\n".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_app_carries_no_patch_seed_or_base_facts() {
+        let d = tempfile::tempdir().unwrap();
+        let images = empty_layout(d.path());
         let c = components::Components {
-            remove: ["a".to_string()].into(),
+            modules: [("app".to_string(), module())].into(),
             ..Default::default()
         };
-        let m: Manifest = [("STACK_TAG", "t3"), ("BUILT_EPOCH", "3")]
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .into();
-        let refs = BTreeSet::new();
+        let m = Manifest::new();
         let contents = Contents {
             manifest: &m,
             patch: None,
             seed: None,
             images: &images,
-            refs: &refs,
             notes: None,
             instance: None,
-            components: Some(&c),
+            components: &c,
         };
         let out = d.path().join("b.tar");
-        write(&contents, &sk, 1, &out).unwrap();
+        let signer = |s: &[u8]| Ok(sign(SIGNER, s));
+        write(&contents, signer, 1, &out).unwrap();
         let dest = d.path().join("out");
-        let got = unpack(&out, &dest, &Verifier::new(&public, NAMESPACE).unwrap()).unwrap();
-        assert_eq!(got["FORMAT"], FORMAT);
-        assert!(!has_base(&got));
-        assert!(check(&dest).unwrap().is_empty());
-        assert!(release_refs(&dest).unwrap().is_empty());
-        assert_eq!(
-            components::Components::read(&dest).unwrap(),
-            Some(c.clone())
-        );
+        let got = unpack(&out, &dest, &trust()).unwrap();
+        assert_eq!(got.manifest["FORMAT"], FORMAT);
+        assert!(!has_base(&got.manifest));
+        let (read, carried) = check(&dest).unwrap();
+        assert_eq!(read, c);
+        assert!(carried.is_empty());
         assert!(!dest.join(PATCH).exists() && !dest.join(SEED).exists());
 
         let patched = Contents {
@@ -955,76 +890,77 @@ mod tests {
             seed: Some(""),
             ..contents
         };
-        assert!(write(&patched, &sk, 1, &out).is_err());
+        assert!(write(&patched, signer, 1, &out).is_err());
         let based = components::Components {
             base: Some(BTreeSet::new()),
             ..c.clone()
         };
         let unpatched = Contents {
-            components: Some(&based),
+            components: &based,
             ..contents
         };
-        assert!(write(&unpatched, &sk, 1, &out).is_err());
-        let other = ["r/x:1".to_string()].into();
-        let unlisted = Contents {
-            refs: &other,
-            ..contents
-        };
-        assert!(write(&unlisted, &sk, 1, &out).is_err());
+        assert!(write(&unpatched, signer, 1, &out).is_err());
+        for (k, v) in [
+            ("BUILT_EPOCH", "3"),
+            ("LOCK_PROFILE", "edge"),
+            ("STACK_TAG", "t"),
+        ] {
+            let named = Manifest::from([(k.into(), v.into())]);
+            let e = write(
+                &Contents {
+                    manifest: &named,
+                    ..contents
+                },
+                signer,
+                1,
+                &out,
+            )
+            .unwrap_err();
+            assert!(format!("{e:#}").contains(k), "{e:#}");
+        }
     }
 
     #[test]
     fn another_format_is_refused_by_name() {
         for (mf, why) in [
             (
-                "FORMAT=2\nSTACK_TAG=t2\n",
-                "the bundle is format 2, and only format 4 is read",
+                "FORMAT=4\nSTACK_DIGEST=sha256:00\n",
+                "the bundle is format 4, and only format 5 is read",
             ),
+            ("STACK_DIGEST=sha256:00\n", "names no FORMAT"),
             (
-                "FORMAT=3\nSTACK_TAG=t2\n",
-                "the bundle is format 3, and only format 4 is read",
+                "FORMAT=5\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\n",
+                "the unit names its releases",
             ),
-            ("STACK_TAG=t2\n", "names no FORMAT"),
+            ("FORMAT=5\nLOCK_PROFILE=edge\n", "names LOCK_PROFILE"),
         ] {
             let c = Case::new();
             std::fs::write(c.src().join(MANIFEST), mf).unwrap();
-            std::fs::remove_file(c.src().join(REFS)).unwrap();
-            seal(&c.src(), &c.key, NAMESPACE);
+            seal(&c.src(), SIGNER);
             refused(&c, c.open(HEAD), why);
-            let t = c.dir.path().join("b.tar");
-            let v = Verifier::new(&c.public, NAMESPACE).unwrap();
-            let e = format!("{:#}", read_head(File::open(&t).unwrap(), &v).unwrap_err());
+            let e = format!("{:#}", c.head().unwrap_err());
             assert!(e.contains(why), "{e}");
         }
     }
 
     #[test]
-    fn a_bundle_without_refs_is_refused() {
+    fn a_bundle_without_components_is_refused() {
         let c = Case::new();
-        std::fs::remove_file(c.src().join(REFS)).unwrap();
-        seal(&c.src(), &c.key, NAMESPACE);
-        refused(&c, c.open(HEAD), "do not cover refs");
-        let t = c.dir.path().join("b.tar");
-        let v = Verifier::new(&c.public, NAMESPACE).unwrap();
-        let e = format!("{:#}", read_head(File::open(&t).unwrap(), &v).unwrap_err());
-        assert!(e.contains("do not cover refs"), "{e}");
+        std::fs::remove_file(c.src().join(components::COMPONENTS)).unwrap();
+        seal(&c.src(), SIGNER);
+        refused(&c, c.open(HEAD), "do not cover components.json");
+        let e = format!("{:#}", c.head().unwrap_err());
+        assert!(e.contains("do not cover components.json"), "{e}");
     }
 
     #[test]
-    fn a_missing_or_unreadable_list_is_refused() {
-        let d = tempfile::tempdir().unwrap();
-        assert!(release_refs(d.path()).is_err());
-        std::fs::write(d.path().join(REFS), b"\xff\xfe\n").unwrap();
-        assert!(release_refs(d.path()).is_err());
-    }
-
-    #[test]
-    fn a_refs_line_is_one_ref() {
-        assert!(parse_refs("a:1\na:1\n").is_err());
-        assert!(parse_refs("a:1\n\nb:2\n").is_err());
-        assert!(parse_refs("a:1 b:2\n").is_err());
-        assert!(parse_refs("").is_err());
-        assert_eq!(parse_refs("b:2\na:1\n").unwrap().len(), 2);
+    fn the_head_is_signed() {
+        let c = Case::new();
+        let h = c.head().unwrap().unwrap();
+        assert_eq!(
+            (h.signer.as_str(), h.manifest["BUILT_EPOCH"].as_str()),
+            (SIGNER, "2")
+        );
     }
 
     #[test]

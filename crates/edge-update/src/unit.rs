@@ -2,9 +2,10 @@
 //! registry. Real clients and test fakes both implement these.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use edge_bundle::Signer;
 use serde::{Deserialize, Serialize};
 
 #[async_trait]
@@ -41,6 +42,10 @@ pub trait Cluster: Send + Sync {
     async fn set_key(&self, at: &Ref, key: &str, value: &str) -> anyhow::Result<()>;
     /// The Flux version the FluxInstance runs.
     async fn flux_version(&self, instance: &Ref) -> anyhow::Result<String>;
+    /// The FluxInstance's `spec.components`.
+    async fn flux_components(&self, instance: &Ref) -> anyhow::Result<BTreeSet<String>>;
+    /// The apiserver's version: `vX.Y.Z`.
+    async fn kubernetes_version(&self) -> anyhow::Result<String>;
     /// The FluxInstance's `spec.sync` url and ref.
     async fn sync(&self, instance: &Ref) -> anyhow::Result<(String, String)>;
     async fn repoint(
@@ -119,14 +124,16 @@ impl std::fmt::Display for Ref {
     }
 }
 
-/// What the consumer supplies: the key, the node's paths and the stack's names.
+/// What the consumer supplies: who may sign, the node's paths and the stack's names.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
-    /// OpenSSH public key that signs bundles.
-    pub signing_key: String,
-    /// The `ssh-keygen -Y sign -n` namespace.
-    pub signature_namespace: String,
+    /// Sigstore's `trusted_root.json`.
+    pub trusted_root: PathBuf,
+    pub trust_policy: Vec<Signer>,
+    /// A Docker `config.json` with registry logins for pulling apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_auth: Option<PathBuf>,
     /// The node path of the store log copied before an update.
     pub store: String,
     /// The node path of boot-commit's record of the boot it blessed.

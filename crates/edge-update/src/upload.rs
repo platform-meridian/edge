@@ -7,12 +7,13 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bundle::{self, Manifest, Verifier};
+use crate::bundle::{self, Manifest, Trust};
 use crate::engine::Clock;
 
 pub const CHUNK: u32 = 2 << 20;
@@ -65,7 +66,7 @@ impl Upload {
         (0..self.chunks()).all(|i| self.has(i))
     }
     /// Bytes held from the start without a gap.
-    fn start(&self) -> u64 {
+    pub fn start(&self) -> u64 {
         let n = (0..self.chunks()).take_while(|&i| self.has(i)).count() as u64;
         (n * self.chunk_size as u64).min(self.size)
     }
@@ -77,21 +78,21 @@ impl Upload {
 
 pub struct Uploads {
     dir: PathBuf,
-    verifier: Option<Verifier>,
+    trust: Option<Arc<dyn Trust>>,
     now: Clock,
 }
 
 impl Uploads {
-    /// Without a verifier the head is not read.
+    /// Without a trust the head is not read.
     #[cfg(test)]
     pub fn new(dir: &Path) -> Self {
         Self::with(dir, None, std::sync::Arc::new(crate::engine::unix_now))
     }
 
-    pub fn with(dir: &Path, verifier: Option<Verifier>, now: Clock) -> Self {
+    pub fn with(dir: &Path, trust: Option<Arc<dyn Trust>>, now: Clock) -> Self {
         Self {
             dir: dir.into(),
-            verifier,
+            trust,
             now,
         }
     }
@@ -223,7 +224,7 @@ impl Uploads {
 
     /// Looks for the signed head in the start held, once.
     fn read_head(&self, u: &mut Upload) {
-        let Some(v) = &self.verifier else {
+        let Some(trust) = &self.trust else {
             return;
         };
         let (start, whole) = (u.start(), u.start() == u.size);
@@ -236,7 +237,7 @@ impl Uploads {
         }
         let read = File::open(self.bundle())
             .map_err(anyhow::Error::from)
-            .and_then(|f| bundle::read_head(f.take(start), v));
+            .and_then(|f| bundle::read_head(f.take(start), trust.as_ref()));
         match read {
             Ok(Some(h)) => match crate::engine::manifest_check(&h.manifest) {
                 Ok(()) => {
@@ -386,11 +387,11 @@ mod tests {
         assert!(e.to_string().contains("free"), "{e}");
     }
 
-    const MF: &str = "FORMAT=4\nSTACK_TAG=s2\nSTACK_DIGEST=sha256:11\nINSTALLER_REF=r/i:1@sha256:22\n\
+    const MF: &str = "FORMAT=5\nSTACK_DIGEST=sha256:11\nINSTALLER_REF=r/i:1@sha256:22\n\
                       TALOS_VERSION=v1.14.1\nBUILT_EPOCH=2000\nSECUREBOOT=1\n";
 
     /// A bundle three chunks long, its head in the first.
-    fn signed(dir: &Path, key: &Path, manifest: &str) -> Vec<u8> {
+    fn signed(dir: &Path, signer: &str, manifest: &str) -> Vec<u8> {
         use crate::bundle::testkit;
         let src = dir.join("src");
         let _ = std::fs::remove_dir_all(&src);
@@ -400,7 +401,7 @@ mod tests {
             body(CHUNK as usize * 2 + 9),
         )
         .unwrap();
-        testkit::seal(&src, key, testkit::NAMESPACE);
+        testkit::seal(&src, signer);
         let tar = dir.join("b.tar");
         testkit::pack(&src, &tar, testkit::HEAD);
         std::fs::read(tar).unwrap()
@@ -412,17 +413,18 @@ mod tests {
         up.put(&hex::encode(sha(data)), i, c, &sha(c))
     }
 
-    fn checking(d: &Path, public: &str) -> Uploads {
-        let v = Verifier::new(public, crate::bundle::testkit::NAMESPACE).unwrap();
-        Uploads::with(&d.join("up"), Some(v), Arc::new(|| 50))
+    fn checking(d: &Path) -> Uploads {
+        let trust = Arc::new(crate::bundle::testkit::trust());
+        Uploads::with(&d.join("up"), Some(trust), Arc::new(|| 50))
     }
+
+    use crate::bundle::testkit::SIGNER;
 
     #[test]
     fn the_head_is_read_as_soon_as_the_start_arrives() {
         let d = tempfile::tempdir().unwrap();
-        let (key, public) = crate::bundle::testkit::keygen(d.path(), "k");
-        let up = checking(d.path(), &public);
-        let data = signed(d.path(), &key, MF);
+        let up = checking(d.path());
+        let data = signed(d.path(), SIGNER, MF);
         let u = up
             .begin(data.len() as u64, &hex::encode(sha(&data)), "ann")
             .unwrap();
@@ -433,8 +435,8 @@ mod tests {
         );
         let u = put_one(&up, &data, 0).unwrap();
         let h = u.head.unwrap();
-        assert_eq!(h.manifest["STACK_TAG"], "s2");
-        assert!(h.signer.starts_with("SHA256:"));
+        assert_eq!(h.manifest["BUILT_EPOCH"], "2000");
+        assert_eq!(h.signer, SIGNER);
         let u = put_one(&up, &data, 1).unwrap();
         assert!(u.complete && u.finished == 50 && u.refused.is_empty());
     }
@@ -442,18 +444,16 @@ mod tests {
     #[test]
     fn a_bundle_this_unit_refuses_is_refused_from_its_start() {
         let d = tempfile::tempdir().unwrap();
-        let (key, public) = crate::bundle::testkit::keygen(d.path(), "k");
-        let (stranger, _) = crate::bundle::testkit::keygen(d.path(), "stranger");
-        let up = checking(d.path(), &public);
-        for (key, manifest, why) in [
-            (&stranger, MF, "pinned update key"),
+        let up = checking(d.path());
+        for (signer, manifest, why) in [
+            ("a stranger", MF, "not a signer this unit trusts"),
             (
-                &key,
-                &MF.replace("FORMAT=4", "FORMAT=3")[..],
-                "the bundle is format 3, and only format 4 is read",
+                SIGNER,
+                &MF.replace("FORMAT=5", "FORMAT=4")[..],
+                "the bundle is format 4, and only format 5 is read",
             ),
         ] {
-            let data = signed(d.path(), key, manifest);
+            let data = signed(d.path(), signer, manifest);
             up.begin(data.len() as u64, &hex::encode(sha(&data)), "")
                 .unwrap();
             let e = format!("{:#}", put_one(&up, &data, 0).unwrap_err());
@@ -466,10 +466,9 @@ mod tests {
     #[test]
     fn a_whole_upload_without_a_head_is_refused() {
         let d = tempfile::tempdir().unwrap();
-        let (key, public) = crate::bundle::testkit::keygen(d.path(), "k");
-        let up = checking(d.path(), &public);
+        let up = checking(d.path());
         // The sums and signature alone: it ends before its MANIFEST.
-        let full = signed(d.path(), &key, MF);
+        let full = signed(d.path(), SIGNER, MF);
         let cut = full.windows(8).position(|w| w == b"MANIFEST").unwrap() + 2048;
         let data = &full[..cut];
         let u = up

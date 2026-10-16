@@ -1,6 +1,8 @@
-//! The update API over ConnectRPC. Uploads are handled here; verifying and
-//! applying are handed to the engine, whose status every client watches.
+//! The update API over ConnectRPC. Uploads and pulls are handled here;
+//! verifying and applying are handed to the engine, whose status every client
+//! watches.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use connectrpc::{
@@ -8,11 +10,12 @@ use connectrpc::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::bundle::components::{MODULES_KEY, REMOVE_KEY};
+use crate::bundle::components::{MODULES_KEY, Module, REMOVE_KEY};
 use crate::diff::{Change, Component, Diff};
 use crate::engine::{self, Entry, Outcome, Phase, Power, Record, Release, Storage, Unit};
 use crate::judge::{Check, CheckState};
 use crate::pb::edge::update::v1 as pb;
+use crate::pull::Puller;
 use crate::steps::{self, State, Step, Taken};
 use crate::upload::{Upload, Uploads};
 
@@ -20,8 +23,11 @@ type Reply<T> = oneshot::Sender<anyhow::Result<T>>;
 
 pub enum Command {
     Verify(String, Reply<()>),
-    /// The tag, and who applies it.
+    /// The release's id, and who applies it.
     Apply(String, String, Reply<()>),
+    /// The app, and who uninstalls it.
+    Uninstall(String, String, Reply<()>),
+    Apps(Reply<BTreeMap<String, Module>>),
     Power(Power, Reply<String>),
     Commit(String, String, Reply<()>),
     RollBack(String, String, Reply<String>),
@@ -43,6 +49,7 @@ pub struct Service {
     commands: mpsc::Sender<Command>,
     status: watch::Receiver<Snapshot>,
     uploads: Arc<Mutex<Uploads>>,
+    puller: Puller,
 }
 
 impl Service {
@@ -50,11 +57,13 @@ impl Service {
         commands: mpsc::Sender<Command>,
         status: watch::Receiver<Snapshot>,
         uploads: Uploads,
+        puller: Puller,
     ) -> Self {
         Self {
             commands,
             status,
             uploads: Arc::new(Mutex::new(uploads)),
+            puller,
         }
     }
 
@@ -235,9 +244,8 @@ fn diff(d: &Diff) -> pb::Diff {
 
 fn release(r: &Release) -> pb::Release {
     pb::Release {
-        stack_tag: r.tag().into(),
+        id: r.id.clone(),
         talos_version: r.get("TALOS_VERSION").into(),
-        built_epoch: r.get("BUILT_EPOCH").parse().unwrap_or_default(),
         manifest: r
             .manifest
             .iter()
@@ -252,6 +260,19 @@ fn release(r: &Release) -> pb::Release {
         brings_base: r.brings_base,
         modules: r.modules.iter().cloned().collect(),
         removes: r.removes.iter().cloned().collect(),
+        ..Default::default()
+    }
+}
+
+fn app(name: &str, m: &Module) -> pb::App {
+    pb::App {
+        name: name.into(),
+        version: m.version.clone(),
+        epoch: m.epoch,
+        images: m.refs.iter().cloned().collect(),
+        requires_talos: m.requires.talos.clone(),
+        requires_kubernetes: m.requires.kubernetes.clone(),
+        requires_flux: m.requires.flux.iter().cloned().collect(),
         ..Default::default()
     }
 }
@@ -551,9 +572,54 @@ impl pb::UpdateService for Service {
         _: RequestContext,
         request: ServiceRequest<'_, pb::ApplyRequest>,
     ) -> ServiceResult<pb::ApplyResponse> {
-        let (tag, by) = (request.stack_tag.to_string(), request.by.to_string());
+        let (id, by) = (request.release_id.to_string(), request.by.to_string());
         Response::ok(pb::ApplyResponse {
-            status: self.command(|tx| Command::Apply(tag, by, tx)).await?.into(),
+            status: self.command(|tx| Command::Apply(id, by, tx)).await?.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn install(
+        &self,
+        _: RequestContext,
+        request: ServiceRequest<'_, pb::InstallRequest>,
+    ) -> ServiceResult<pb::InstallResponse> {
+        let (reference, by) = (request.reference.to_string(), request.by.to_string());
+        self.idle()?;
+        let sha = self
+            .puller
+            .pull(&reference, &self.uploads, &by)
+            .await
+            .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))?;
+        Response::ok(pb::InstallResponse {
+            status: self.command(|tx| Command::Verify(sha, tx)).await?.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn uninstall(
+        &self,
+        _: RequestContext,
+        request: ServiceRequest<'_, pb::UninstallRequest>,
+    ) -> ServiceResult<pb::UninstallResponse> {
+        let (name, by) = (request.name.to_string(), request.by.to_string());
+        Response::ok(pb::UninstallResponse {
+            status: self
+                .command(|tx| Command::Uninstall(name, by, tx))
+                .await?
+                .into(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_apps(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, pb::ListAppsRequest>,
+    ) -> ServiceResult<pb::ListAppsResponse> {
+        let apps = self.ask(Command::Apps).await?;
+        Response::ok(pb::ListAppsResponse {
+            apps: apps.iter().map(|(name, m)| app(name, m)).collect(),
             ..Default::default()
         })
     }
@@ -728,7 +794,12 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::channel(1);
         let (publish, status) = watch::channel(Snapshot::default());
-        let svc = Arc::new(Service::new(tx, status, Uploads::new(dir)));
+        let svc = Arc::new(Service::new(
+            tx,
+            status,
+            Uploads::new(dir),
+            Puller::new(None).unwrap(),
+        ));
         let bound = connectrpc::Server::bind("127.0.0.1:0").await.unwrap();
         let addr = bound.local_addr().unwrap();
         tokio::spawn(bound.serve(svc.register(connectrpc::Router::new())));
@@ -810,7 +881,7 @@ mod tests {
                 rolled_back: String::new(),
             };
             s.record.release = Some(Release {
-                manifest: [("STACK_TAG".to_string(), "s1".to_string())].into(),
+                id: "s1".into(),
                 ..Release::default()
             });
             s.unit.stack_tag = "s1".into();
@@ -1059,7 +1130,7 @@ mod tests {
             rolled_back: String::new(),
         };
         s.record.release = Some(Release {
-            manifest: [("STACK_TAG".to_string(), "s2".to_string())].into(),
+            id: "s2".into(),
             ..Release::default()
         });
         steps::enter(&mut s.record.steps, Step::Trial, 500);
@@ -1176,7 +1247,8 @@ mod tests {
         u.finished = 200;
         u.refused = "not ours".into();
         u.head.as_mut().unwrap().notes = Some("# 2".into());
-        u.head.as_mut().unwrap().signer = "SHA256:x k".into();
+        u.head.as_mut().unwrap().signer =
+            "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1".into();
         let m = &mut u.head.as_mut().unwrap().manifest;
         m.insert("MODULES".into(), "gw esm".into());
         m.insert("REMOVE".into(), "old".into());
@@ -1223,7 +1295,11 @@ mod tests {
                 h.notes.as_str(),
                 h.signer.as_str()
             ),
-            ("v1.14.1", "# 2", "SHA256:x k")
+            (
+                "v1.14.1",
+                "# 2",
+                "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1"
+            )
         );
     }
 
@@ -1240,18 +1316,17 @@ mod tests {
             owner: "gw".into(),
         };
         let r = Release {
+            id: "s2".into(),
             sha256: "bb".repeat(32),
             manifest: [
-                ("STACK_TAG", "s2"),
                 ("TALOS_VERSION", "v1.15.0"),
-                ("BUILT_EPOCH", "77"),
                 ("COMPONENT_APP", "r.io/app:2 sha256:2 2 dirty=true"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
             notes: Some("notes".into()),
-            signer: "SHA256:k s".into(),
+            signer: "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v2".into(),
             images: [("r.io/app:2".to_string(), "sha256:2".to_string())].into(),
             owners: [("r.io/app:2".to_string(), "gw".to_string())].into(),
             brings_base: true,
@@ -1281,19 +1356,17 @@ mod tests {
         };
         let p = release(&r);
         assert_eq!(
-            (
-                p.stack_tag.as_str(),
-                p.talos_version.as_str(),
-                p.built_epoch,
-                p.sha256.clone()
-            ),
-            ("s2", "v1.15.0", 77, vec![0xbb; 32])
+            (p.id.as_str(), p.talos_version.as_str(), p.sha256.clone()),
+            ("s2", "v1.15.0", vec![0xbb; 32])
         );
         assert_eq!(
             (p.notes.as_str(), p.signer.as_str()),
-            ("notes", "SHA256:k s")
+            (
+                "notes",
+                "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v2"
+            )
         );
-        assert_eq!(p.manifest.len(), 4);
+        assert_eq!(p.manifest.len(), 2);
         let checks: Vec<_> = p
             .checks
             .iter()
@@ -1515,7 +1588,7 @@ mod tests {
             rolled_back: String::new(),
         };
         s.record.release = Some(Release {
-            manifest: [("STACK_TAG".to_string(), "s2".to_string())].into(),
+            id: "s2".into(),
             ..Release::default()
         });
         s.record.error = "last one failed".into();
@@ -1524,10 +1597,7 @@ mod tests {
         steps::enter(&mut s.record.steps, Step::Trial, 300);
         let up = uploading(None);
         let st = status(&s, Some(&up), 1000);
-        assert_eq!(
-            st.release.as_option().map(|r| r.stack_tag.as_str()),
-            Some("s2")
-        );
+        assert_eq!(st.release.as_option().map(|r| r.id.as_str()), Some("s2"));
         assert_eq!(
             (st.error.as_str(), st.updated_unix),
             ("last one failed", 321)
@@ -1552,10 +1622,7 @@ mod tests {
             by: String::new(),
             rollback_reason: String::new(),
         });
-        assert_eq!(
-            e.release.as_option().map(|r| r.stack_tag.as_str()),
-            Some("s2")
-        );
+        assert_eq!(e.release.as_option().map(|r| r.id.as_str()), Some("s2"));
         let r = Record {
             log: vec![crate::engine::LogLine {
                 unix: 42,
@@ -1607,7 +1674,7 @@ mod tests {
         let by = |r: Option<String>| r;
         let s = c
             .apply(pb::ApplyRequest {
-                stack_tag: "s2".into(),
+                release_id: "s2".into(),
                 by: "ann".into(),
                 ..Default::default()
             })
