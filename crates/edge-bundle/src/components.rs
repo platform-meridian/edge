@@ -281,8 +281,10 @@ fn not_older<T: PartialEq>(
     Ok(())
 }
 
-/// The stack's `modules/`: a kustomization of each module's objects, and with
-/// `record` (namespace, name) a ConfigMap saying what is installed.
+/// The stack's `modules/`, a kustomize Component the stack includes: each
+/// module's objects, its gateway routes projected into edge-gateway's
+/// `routes.d/60-<module>.yaml`, and with `record` (namespace, name) a
+/// ConfigMap saying what is installed.
 pub fn modules_dir(
     modules: &BTreeMap<String, Module>,
     record: Option<(&str, &str)>,
@@ -324,13 +326,28 @@ pub fn modules_dir(
     } else {
         format!("resources:\n{resources}")
     };
+    let mut kustomization = format!(
+        "# The modules the unit runs, one file of Flux objects each, and each\n\
+         # one's static edge-gateway routes: ConfigMap edge-gateway-routes-<module>\n\
+         # in edge-gateway's namespace, if the module brings it.\n\
+         apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\n{resources}"
+    );
+    if !modules.is_empty() {
+        kustomization.push_str(
+            "patches:\n  - target: { kind: Deployment, name: edge-gateway }\n    patch: |-\n",
+        );
+        for name in modules.keys() {
+            kustomization.push_str(&format!(
+                "      - op: add\n        path: /spec/template/spec/volumes/0/projected/sources/-\n        \
+                 value:\n          configMap:\n            name: edge-gateway-routes-{name}\n            \
+                 optional: true\n            \
+                 items: [{{ key: routes.yaml, path: routes.d/60-{name}.yaml }}]\n"
+            ));
+        }
+    }
     files.push((
         format!("{MODULES}/kustomization.yaml"),
-        format!(
-            "# The modules the unit runs, one file of Flux objects each.\n\
-             apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n{resources}"
-        )
-        .into_bytes(),
+        kustomization.into_bytes(),
     ));
     files.sort();
     Ok(files)
@@ -707,7 +724,16 @@ mod tests {
                 "modules/kustomization.yaml"
             ]
         );
-        assert!(tree["modules/kustomization.yaml"].contains("  - a.yaml\n"));
+        let k: serde_yaml::Value =
+            serde_yaml::from_str(&tree["modules/kustomization.yaml"]).unwrap();
+        assert_eq!(k["kind"], "Component");
+        assert_eq!(k["resources"][0], "a.yaml");
+        let ops: serde_yaml::Value =
+            serde_yaml::from_str(k["patches"][0]["patch"].as_str().unwrap()).unwrap();
+        let cm = &ops[0]["value"]["configMap"];
+        assert_eq!(cm["name"], "edge-gateway-routes-a");
+        assert_eq!(cm["optional"], true);
+        assert_eq!(cm["items"][0]["path"], "routes.d/60-a.yaml");
         let record: serde_yaml::Value =
             serde_yaml::from_str(&tree["modules/installed.yaml"]).unwrap();
         assert_eq!(record["metadata"]["name"], "installed");
@@ -729,6 +755,7 @@ mod tests {
     fn no_modules_is_an_empty_kustomization() {
         let files = modules_dir(&BTreeMap::new(), None).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(String::from_utf8_lossy(&files[0].1).contains("resources: []"));
+        let k = String::from_utf8_lossy(&files[0].1);
+        assert!(k.contains("resources: []") && !k.contains("patches"), "{k}");
     }
 }

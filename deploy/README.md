@@ -62,6 +62,9 @@ patches:
             items: [{ key: routes.yaml, path: routes.d/10-mine.yaml }]
 ```
 
+edge-update projects each installed module's own, ConfigMap
+`edge-gateway-routes-<module>`, as `routes.d/60-<module>.yaml`.
+
 `talos/` holds the Talos extension services: edge-scope, edge-layers,
 edge-watch, edge-registry, edge-dhcp (`operator-lan`) and a minimal edge-cni
 config that lets the node become Ready. edge-registry wants a user volume named

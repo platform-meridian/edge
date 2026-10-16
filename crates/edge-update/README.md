@@ -61,12 +61,18 @@ the stack the unit runs: a module it brings is installed or updated, one it
 does not mention stays as it is, one goes only if the bundle names it in
 `remove`, and without a base the unit keeps its own, installer included, so
 there is no OS step. It composes the stack for the result, the base's
-artifact with `modules/` rewritten (one file of Flux objects per module, and
-with `stack.modules` set, a ConfigMap of `MODULES` and each module's MANIFEST
-lines), tags it with a release id it mints in the repository the base's
+artifact with `modules/` rewritten, tags it with a release id it mints in the repository the base's
 stack came from, and keeps the set beside that tag. The release's MANIFEST, refs and machine
 config are then the set's, so the judge, rollback and collection cover the
 whole set: rolling back returns to the previous one. `Apply` takes the id.
+
+`modules/` is a kustomize Component, which the stack includes under
+`components:`. It holds one file of Flux objects per module; with
+`stack.modules` set, a ConfigMap of `MODULES` and each module's MANIFEST
+lines; and a patch projecting each module's static routes, ConfigMap
+`edge-gateway-routes-<module>` (optional), into edge-gateway as
+`routes.d/60-<module>.yaml`. A module brings a route by shipping that
+ConfigMap.
 The release still says what the bundle itself did: `brings_base`, the
 `modules` it brought and those it `removes`, and each of its components names
 its `owner` (`base` or a module) and whether the bundle `carried` it. A bundle
