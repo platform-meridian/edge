@@ -401,7 +401,7 @@ mod tests {
             body(CHUNK as usize * 2 + 9),
         )
         .unwrap();
-        testkit::seal(&src, signer);
+        testkit::sign_tree(&src, signer);
         let tar = dir.join("b.tar");
         testkit::pack(&src, &tar, testkit::HEAD);
         std::fs::read(tar).unwrap()

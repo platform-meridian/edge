@@ -27,8 +27,9 @@
 //! An app is a bundle without a base that brings one module, also published
 //! as an OCI artifact whose one layer is the tar ([`APP_ARTIFACT`]).
 //!
-//! A build writes one with [`write`]; a unit reads one with [`unpack`] and
-//! [`check`], or its signed head alone, as it arrives, with [`read_head`].
+//! A build writes one with [`write`], or [`stage`] then [`seal`] to sign
+//! between; a unit reads one with [`unpack`] and [`check`], or its signed
+//! head alone, as it arrives, with [`read_head`].
 
 pub mod components;
 pub mod machineconfig;
@@ -529,6 +530,57 @@ pub fn write(
     mtime: u64,
     out: &Path,
 ) -> anyhow::Result<()> {
+    let files = sources(contents)?;
+    let sums = sums_of(&files)?;
+    let sig = sign(sums.as_bytes()).context("signing the sums")?;
+    archive(&files, &sums, &sig, mtime, out)
+}
+
+/// [`write`]'s first half: `contents` laid out at `dir`, which must not
+/// exist, with its `SHA256SUMS` to sign.
+pub fn stage(contents: &Contents, dir: &Path) -> anyhow::Result<()> {
+    ensure!(!dir.exists(), "{} already exists", dir.display());
+    let files = sources(contents)?;
+    for (name, src) in &files {
+        let out = dir.join(name);
+        if let Some(d) = out.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::io::copy(&mut src.open()?, &mut File::create(&out)?)?;
+    }
+    std::fs::write(dir.join(SUMS), sums_of(&files)?)?;
+    Ok(())
+}
+
+/// [`write`]'s second half: the tree [`stage`] laid out, with `signature`
+/// over its sums, as the bundle `out`.
+pub fn seal(dir: &Path, signature: &[u8], mtime: u64, out: &Path) -> anyhow::Result<()> {
+    let mut files = BTreeMap::new();
+    for p in walk(dir)? {
+        let name = p
+            .strip_prefix(dir)?
+            .to_str()
+            .context("a path is not UTF-8")?;
+        if name != SUMS && name != SIGNATURE {
+            files.insert(name.to_string(), Source::File(p.clone()));
+        }
+    }
+    let sums = std::fs::read_to_string(dir.join(SUMS)).context("reading the staged sums")?;
+    ensure!(
+        sums_of(&files)? == sums,
+        "{} is no longer what its {SUMS} say: stage it again",
+        dir.display()
+    );
+    ensure!(
+        signature.len() as u64 <= MAX_SIGNATURE,
+        "the signature is {} bytes, more than {MAX_SIGNATURE}",
+        signature.len()
+    );
+    archive(&files, &sums, signature, mtime, out)
+}
+
+/// What a bundle of `contents` holds, by name. Refuses what a unit would.
+fn sources(contents: &Contents) -> anyhow::Result<BTreeMap<String, Source>> {
     let c = contents.components;
     c.check()?;
     let base = c.base.is_some();
@@ -585,14 +637,27 @@ pub fn write(
         files.insert(name.into(), Source::File(p));
     }
 
+    Ok(files)
+}
+
+fn sums_of(files: &BTreeMap<String, Source>) -> anyhow::Result<String> {
     let mut sums = String::new();
-    for (name, src) in &files {
+    for (name, src) in files {
         let mut hash = Sha256::new();
         std::io::copy(&mut src.open()?, &mut hash)?;
         sums.push_str(&format!("{}  {name}\n", hex::encode(hash.finalize())));
     }
-    let sig = sign(sums.as_bytes()).context("signing the sums")?;
+    Ok(sums)
+}
 
+/// The tar: the sums, their signature, then every file.
+fn archive(
+    files: &BTreeMap<String, Source>,
+    sums: &str,
+    sig: &[u8],
+    mtime: u64,
+    out: &Path,
+) -> anyhow::Result<()> {
     let r = (|| {
         let mut tar = tar::Builder::new(std::io::BufWriter::new(File::create(out)?));
         let mut append = |name: &str, size: u64, data: &mut dyn Read| {
@@ -606,8 +671,8 @@ pub fn write(
             tar.append_data(&mut h, name, data)
         };
         append(SUMS, sums.len() as u64, &mut sums.as_bytes())?;
-        append(SIGNATURE, sig.len() as u64, &mut sig.as_slice())?;
-        for (name, src) in &files {
+        append(SIGNATURE, sig.len() as u64, &mut &sig[..])?;
+        for (name, src) in files {
             append(name, src.len()?, &mut src.open()?)?;
         }
         tar.into_inner()?.into_inner()?.sync_all()?;
@@ -654,7 +719,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             tree(&dir.path().join("src"), MF);
-            seal(&dir.path().join("src"), SIGNER);
+            sign_tree(&dir.path().join("src"), SIGNER);
             Self { dir }
         }
         fn src(&self) -> PathBuf {
@@ -747,7 +812,7 @@ mod tests {
             "FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=9\n",
         )
         .unwrap();
-        seal(&c.src(), "an attacker");
+        sign_tree(&c.src(), "an attacker");
         refused(&c, c.open(HEAD), "not a signer this unit trusts");
     }
 
@@ -818,7 +883,7 @@ mod tests {
             r#"{"base":["registry.example/app:v2"]}"#,
         )
         .unwrap();
-        seal(&c.src(), SIGNER);
+        sign_tree(&c.src(), SIGNER);
         c.open(HEAD).unwrap();
         let e = format!("{:#}", check(&c.out()).unwrap_err());
         assert!(e.contains("registry.example/installer@sha256:bb"), "{e}");
@@ -828,7 +893,7 @@ mod tests {
             r#"{"base":["registry.example/app:v2","registry.example/installer@sha256:bb","registry.example/base:v1"]}"#,
         )
         .unwrap();
-        seal(&c.src(), SIGNER);
+        sign_tree(&c.src(), SIGNER);
         c.open(HEAD).unwrap();
         let (components, carried) = check(&c.out()).unwrap();
         assert_eq!((carried.len(), components.refs().len()), (2, 3));
@@ -921,6 +986,43 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_bundle_seals_into_what_write_writes() {
+        let d = tempfile::tempdir().unwrap();
+        let images = empty_layout(d.path());
+        let c = components::Components {
+            modules: [("app".to_string(), module())].into(),
+            ..Default::default()
+        };
+        let m = Manifest::new();
+        let contents = Contents {
+            manifest: &m,
+            patch: None,
+            seed: None,
+            images: &images,
+            notes: Some("# v1.2.0\n"),
+            instance: None,
+            components: &c,
+        };
+        let staged = d.path().join("staged");
+        stage(&contents, &staged).unwrap();
+        assert!(stage(&contents, &staged).is_err(), "staged over");
+        let sums = std::fs::read(staged.join(SUMS)).unwrap();
+        let (sealed, written) = (d.path().join("sealed.tar"), d.path().join("written.tar"));
+        seal(&staged, &sign(SIGNER, &sums), 7, &sealed).unwrap();
+        write(&contents, |s| Ok(sign(SIGNER, s)), 7, &written).unwrap();
+        assert_eq!(
+            std::fs::read(&sealed).unwrap(),
+            std::fs::read(&written).unwrap()
+        );
+        let u = unpack(&sealed, &d.path().join("out"), &trust()).unwrap();
+        assert_eq!(u.signer, SIGNER);
+
+        std::fs::write(staged.join(NOTES), "# edited\n").unwrap();
+        let e = seal(&staged, &sign(SIGNER, &sums), 7, &sealed).unwrap_err();
+        assert!(format!("{e:#}").contains("stage it again"), "{e:#}");
+    }
+
+    #[test]
     fn another_format_is_refused_by_name() {
         for (mf, why) in [
             (
@@ -936,7 +1038,7 @@ mod tests {
         ] {
             let c = Case::new();
             std::fs::write(c.src().join(MANIFEST), mf).unwrap();
-            seal(&c.src(), SIGNER);
+            sign_tree(&c.src(), SIGNER);
             refused(&c, c.open(HEAD), why);
             let e = format!("{:#}", c.head().unwrap_err());
             assert!(e.contains(why), "{e}");
@@ -947,7 +1049,7 @@ mod tests {
     fn a_bundle_without_components_is_refused() {
         let c = Case::new();
         std::fs::remove_file(c.src().join(components::COMPONENTS)).unwrap();
-        seal(&c.src(), SIGNER);
+        sign_tree(&c.src(), SIGNER);
         refused(&c, c.open(HEAD), "do not cover components.json");
         let e = format!("{:#}", c.head().unwrap_err());
         assert!(e.contains("do not cover components.json"), "{e}");

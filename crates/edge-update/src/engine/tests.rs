@@ -968,7 +968,7 @@ impl Harness {
         let index = serde_json::json!({ "manifests": manifests });
         std::fs::write(src.join("images/index.json"), index.to_string()).unwrap();
         std::fs::write(src.join("images/blobs/sha256/aa"), &s.tag).unwrap();
-        testkit::seal(&src, signer);
+        testkit::sign_tree(&src, signer);
         let tar = self.dir.path().join("bundle.tar");
         testkit::pack(&src, &tar, testkit::HEAD);
         let data = std::fs::read(&tar).unwrap();

@@ -51,7 +51,7 @@ const LAYOUT_INDEX: &str = r#"{"schemaVersion":2,"manifests":[
 pub const COMPONENTS: &str =
     r#"{"base":["registry.example/app:v2","registry.example/installer@sha256:bb"]}"#;
 
-/// A source tree of a base as a build lays it out; `seal` sums and signs it.
+/// A source tree of a base as a build lays it out; `sign_tree` sums and signs it.
 pub fn tree(dir: &Path, manifest: &str) {
     std::fs::create_dir_all(dir.join("images/blobs/sha256")).unwrap();
     std::fs::write(dir.join("MANIFEST"), manifest).unwrap();
@@ -93,7 +93,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Sums every file and signs the sums as `signer`.
-pub fn seal(dir: &Path, signer: &str) {
+pub fn sign_tree(dir: &Path, signer: &str) {
     let mut sums = String::new();
     for f in files(dir) {
         let h = sha2::Sha256::digest(std::fs::read(dir.join(&f)).unwrap());
