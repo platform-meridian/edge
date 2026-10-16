@@ -78,11 +78,15 @@ again at apply.
 ## Apps
 
 An app is a bundle without a base bringing one module (`edge-bundle`).
-`Install` pulls it by OCI reference into the upload, then verifies it as
-`Verify` does; registry logins come from the Docker `config.json` that
-`registryAuth` names. `Uninstall` composes the set without the app, with no
-signature to check. Either is then applied with `Apply`. `ListApps` lists the
-installed modules.
+`Install` verifies a bundle, an app or a base, from one of:
+
+- `upload`: a complete upload (`BeginUpload`, `PutChunk`);
+- `url`: the tar over HTTPS, resumed by range;
+- `reference`: an app's OCI artifact; registry logins come from the Docker
+  `config.json` that `registryAuth` names.
+
+`Uninstall` composes the set without the app, with no signature to check.
+Either is then applied with `Apply`. `ListApps` lists the installed modules.
 
 ## What runs, and what a release changes
 
@@ -133,7 +137,7 @@ release, which the judge then takes on trial like any other. The OS stays.
 
 A stack trial with no `good` release has nothing to roll back to, so one that
 never comes up healthy would hold the unit until someone commits it. While
-the judge's checks fail on such a trial, an upload and `Verify` are taken
+the judge's checks fail on such a trial, an upload and `Install` are taken
 anyway: the trial is ended as failed, with the reason in the history, and
 `Apply` moves the stack off it without waiting for a good release. A healthy
 trial, or one with a release to roll back to, is never taken over.

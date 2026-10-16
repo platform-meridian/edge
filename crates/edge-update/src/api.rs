@@ -555,18 +555,6 @@ impl pb::UpdateService for Service {
         })
     }
 
-    async fn verify(
-        &self,
-        _: RequestContext,
-        request: ServiceRequest<'_, pb::VerifyRequest>,
-    ) -> ServiceResult<pb::VerifyResponse> {
-        let sha = hex32(request.sha256)?;
-        Response::ok(pb::VerifyResponse {
-            status: self.command(|tx| Command::Verify(sha, tx)).await?.into(),
-            ..Default::default()
-        })
-    }
-
     async fn apply(
         &self,
         _: RequestContext,
@@ -584,13 +572,21 @@ impl pb::UpdateService for Service {
         _: RequestContext,
         request: ServiceRequest<'_, pb::InstallRequest>,
     ) -> ServiceResult<pb::InstallResponse> {
-        let (reference, by) = (request.reference.to_string(), request.by.to_string());
-        self.idle()?;
-        let sha = self
-            .puller
-            .pull(&reference, &self.uploads, &by)
-            .await
-            .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))?;
+        use pb::__buffa::view::oneof::install_request::Source;
+        let by = request.by.to_string();
+        let fetched = match &request.source {
+            Some(Source::Upload(sha)) => Ok(hex32(sha)?),
+            Some(Source::Reference(r)) => {
+                self.idle()?;
+                self.puller.pull(r, &self.uploads, &by).await
+            }
+            Some(Source::Url(u)) => {
+                self.idle()?;
+                self.puller.download(u, &self.uploads, &by).await
+            }
+            None => return Err(ConnectError::invalid_argument("no source")),
+        };
+        let sha = fetched.map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))?;
         Response::ok(pb::InstallResponse {
             status: self.command(|tx| Command::Verify(sha, tx)).await?.into(),
             ..Default::default()
@@ -926,8 +922,11 @@ mod tests {
             }
         });
         let s = c
-            .verify(pb::VerifyRequest {
-                sha256: vec![9; 32],
+            .install(pb::InstallRequest {
+                source: Some(pb::__buffa::oneof::install_request::Source::Upload(vec![
+                    9;
+                    32
+                ])),
                 ..Default::default()
             })
             .await

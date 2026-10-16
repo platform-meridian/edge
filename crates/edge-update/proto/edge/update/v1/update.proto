@@ -10,16 +10,15 @@ service UpdateService {
   rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
   // Stores one chunk. A chunk already held is accepted again.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
-  // Checks a complete upload against the trust policy and this unit, changing
-  // nothing. Refused while an update runs, except on a stack trial that is
-  // unhealthy with no good release to roll back to: that trial is ended as
-  // failed, and Apply then moves the stack off it. Uploads are taken then too.
-  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // Checks a bundle against the trust policy and this unit, changing nothing;
+  // a fetched one goes into the upload first. Refused while an update runs,
+  // except on a stack trial that is unhealthy with no good release to roll
+  // back to: that trial is ended as failed, and Apply then moves the stack off
+  // it. Uploads are taken then too.
+  rpc Install(InstallRequest) returns (InstallResponse);
   // Applies the verified release. Refused while the OS the unit booted is on
   // trial, since the update's own trial falls back to a blessed one.
   rpc Apply(ApplyRequest) returns (ApplyResponse);
-  // Pulls an app by OCI reference into the upload, then verifies it as Verify does.
-  rpc Install(InstallRequest) returns (InstallResponse);
   // Composes the installed set without an app and verifies it, for Apply.
   rpc Uninstall(UninstallRequest) returns (UninstallResponse);
   // The apps installed in the stack the unit runs.
@@ -105,14 +104,6 @@ message PutChunkResponse {
   Upload upload = 1;
 }
 
-message VerifyRequest {
-  bytes sha256 = 1;
-}
-
-message VerifyResponse {
-  Status status = 1;
-}
-
 message ApplyRequest {
   // The verified release's id.
   string release_id = 1;
@@ -125,10 +116,16 @@ message ApplyResponse {
 }
 
 message InstallRequest {
-  // The app's OCI artifact: "ghcr.io/<owner>/<app>:<tag>" or "…@sha256:…".
-  string reference = 1;
+  oneof source {
+    // The SHA-256 of a complete upload.
+    bytes upload = 1;
+    // An app's OCI artifact: "ghcr.io/<owner>/<app>:<tag>" or "…@sha256:…".
+    string reference = 2;
+    // The bundle's tar over HTTPS.
+    string url = 3;
+  }
   // Who installs, as other clients see it.
-  string by = 2;
+  string by = 4;
 }
 
 message InstallResponse {

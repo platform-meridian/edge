@@ -188,6 +188,45 @@ impl Puller {
         Ok(sha)
     }
 
+    /// Downloads the bundle at `url` into `uploads` as `by`, resuming a
+    /// download of the same url cut short; returns its sha256.
+    pub async fn download(
+        &self,
+        url: &str,
+        uploads: &Arc<Mutex<Uploads>>,
+        by: &str,
+    ) -> anyhow::Result<String> {
+        let u: Uri = url
+            .parse()
+            .with_context(|| format!("{url:?} is not a URL"))?;
+        let host = u.authority().map(|a| a.as_str()).unwrap_or_default();
+        ensure!(u.scheme_str() == Some(scheme(host)), "{url} is not https");
+        let (part, from) = blocking(uploads, |u| Ok(u.download())).await?;
+        if std::fs::read_to_string(&from).ok().as_deref() != Some(url) {
+            let _ = std::fs::remove_file(&part);
+            std::fs::create_dir_all(from.parent().context("no upload directory")?)?;
+            std::fs::write(&from, url)?;
+        }
+        let held = std::fs::metadata(&part).map_or(0, |m| m.len());
+        let mut res = self.get(url, "*/*", Some(held), &mut None).await?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)?;
+        // A server that ignores the range sends it all.
+        if res.status() != StatusCode::PARTIAL_CONTENT {
+            f.set_len(0)?;
+        }
+        while let Some(frame) = res.body_mut().frame().await {
+            if let Ok(data) = frame?.into_data() {
+                std::io::Write::write_all(&mut f, &data)?;
+            }
+        }
+        f.sync_all()?;
+        let by = by.to_string();
+        Ok(blocking(uploads, move |u| u.adopt(&by)).await?.sha256)
+    }
+
     /// GET `url`, past the registry's bearer challenge and its redirects.
     async fn get(
         &self,
@@ -372,6 +411,10 @@ mod tests {
                                 .status(StatusCode::TEMPORARY_REDIRECT)
                                 .header(header::LOCATION, "/storage/blob")
                                 .body(Full::default()),
+                            "/release/app.tar" => res
+                                .status(StatusCode::FOUND)
+                                .header(header::LOCATION, "/storage/blob")
+                                .body(Full::default()),
                             "/storage/blob" => {
                                 let start = req.headers().get(header::RANGE)
                                     .and_then(|r| r.to_str().ok()?.strip_prefix("bytes=")?.strip_suffix('-')?.parse().ok())
@@ -438,6 +481,38 @@ mod tests {
         let u = up.lock().unwrap();
         assert!(u.current().unwrap().complete);
         assert_eq!(std::fs::read(u.bundle()).unwrap(), blob);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_is_downloaded_past_a_redirect_and_resumed() {
+        let blob: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+        let (addr, from) = registry(app(&blob, bundle::APP_ARTIFACT), blob.clone()).await;
+        let d = tempfile::tempdir().unwrap();
+        let up = uploads(d.path());
+        let url = format!("http://{addr}/release/app.tar");
+        let (part, of) = up.lock().unwrap().download();
+        std::fs::write(&part, &blob[..1000]).unwrap();
+        std::fs::write(&of, &url).unwrap();
+        let p = Puller::new(None).unwrap();
+        let sha = p.download(&url, &up, "ann").await.unwrap();
+        assert_eq!(sha, hex::encode(Sha256::digest(&blob)));
+        assert_eq!(
+            from.load(Ordering::SeqCst),
+            1000,
+            "resumed where it stopped"
+        );
+        {
+            let u = up.lock().unwrap();
+            let c = u.current().unwrap();
+            assert!(c.complete && c.by == "ann");
+            assert_eq!(std::fs::read(u.bundle()).unwrap(), blob);
+            assert!(!part.exists());
+        }
+        let e = p
+            .download("http://example.com/app.tar", &up, "")
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("not https"), "{e:#}");
     }
 
     #[tokio::test]
