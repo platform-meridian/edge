@@ -10,6 +10,9 @@ license.workspace = true
 edge-common = { path = "../edge-common" }
 edge-registry = { path = "../edge-registry" }
 edge-bundle = { path = "../edge-bundle" }
+edge-boot = { path = "../edge-boot" }
+tar.workspace = true
+flate2.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -40,8 +43,7 @@ form_urlencoded = "1"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-flate2.workspace = true
-tar.workspace = true
+edge-boot = { path = "../edge-boot", features = ["testkit"] }
 connectrpc-health = "0.9"
 edge-bundle = { path = "../edge-bundle", features = ["testkit"] }
 tempfile = "3"

@@ -843,6 +843,7 @@ fn settings() -> Settings {
             judge: r("judge"),
             modules: Some(r("modules")),
         },
+        boot_signing: None,
     }
 }
 

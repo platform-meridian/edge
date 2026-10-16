@@ -87,6 +87,10 @@ pub trait Registry: Send + Sync {
     fn digest(&self, image: &str) -> Option<String>;
     /// A manifest or blob the store holds, by digest.
     fn read(&self, digest: &str) -> anyhow::Result<Vec<u8>>;
+    /// A blob the store holds, by digest, to stream.
+    fn open(&self, digest: &str) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+        Ok(Box::new(std::io::Cursor::new(self.read(digest)?)))
+    }
 }
 
 /// `namespace/name`.
@@ -139,6 +143,9 @@ pub struct Settings {
     /// The node path of boot-commit's record of the boot it blessed.
     pub bless: String,
     pub stack: Stack,
+    /// The unit's own boot signing keys: they sign each new OS's boot files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_signing: Option<crate::boot::Settings>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

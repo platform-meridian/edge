@@ -104,9 +104,10 @@ spec:
             grpc: { port: 7444 }
             periodSeconds: 10
             failureThreshold: 3
+          # Signing a new OS's boot files holds its UKI twice.
           resources:
             requests: { cpu: 10m, memory: 32Mi }
-            limits: { memory: 256Mi }
+            limits: { memory: 768Mi }
           securityContext:
             runAsUser: 0
             allowPrivilegeEscalation: false

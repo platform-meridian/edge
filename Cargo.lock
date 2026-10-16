@@ -825,6 +825,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "edge-boot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "edge-boot",
+ "getrandom 0.3.4",
+ "hex",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "edge-bundle"
 version = "0.1.0"
 dependencies = [
@@ -1130,6 +1145,7 @@ dependencies = [
  "connectrpc",
  "connectrpc-build",
  "connectrpc-health",
+ "edge-boot",
  "edge-bundle",
  "edge-common",
  "edge-registry",

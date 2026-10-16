@@ -425,6 +425,8 @@ pub struct Engine {
     pub detail: String,
     pub unit: Unit,
     pub progress: Arc<Progress>,
+    /// Sign each new OS's boot files with, when the settings say to.
+    pub boot_keys: Option<Arc<dyn crate::boot::Keys>>,
 }
 
 enum Next {
@@ -479,7 +481,12 @@ impl Engine {
             detail: String::new(),
             unit: Unit::default(),
             progress: Arc::default(),
+            boot_keys: None,
         })
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     pub fn uploads(&self) -> Uploads {
@@ -1711,8 +1718,18 @@ impl Engine {
                 }
             }
         }
+        let image = match self.signed_installer(&installer).await {
+            Ok(i) => i,
+            Err(e) => {
+                return Ok(Fail(format!(
+                    "the unit could not sign {installer}'s boot files: {e:#}. The OS is unchanged; {}. \
+                     The stack did not move",
+                    self.restore().await?
+                )));
+            }
+        };
         self.detail = "installing the new OS beside the running one".into();
-        if let Err(e) = self.talos.install(&installer).await {
+        if let Err(e) = self.talos.install(&image).await {
             if (self.now)() - self.record.since <= INSTALL {
                 return Err(e);
             }
@@ -1727,6 +1744,36 @@ impl Engine {
             boot_id: self.boot_id().await?,
             asked: None,
         }))
+    }
+
+    /// The installer to install: with boot signing, one with its boot files signed by the unit.
+    async fn signed_installer(&mut self, installer: &str) -> anyhow::Result<String> {
+        let Some(s) = self.settings.boot_signing.clone() else {
+            return Ok(installer.into());
+        };
+        let keys = self
+            .boot_keys
+            .clone()
+            .context("boot signing is set, but the unit has no boot keys")?;
+        self.detail = "signing the new OS's boot files with the unit's keys".into();
+        let (registry, image, scratch) = (
+            self.registry.clone(),
+            installer.to_string(),
+            self.dir.join("boot-signing"),
+        );
+        let signed = tokio::task::spawn_blocking(move || match keys.unlock()? {
+            Some(signer) => {
+                crate::boot::derive(&*registry, &*signer, &s, &image, &scratch).map(Some)
+            }
+            None => Ok(None),
+        })
+        .await??;
+        let Some(signed) = signed else {
+            self.note("the unit holds no boot signing keys: the new OS boots as built");
+            return Ok(installer.into());
+        };
+        self.note(format!("the unit signed the new OS's boot files: {signed}"));
+        Ok(signed)
     }
 
     async fn rebooting(&mut self, before: String, asked: Option<i64>) -> anyhow::Result<Next> {

@@ -68,6 +68,15 @@ impl crate::unit::Registry for Registry {
         std::fs::read(self.0.blob_path(&d))
             .map_err(|e| anyhow::anyhow!("the store holds no {digest}: {e}"))
     }
+
+    fn open(&self, digest: &str) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+        let d: edge_registry::Digest = digest
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("{digest}: {e}"))?;
+        let f = std::fs::File::open(self.0.blob_path(&d))
+            .map_err(|e| anyhow::anyhow!("the store holds no {digest}: {e}"))?;
+        Ok(Box::new(std::io::BufReader::new(f)))
+    }
 }
 
 /// The import left a name it could not parse untagged: nothing to keep by it.

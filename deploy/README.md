@@ -46,7 +46,16 @@ Then provide:
     lock: flux-system/my-stack-lock     # built_epoch, and what LOCK_* lines check
     judge: flux-system/my-stack-commit  # good, previous, trial, rolled_back
     modules: flux-system/my-modules     # optional: the installed modules, written into each stack
+  bootSigning:                        # optional: the unit signs each new OS's boot files
+    tpm: /dev/tpmrm0                  # its keys (crates/edge-boot); a unit without them installs as built
+    phases:                           # PCR 11 phase paths, as systemd-measure --phase
+      signed: [enter-initrd:leave-initrd]
+      running: enter-initrd:leave-initrd:ready
+    uki: /usr/install/amd64/vmlinuz.efi       # in the installer image
+    bootloader: /usr/install/amd64/systemd-boot.efi
   ```
+
+  With `bootSigning`, the pod needs the TPM device: run it privileged.
 - any static routes, as ConfigMaps projected into edge-gateway's
   `routes.d/`, merged in name order:
 

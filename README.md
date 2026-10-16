@@ -27,6 +27,7 @@ recover without anyone on site.
 | [`edge-idle`](crates/edge-idle/) | Throttles the scheduler and controller-manager while the cluster is idle. |
 | [`edge-pack`](crates/edge-pack/) | Packs an app's `deploy/` and images into the artifact a unit installs; CI signs it keyless (`.github/actions/app-release`). |
 | [`edge-kube`](crates/edge-kube/) | Library: the Service, EndpointSlice and NetworkPolicy view shared by edge-cni and edge-dns. |
+| [`edge-boot`](crates/edge-boot/) | Library: the unit signs its own boot chain (Authenticode, UKI PCR policies) with keys in its TPM, usable only under an OS it signed. |
 | [`edge-bundle`](crates/edge-bundle/) | Library: the signed bundle (a base, or an app) and machine-config patch formats, read by edge-update and written by build tooling. |
 | [`edge-common`](crates/edge-common/) | Library: shutdown, logging, durable writes and sandboxing. |
 | [`conformance/`](conformance/) | Release tests: kube-apiserver's storage tests and etcd's robustness tests against edge-state. |

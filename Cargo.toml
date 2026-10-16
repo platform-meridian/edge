@@ -17,6 +17,7 @@ members = [
     "crates/edge-common",
     "crates/edge-registry",
     "crates/edge-bundle",
+    "crates/edge-boot",
     "crates/edge-update",
     "crates/edge-pack",
 ]
