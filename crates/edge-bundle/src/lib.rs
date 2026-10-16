@@ -1,7 +1,8 @@
 //! A bundle is one tar: `SHA256SUMS`, then its Sigstore signature
 //! (`SHA256SUMS.sigstore.json`), then every file the sums name. Nothing past
-//! the first two entries is written anywhere until the signature has verified
-//! against the unit's [`Trust`].
+//! them is written anywhere until the signature has verified against the
+//! unit's [`Trust`]. A bundle without the signature is taken only by a trust
+//! that allows it; its files are still checked against the sums.
 //!
 //! - `MANIFEST`: `KEY=value` lines. `FORMAT=5` ([`FORMAT`]); with a base,
 //!   `STACK_DIGEST`, `INSTALLER_REF` (by digest), `TALOS_VERSION`,
@@ -27,8 +28,8 @@
 //! An app is a bundle without a base that brings one module, also published
 //! as an OCI artifact whose one layer is the tar ([`APP_ARTIFACT`]).
 //!
-//! A build writes one with [`write`], or [`stage`] then [`seal`] to sign
-//! between; a unit reads one with [`unpack`] and [`check`], or its signed
+//! A build writes one with [`write`], or [`stage`] then [`seal`], signed
+//! between or not; a unit reads one with [`unpack`] and [`check`], or its signed
 //! head alone, as it arrives, with [`read_head`].
 
 pub mod components;
@@ -48,7 +49,7 @@ use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
 
 pub use oci::{layout_images, layout_refs};
-pub use sigstore::{Signer, Sigstore, Trust};
+pub use sigstore::{Policy, Signer, Sigstore, Trust, UNSIGNED};
 
 pub const SUMS: &str = "SHA256SUMS";
 pub const SIGNATURE: &str = "SHA256SUMS.sigstore.json";
@@ -186,33 +187,42 @@ pub fn unpack_counting(
 
 type Sums = BTreeMap<PathBuf, [u8; 32]>;
 
-/// The first two entries, the sums and their signature, verified; and the signer.
-fn signed_sums<R: Read>(
-    entries: &mut tar::Entries<'_, R>,
+/// The first entries, the sums and any signature, verified; the signer, and
+/// the entry after them.
+fn signed_sums<'a, R: Read>(
+    entries: &mut tar::Entries<'a, R>,
     trust: &dyn Trust,
-) -> anyhow::Result<(Sums, String)> {
-    let mut next = |want: &str, max: u64| -> anyhow::Result<Vec<u8>> {
-        let mut e = entries
-            .next()
-            .with_context(|| format!("the bundle ends before {want}"))??;
-        let path = e.path()?.into_owned();
-        ensure!(
-            path == Path::new(want) && e.header().entry_type().is_file(),
-            "the bundle must start with {SUMS} then {SIGNATURE}, not {}",
-            path.display()
-        );
+) -> anyhow::Result<(Sums, String, Option<tar::Entry<'a, R>>)> {
+    let mut first = |want: &str, max: u64| -> anyhow::Result<Option<(Vec<u8>, _)>> {
+        let Some(mut e) = entries.next().transpose()? else {
+            return Ok(None);
+        };
+        if e.path()?.as_ref() != Path::new(want) || !e.header().entry_type().is_file() {
+            return Ok(Some((Vec::new(), Some(e))));
+        }
         let size = e.size();
-        read_small(&mut e, size, max, want)
+        Ok(Some((read_small(&mut e, size, max, want)?, None)))
     };
-    let sums_bytes = next(SUMS, MAX_SUMS)?;
-    let sig = next(SIGNATURE, MAX_SIGNATURE)?;
-    let signer = trust.verify(&sums_bytes, &sig)?;
+    let sums_bytes = match first(SUMS, MAX_SUMS)? {
+        Some((b, None)) => b,
+        Some((_, Some(e))) => bail!(
+            "the bundle must start with {SUMS}, not {}",
+            e.path()?.display()
+        ),
+        None => bail!("the bundle ends before {SUMS}"),
+    };
+    let (sig, next) = match first(SIGNATURE, MAX_SIGNATURE)? {
+        Some((b, None)) => (Some(b), None),
+        Some((_, e)) => (None, e),
+        None => (None, None),
+    };
+    let signer = trust.verify(&sums_bytes, sig.as_deref())?;
     let sums = parse_sums(std::str::from_utf8(&sums_bytes).context("the sums are not text")?)?;
     ensure!(
         sums.contains_key(Path::new(MANIFEST)),
         "the signed sums do not cover {MANIFEST}"
     );
-    Ok((sums, signer))
+    Ok((sums, signer, next))
 }
 
 /// What a bundle says of itself, signed: readable before the rest has arrived.
@@ -257,7 +267,8 @@ impl<R: Read> Read for Start<R> {
 fn head_of(start: &mut impl Read, trust: &dyn Trust) -> anyhow::Result<Head> {
     let mut archive = tar::Archive::new(start);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let (sums, signer) = signed_sums(&mut entries, trust)?;
+    let (sums, signer, next) = signed_sums(&mut entries, trust)?;
+    let mut entries = next.map(Ok).into_iter().chain(entries);
     let mut head = Head {
         signer,
         ..Head::default()
@@ -346,11 +357,11 @@ impl<R: Read> Read for Counting<'_, R> {
 fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result<Unpacked> {
     let mut archive = tar::Archive::new(tar);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let (sums, signer) = signed_sums(&mut entries, trust)?;
+    let (sums, signer, next) = signed_sums(&mut entries, trust)?;
 
     std::fs::create_dir_all(dest)?;
     let mut seen = BTreeSet::new();
-    for e in entries {
+    for e in next.map(Ok).into_iter().chain(entries) {
         let mut e = e?;
         let path = safe(&e.path()?)?;
         let kind = e.header().entry_type();
@@ -533,7 +544,7 @@ pub fn write(
     let files = sources(contents)?;
     let sums = sums_of(&files)?;
     let sig = sign(sums.as_bytes()).context("signing the sums")?;
-    archive(&files, &sums, &sig, mtime, out)
+    archive(&files, &sums, Some(&sig), mtime, out)
 }
 
 /// [`write`]'s first half: `contents` laid out at `dir`, which must not
@@ -552,9 +563,9 @@ pub fn stage(contents: &Contents, dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// [`write`]'s second half: the tree [`stage`] laid out, with `signature`
+/// [`write`]'s second half: the tree [`stage`] laid out, with any `signature`
 /// over its sums, as the bundle `out`.
-pub fn seal(dir: &Path, signature: &[u8], mtime: u64, out: &Path) -> anyhow::Result<()> {
+pub fn seal(dir: &Path, signature: Option<&[u8]>, mtime: u64, out: &Path) -> anyhow::Result<()> {
     let mut files = BTreeMap::new();
     for p in walk(dir)? {
         let name = p
@@ -571,11 +582,13 @@ pub fn seal(dir: &Path, signature: &[u8], mtime: u64, out: &Path) -> anyhow::Res
         "{} is no longer what its {SUMS} say: stage it again",
         dir.display()
     );
-    ensure!(
-        signature.len() as u64 <= MAX_SIGNATURE,
-        "the signature is {} bytes, more than {MAX_SIGNATURE}",
-        signature.len()
-    );
+    if let Some(s) = signature {
+        ensure!(
+            s.len() as u64 <= MAX_SIGNATURE,
+            "the signature is {} bytes, more than {MAX_SIGNATURE}",
+            s.len()
+        );
+    }
     archive(&files, &sums, signature, mtime, out)
 }
 
@@ -650,11 +663,11 @@ fn sums_of(files: &BTreeMap<String, Source>) -> anyhow::Result<String> {
     Ok(sums)
 }
 
-/// The tar: the sums, their signature, then every file.
+/// The tar: the sums, any signature, then every file.
 fn archive(
     files: &BTreeMap<String, Source>,
     sums: &str,
-    sig: &[u8],
+    sig: Option<&[u8]>,
     mtime: u64,
     out: &Path,
 ) -> anyhow::Result<()> {
@@ -671,7 +684,9 @@ fn archive(
             tar.append_data(&mut h, name, data)
         };
         append(SUMS, sums.len() as u64, &mut sums.as_bytes())?;
-        append(SIGNATURE, sig.len() as u64, &mut &sig[..])?;
+        if let Some(sig) = sig {
+            append(SIGNATURE, sig.len() as u64, &mut &sig[..])?;
+        }
         for (name, src) in files {
             append(name, src.len()?, &mut src.open()?)?;
         }
@@ -776,7 +791,10 @@ mod tests {
     #[test]
     fn another_signer_is_refused() {
         let c = Case::new();
-        let other = Trusted(vec!["someone else".into()]);
+        let other = Trusted {
+            signers: vec!["someone else".into()],
+            allow_unsigned: false,
+        };
         refused(
             &c,
             c.open_with(HEAD, &other),
@@ -785,10 +803,29 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_is_refused() {
+    fn unsigned_is_refused_unless_the_trust_allows_it() {
         let c = Case::new();
         std::fs::remove_file(c.src().join(SIGNATURE)).unwrap();
-        refused(&c, c.open(HEAD), "must start with");
+        refused(&c, c.open(HEAD), "does not allow unsigned");
+        let dev = Trusted {
+            signers: Vec::new(),
+            allow_unsigned: true,
+        };
+        c.open_with(HEAD, &dev).unwrap();
+        let h = read_head(File::open(c.tar(HEAD)).unwrap(), &dev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (h.signer.as_str(), h.manifest["BUILT_EPOCH"].as_str()),
+            (UNSIGNED, "2")
+        );
+
+        std::fs::write(c.src().join("seed.yaml"), "kind: Evil\n").unwrap();
+        refused(
+            &c,
+            c.open_with(HEAD, &dev),
+            "does not match the signed sums",
+        );
     }
 
     #[test]
@@ -1008,7 +1045,7 @@ mod tests {
         assert!(stage(&contents, &staged).is_err(), "staged over");
         let sums = std::fs::read(staged.join(SUMS)).unwrap();
         let (sealed, written) = (d.path().join("sealed.tar"), d.path().join("written.tar"));
-        seal(&staged, &sign(SIGNER, &sums), 7, &sealed).unwrap();
+        seal(&staged, Some(&sign(SIGNER, &sums)), 7, &sealed).unwrap();
         write(&contents, |s| Ok(sign(SIGNER, s)), 7, &written).unwrap();
         assert_eq!(
             std::fs::read(&sealed).unwrap(),
@@ -1017,8 +1054,13 @@ mod tests {
         let u = unpack(&sealed, &d.path().join("out"), &trust()).unwrap();
         assert_eq!(u.signer, SIGNER);
 
+        let unsigned = d.path().join("unsigned.tar");
+        seal(&staged, None, 7, &unsigned).unwrap();
+        let e = unpack(&unsigned, &d.path().join("refused"), &trust()).unwrap_err();
+        assert!(format!("{e:#}").contains("unsigned"), "{e:#}");
+
         std::fs::write(staged.join(NOTES), "# edited\n").unwrap();
-        let e = seal(&staged, &sign(SIGNER, &sums), 7, &sealed).unwrap_err();
+        let e = seal(&staged, Some(&sign(SIGNER, &sums)), 7, &sealed).unwrap_err();
         assert!(format!("{e:#}").contains("stage it again"), "{e:#}");
     }
 

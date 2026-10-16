@@ -55,3 +55,5 @@ oras push ghcr.io/my-org/app-web/app:v1.2.0 \
 
 `--layout` is an OCI image layout holding every image by digest
 (`skopeo copy --all`). The same inputs pack the same sums.
+`edge-pack seal staged app.tar`, without a signature, seals a bundle only a
+unit whose policy allows unsigned bundles takes.

@@ -15,12 +15,15 @@ A bundle is signed keyless (`cosign sign-blob --bundle` over its
 ```yaml
 trustedRoot: /etc/edge-update/trusted_root.json
 trustPolicy:
-  - issuer: https://token.actions.githubusercontent.com
-    workflow: https://github.com/my-org/my-app/.github/workflows/release.yml
-    ref: refs/tags/*      # exact, or a prefix ending in *
+  signers:
+    - issuer: https://token.actions.githubusercontent.com
+      workflow: https://github.com/my-org/my-app/.github/workflows/release.yml
+      ref: refs/tags/*    # exact, or a prefix ending in *
+  allowUnsigned: false    # true takes a bundle without a signature: development only
 ```
 
-The release names its signer, `<workflow>@<ref>`.
+The release names its signer, `<workflow>@<ref>`, or `unsigned`. An unsigned
+bundle's files are still checked against its `SHA256SUMS`.
 
 ## An update, step by step
 

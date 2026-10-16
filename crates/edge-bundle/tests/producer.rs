@@ -13,7 +13,8 @@ const SIGNER: &str = "https://github.com/test/talos/.github/workflows/release.ym
 struct Signed;
 
 impl Trust for Signed {
-    fn verify(&self, sums: &[u8], signature: &[u8]) -> anyhow::Result<String> {
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String> {
+        let signature = signature.ok_or_else(|| anyhow::anyhow!("the bundle is unsigned"))?;
         let (who, sha) = std::str::from_utf8(signature)?
             .trim()
             .rsplit_once(' ')

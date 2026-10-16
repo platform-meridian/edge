@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use edge_bundle::Signer;
+use edge_bundle::Policy;
 use serde::{Deserialize, Serialize};
 
 #[async_trait]
@@ -130,7 +130,7 @@ impl std::fmt::Display for Ref {
 pub struct Settings {
     /// Sigstore's `trusted_root.json`.
     pub trusted_root: PathBuf,
-    pub trust_policy: Vec<Signer>,
+    pub trust_policy: Policy,
     /// A Docker `config.json` with registry logins for pulling apps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_auth: Option<PathBuf>,

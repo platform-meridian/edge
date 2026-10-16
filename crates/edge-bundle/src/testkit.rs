@@ -11,15 +11,28 @@ use crate::{SIGNATURE, SUMS, Trust};
 /// The signer [`trust`] takes.
 pub const SIGNER: &str = "https://github.com/test/app/.github/workflows/release.yml@refs/tags/v1";
 
-pub struct Trusted(pub Vec<String>);
+pub struct Trusted {
+    pub signers: Vec<String>,
+    pub allow_unsigned: bool,
+}
 
 /// A trust that takes [`SIGNER`].
 pub fn trust() -> Trusted {
-    Trusted(vec![SIGNER.into()])
+    Trusted {
+        signers: vec![SIGNER.into()],
+        allow_unsigned: false,
+    }
 }
 
 impl Trust for Trusted {
-    fn verify(&self, sums: &[u8], signature: &[u8]) -> anyhow::Result<String> {
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String> {
+        let Some(signature) = signature else {
+            ensure!(
+                self.allow_unsigned,
+                "the bundle is unsigned, and the trust policy does not allow unsigned bundles"
+            );
+            return Ok(crate::UNSIGNED.into());
+        };
         let (who, sha) = std::str::from_utf8(signature)
             .ok()
             .and_then(|s| s.trim().rsplit_once(' '))
@@ -29,7 +42,7 @@ impl Trust for Trusted {
             "the signature does not verify"
         );
         ensure!(
-            self.0.iter().any(|s| s == who),
+            self.signers.iter().any(|s| s == who),
             "{who} is not a signer this unit trusts"
         );
         Ok(who.into())

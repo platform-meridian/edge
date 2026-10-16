@@ -106,7 +106,7 @@ fn an_app_packs_signs_and_unpacks_as_a_unit_reads_it() {
     let staged = packed(d.path(), &deploy, &layout, &image).unwrap();
     let sums = std::fs::read(staged.join(edge_bundle::SUMS)).unwrap();
     let tar = d.path().join("app.tar");
-    edge_bundle::seal(&staged, &sign(SIGNER, &sums), 0, &tar).unwrap();
+    edge_bundle::seal(&staged, Some(&sign(SIGNER, &sums)), 0, &tar).unwrap();
 
     let dest = d.path().join("unpacked");
     let u = edge_bundle::unpack(&tar, &dest, &trust()).unwrap();

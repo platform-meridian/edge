@@ -5,8 +5,8 @@
 //!       [--notes <file>] [--secret-owner <namespace>/<serviceaccount>
 //!       --secret-label <key>=<value>]
 //!                       the app staged at <out dir>, with its SHA256SUMS to sign
-//!   edge-pack seal <out dir> <SHA256SUMS.sigstore.json> <app.tar>
-//!                       the staged app and its signature as the app's tar
+//!   edge-pack seal <out dir> [<SHA256SUMS.sigstore.json>] <app.tar>
+//!                       the staged app and any signature as the app's tar
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,12 +17,18 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("pack") => pack(&args[1..]),
-        Some("seal") if args.len() == 4 => {
-            let sig = std::fs::read(&args[2]).with_context(|| format!("reading {}", args[2]))?;
-            edge_bundle::seal(Path::new(&args[1]), &sig, 0, Path::new(&args[3]))
+        Some("seal") if matches!(args.len(), 3 | 4) => {
+            let sig = match &args[2..args.len() - 1] {
+                [s] => Some(std::fs::read(s).with_context(|| format!("reading {s}"))?),
+                _ => None,
+            };
+            let out = Path::new(&args[args.len() - 1]);
+            edge_bundle::seal(Path::new(&args[1]), sig.as_deref(), 0, out)
         }
         _ => {
-            bail!("usage: edge-pack pack <deploy> <out> … | edge-pack seal <out> <signature> <tar>")
+            bail!(
+                "usage: edge-pack pack <deploy> <out> … | edge-pack seal <out> [<signature>] <tar>"
+            )
         }
     }
 }

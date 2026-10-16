@@ -84,7 +84,8 @@ message Head {
   map<string, string> manifest = 1;
   // Release notes, Markdown, if the bundle carries any.
   string notes = 2;
-  // The workflow identity its Sigstore certificate names: "<workflow>@<ref>".
+  // The workflow identity its Sigstore certificate names, "<workflow>@<ref>",
+  // or "unsigned" for a bundle without a signature.
   string signer = 3;
   // What its MANIFEST says it brings: a base or none, its modules, and those it removes.
   bool brings_base = 4;

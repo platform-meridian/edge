@@ -9,9 +9,23 @@ use sigstore_types::Bundle;
 use sigstore_verify::crypto::FulcioCiClaims;
 use sigstore_verify::{VerificationPolicy, Verifier};
 
-/// Checks a signature over a bundle's sums; says who signed.
+/// Checks a signature over a bundle's sums, or its absence; says who signed.
 pub trait Trust: Send + Sync {
-    fn verify(&self, sums: &[u8], signature: &[u8]) -> anyhow::Result<String>;
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String>;
+}
+
+/// The signer of a bundle without a signature.
+pub const UNSIGNED: &str = "unsigned";
+
+/// Who a unit takes bundles from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Policy {
+    #[serde(default)]
+    pub signers: Vec<Signer>,
+    /// Takes a bundle without a signature, its sums still checked: for development.
+    #[serde(default)]
+    pub allow_unsigned: bool,
 }
 
 /// A signer a unit trusts: a workflow, run on a ref, as an OIDC issuer vouches.
@@ -53,26 +67,36 @@ impl Signer {
     }
 }
 
-/// The unit's trust: Sigstore's root, and the signers it takes.
+/// The unit's trust: Sigstore's root, and its policy.
 pub struct Sigstore {
     verifier: Verifier,
-    signers: Vec<Signer>,
+    policy: Policy,
 }
 
 impl Sigstore {
-    pub fn new(trusted_root: &str, signers: Vec<Signer>) -> anyhow::Result<Self> {
-        ensure!(!signers.is_empty(), "the trust policy names no signer");
-        for s in &signers {
+    pub fn new(trusted_root: &str, policy: Policy) -> anyhow::Result<Self> {
+        ensure!(
+            policy.allow_unsigned || !policy.signers.is_empty(),
+            "the trust policy names no signer"
+        );
+        for s in &policy.signers {
             s.check()?;
         }
         let root = TrustedRoot::from_json(trusted_root).context("the trusted root")?;
         let verifier = Verifier::new(&root).context("the trusted root")?;
-        Ok(Self { verifier, signers })
+        Ok(Self { verifier, policy })
     }
 }
 
 impl Trust for Sigstore {
-    fn verify(&self, sums: &[u8], signature: &[u8]) -> anyhow::Result<String> {
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String> {
+        let Some(signature) = signature else {
+            ensure!(
+                self.policy.allow_unsigned,
+                "the bundle is unsigned, and the trust policy does not allow unsigned bundles"
+            );
+            return Ok(UNSIGNED.into());
+        };
         let bundle = std::str::from_utf8(signature)
             .ok()
             .and_then(|s| Bundle::from_json(s).ok())
@@ -92,7 +116,8 @@ impl Trust for Sigstore {
             .context("the signature has no certificate")?
             .ci_claims;
         ensure!(
-            self.signers
+            self.policy
+                .signers
                 .iter()
                 .any(|s| s.admits(issuer, identity, claims)),
             "{identity} ({issuer}, on {}) is not a signer this unit trusts",
@@ -121,12 +146,19 @@ mod tests {
         }
     }
 
+    fn policy(signers: &[Signer]) -> Policy {
+        Policy {
+            signers: signers.to_vec(),
+            allow_unsigned: false,
+        }
+    }
+
     fn trust(signers: &[Signer]) -> Sigstore {
-        Sigstore::new(ROOT, signers.to_vec()).unwrap()
+        Sigstore::new(ROOT, policy(signers)).unwrap()
     }
 
     fn refused(t: &Sigstore, sums: &[u8], sig: &[u8], why: &str) {
-        let e = format!("{:#}", t.verify(sums, sig).unwrap_err());
+        let e = format!("{:#}", t.verify(sums, Some(sig)).unwrap_err());
         assert!(e.contains(why), "want {why:?}, got {e:?}");
     }
 
@@ -135,11 +167,11 @@ mod tests {
     fn a_release_workflows_signature_verifies_offline() {
         let t = trust(&[signer(GHA, WORKFLOW, "refs/tags/*")]);
         assert_eq!(
-            t.verify(SUMS, SIGNED).unwrap(),
+            t.verify(SUMS, Some(SIGNED)).unwrap(),
             format!("{WORKFLOW}@refs/tags/v2.18.3")
         );
         let exact = trust(&[signer(GHA, WORKFLOW, "refs/tags/v2.18.3")]);
-        exact.verify(SUMS, SIGNED).unwrap();
+        exact.verify(SUMS, Some(SIGNED)).unwrap();
     }
 
     #[test]
@@ -191,7 +223,7 @@ mod tests {
         root["tlogs"] = serde_json::json!([]);
         let t = Sigstore::new(
             &root.to_string(),
-            vec![signer(GHA, WORKFLOW, "refs/tags/*")],
+            policy(&[signer(GHA, WORKFLOW, "refs/tags/*")]),
         )
         .unwrap();
         refused(&t, SUMS, SIGNED, "does not verify");
@@ -199,9 +231,25 @@ mod tests {
 
     #[test]
     fn a_policy_names_whole_signers() {
-        assert!(Sigstore::new(ROOT, vec![]).is_err());
-        assert!(Sigstore::new(ROOT, vec![signer(GHA, "", "refs/tags/*")]).is_err());
-        assert!(Sigstore::new(ROOT, vec![signer(GHA, &format!("{WORKFLOW}@x"), "x")]).is_err());
-        assert!(Sigstore::new("{}", vec![signer(GHA, WORKFLOW, "refs/tags/*")]).is_err());
+        assert!(Sigstore::new(ROOT, policy(&[])).is_err());
+        assert!(Sigstore::new(ROOT, policy(&[signer(GHA, "", "refs/tags/*")])).is_err());
+        assert!(
+            Sigstore::new(ROOT, policy(&[signer(GHA, &format!("{WORKFLOW}@x"), "x")])).is_err()
+        );
+        assert!(Sigstore::new("{}", policy(&[signer(GHA, WORKFLOW, "refs/tags/*")])).is_err());
+    }
+
+    #[test]
+    fn unsigned_is_taken_only_when_the_policy_allows_it() {
+        let t = trust(&[signer(GHA, WORKFLOW, "refs/tags/*")]);
+        let e = format!("{:#}", t.verify(SUMS, None).unwrap_err());
+        assert!(e.contains("does not allow unsigned"), "{e}");
+        let dev = Policy {
+            allow_unsigned: true,
+            ..Policy::default()
+        };
+        let t = Sigstore::new(ROOT, dev).unwrap();
+        assert_eq!(t.verify(SUMS, None).unwrap(), UNSIGNED);
+        refused(&t, SUMS, b"not json", "not a Sigstore bundle");
     }
 }

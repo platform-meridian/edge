@@ -830,7 +830,7 @@ fn settings() -> Settings {
     let r = |n: &str| Ref::try_from(format!("flux-system/{n}")).unwrap();
     Settings {
         trusted_root: "/etc/edge-update/trusted_root.json".into(),
-        trust_policy: Vec::new(),
+        trust_policy: Default::default(),
         registry_auth: None,
         store: "/var/lib/etcd/state.log".into(),
         bless: BLESS.into(),

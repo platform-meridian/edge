@@ -29,10 +29,12 @@ Then provide:
 
   ```yaml
   trustedRoot: /etc/edge-update/trusted_root.json
-  trustPolicy:                        # the signers whose bundles the unit takes
-    - issuer: https://token.actions.githubusercontent.com
-      workflow: https://github.com/my-org/my-app/.github/workflows/release.yml
-      ref: refs/tags/*
+  trustPolicy:
+    signers:                          # whose bundles the unit takes
+      - issuer: https://token.actions.githubusercontent.com
+        workflow: https://github.com/my-org/my-app/.github/workflows/release.yml
+        ref: refs/tags/*
+    allowUnsigned: false              # true for development only
   registryAuth: /etc/edge-update/docker-config.json  # optional: logins to pull apps
   store: /var/lib/etcd/state.log      # copied off before each update
   bless: /var/mnt/my-volume/blessed   # boot-commit's record of the boot it blessed
