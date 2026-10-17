@@ -87,29 +87,8 @@ jobs:
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2048
         working-directory: ${{ matrix.dir }}/fuzz
 
-  build:
+  publish:
     needs: [check, deny, conformance, fuzz]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get install -y musl-tools
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: bpf-linker@0.11.1,cargo-auditable
-      - run: cargo auditable build --release --locked --target x86_64-unknown-linux-musl
-      - uses: actions/upload-artifact@v7
-        with:
-          name: bin
-          path: |
-            target/x86_64-unknown-linux-musl/release/edge-*
-            !target/x86_64-unknown-linux-musl/release/*.d
-
-  image:
-    needs: build
     if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
     permissions:
@@ -122,15 +101,22 @@ jobs:
         name: [edge-cni, edge-dhcp, edge-dns, edge-gateway, edge-idle, edge-layers, edge-registry, edge-scope, edge-signer, edge-state, edge-update, edge-watch]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
         with:
-          name: bin
-          path: dist/amd64
+          persist-credentials: false
+      - run: sudo apt-get install -y musl-tools
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker@0.11.1,cargo-auditable
+      - run: cargo auditable build --release --locked --target x86_64-unknown-linux-musl --bin ${{ matrix.name }}
+      - run: install -Dm755 -t dist/amd64 target/x86_64-unknown-linux-musl/release/${{ matrix.name }}
       - uses: anchore/sbom-action@v0
         with:
           file: dist/amd64/${{ matrix.name }}
           format: spdx-json
-          artifact-name: ${{ matrix.name }}.spdx.json
+          upload-artifact: false
           output-file: ${{ matrix.name }}.spdx.json
       - uses: redhat-actions/buildah-build@v3
         with:
