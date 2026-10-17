@@ -297,7 +297,7 @@ fn talosconfig(unit: &str, address: IpAddr, c: &TalosCertificate) -> anyhow::Res
         "crt": b64(&c.crt),
         "key": b64(&c.key),
     });
-    Ok(serde_yaml::to_string(&serde_json::json!({
+    Ok(serde_saphyr::to_string(&serde_json::json!({
         "context": unit,
         "contexts": { unit: context },
     }))?)
@@ -312,7 +312,7 @@ fn kubeconfig(
     key: &str,
 ) -> anyhow::Result<String> {
     let user = format!("{by}@{unit}");
-    Ok(serde_yaml::to_string(&serde_json::json!({
+    Ok(serde_saphyr::to_string(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "Config",
         "clusters": [{ "name": unit, "cluster": {
@@ -363,7 +363,7 @@ impl Talos {
     fn channel(&self) -> anyhow::Result<Channel> {
         let text = std::fs::read_to_string(&self.talosconfig)
             .with_context(|| format!("read {}", self.talosconfig.display()))?;
-        let tc: Talosconfig = serde_yaml::from_str(&text)?;
+        let tc: Talosconfig = serde_saphyr::from_str(&text)?;
         let ctx = tc
             .contexts
             .get(&tc.context)
@@ -436,16 +436,16 @@ mod tests {
             crt: b"crt".to_vec(),
             key: b"key".to_vec(),
         };
-        let v4: serde_yaml::Value =
-            serde_yaml::from_str(&talosconfig("u1", "10.50.0.1".parse().unwrap(), &c).unwrap())
+        let v4: serde_json::Value =
+            serde_saphyr::from_str(&talosconfig("u1", "10.50.0.1".parse().unwrap(), &c).unwrap())
                 .unwrap();
         assert_eq!(v4["context"], "u1");
         let ctx = &v4["contexts"]["u1"];
         assert_eq!(ctx["endpoints"][0], "10.50.0.1");
         assert_eq!(ctx["nodes"][0], "10.50.0.1");
         assert_eq!(ctx["crt"], b64(b"crt"));
-        let v6: serde_yaml::Value =
-            serde_yaml::from_str(&talosconfig("u1", "fd00::1".parse().unwrap(), &c).unwrap())
+        let v6: serde_json::Value =
+            serde_saphyr::from_str(&talosconfig("u1", "fd00::1".parse().unwrap(), &c).unwrap())
                 .unwrap();
         assert_eq!(v6["contexts"]["u1"]["endpoints"][0], "[fd00::1]");
         assert_eq!(v6["contexts"]["u1"]["nodes"][0], "fd00::1");
@@ -462,7 +462,7 @@ mod tests {
             "key",
         )
         .unwrap();
-        let v: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let v: serde_json::Value = serde_saphyr::from_str(&text).unwrap();
         assert_eq!(v["current-context"], "u1");
         assert_eq!(
             v["clusters"][0]["cluster"]["server"],

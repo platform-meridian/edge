@@ -3,8 +3,7 @@
 //! material put back, so the unit's secrets never travel.
 
 use anyhow::{Context, bail, ensure};
-use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use serde_json::{Map, Value};
 
 /// In the v1alpha1 document. Secrets, then the unit's identity.
 const V1_HELD: &[&[&str]] = &[
@@ -85,7 +84,7 @@ enum Key {
 
 fn key(doc: &Value) -> anyhow::Result<Key> {
     let m = doc
-        .as_mapping()
+        .as_object()
         .context("a config document is not a mapping")?;
     if let Some(kind) = m.get("kind") {
         let kind = kind.as_str().context("a document's kind is not a string")?;
@@ -101,11 +100,7 @@ fn key(doc: &Value) -> anyhow::Result<Key> {
 
 fn parse(text: &str) -> anyhow::Result<Vec<(Key, Value)>> {
     let mut docs: Vec<(Key, Value)> = Vec::new();
-    for de in serde_yaml::Deserializer::from_str(text) {
-        let doc = Value::deserialize(de).context("the config is not YAML")?;
-        if doc.is_null() {
-            continue;
-        }
+    for doc in crate::yaml::documents(text).context("the config is not YAML")? {
         let k = key(&doc)?;
         ensure!(
             !docs.iter().any(|(d, _)| *d == k),
@@ -122,36 +117,34 @@ fn render(docs: &[(Key, Value)]) -> anyhow::Result<String> {
         if !out.is_empty() {
             out.push_str("---\n");
         }
-        out.push_str(&serde_yaml::to_string(doc)?);
+        out.push_str(&serde_saphyr::to_string(doc)?);
     }
     Ok(out)
 }
 
 fn get<'a>(doc: &'a Value, path: &[&str]) -> Option<&'a Value> {
-    path.iter().try_fold(doc, |v, k| v.as_mapping()?.get(*k))
+    path.iter().try_fold(doc, |v, k| v.as_object()?.get(*k))
 }
 
 fn remove(doc: &mut Value, path: &[&str]) -> Option<Value> {
     let (last, parents) = path.split_last()?;
     let mut v = doc;
     for k in parents {
-        v = v.as_mapping_mut()?.get_mut(*k)?;
+        v = v.as_object_mut()?.get_mut(*k)?;
     }
-    v.as_mapping_mut()?.remove(*last)
+    v.as_object_mut()?.remove(*last)
 }
 
 fn set(doc: &mut Value, path: &[&str], value: Value) -> anyhow::Result<()> {
     let (last, parents) = path.split_last().context("empty path")?;
     let mut v = doc;
     for k in parents {
-        let m = v.as_mapping_mut().context("not a mapping")?;
-        v = m
-            .entry(Value::from(*k))
-            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        let m = v.as_object_mut().context("not a mapping")?;
+        v = m.entry(*k).or_insert_with(|| Value::Object(Map::new()));
     }
-    v.as_mapping_mut()
+    v.as_object_mut()
         .context("not a mapping")?
-        .insert(Value::from(*last), value);
+        .insert((*last).into(), value);
     Ok(())
 }
 
@@ -304,16 +297,16 @@ pub fn merge(unit: &str, patch: &str) -> anyhow::Result<String> {
         if fields.is_empty() {
             continue;
         }
-        let mut kept = Mapping::new();
+        let mut kept = Map::new();
         for h in ["apiVersion", "kind", "name"] {
-            if let Some(v) = doc.as_mapping().and_then(|m| m.get(h)) {
-                kept.insert(Value::from(h), v.clone());
+            if let Some(v) = doc.as_object().and_then(|m| m.get(h)) {
+                kept.insert(h.to_string(), v.clone());
             }
         }
         for (f, v) in fields {
-            kept.insert(Value::from(f), v);
+            kept.insert(f.to_string(), v);
         }
-        out.push((k.clone(), Value::Mapping(kept)));
+        out.push((k.clone(), Value::Object(kept)));
     }
 
     // Whatever the rules above say, the unit's own material leaves unchanged.
@@ -424,6 +417,7 @@ pub fn rotation_as_running(next: &str, running: &str) -> anyhow::Result<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const UNIT: &str = r#"version: v1alpha1
 machine:
@@ -539,24 +533,27 @@ image: kubelet:new
         docs.iter().find(|(d, _)| *d == k).map(|(_, v)| v)
     }
 
-    fn s(v: Option<&Value>) -> String {
-        serde_yaml::to_string(&v.cloned().unwrap_or(Value::Null)).unwrap()
+    fn s(v: Option<&Value>) -> Value {
+        v.cloned().unwrap_or(Value::Null)
     }
 
     #[test]
     fn build_wins_where_it_owns() {
         let out = parse(&merge(UNIT, PATCH).unwrap()).unwrap();
         let v1 = doc(&out, "v1alpha1", "").unwrap();
-        assert_eq!(s(get(v1, &["cluster", "etcd", "image"])), "store:new\n");
+        assert_eq!(
+            s(get(v1, &["cluster", "etcd", "image"])),
+            json!("store:new")
+        );
         assert_eq!(
             s(get(v1, &["machine", "sysctls", "vm.dirty_ratio"])),
-            "'10'\n"
+            json!("10")
         );
         let api = doc(&out, "KubeAPIServerConfig", "").unwrap();
-        assert_eq!(s(get(api, &["image"])), "apiserver:new\n");
+        assert_eq!(s(get(api, &["image"])), json!("apiserver:new"));
         assert!(doc(&out, "KubeletConfig", "").is_some());
         let data = doc(&out, "UserVolumeConfig", "data").unwrap();
-        assert_eq!(s(get(data, &["provisioning", "minSize"])), "2GB\n");
+        assert_eq!(s(get(data, &["provisioning", "minSize"])), json!("2GB"));
     }
 
     #[test]
@@ -567,17 +564,23 @@ image: kubelet:new
         kept.retain(|(k, _)| k != "UserVolumeConfig fresh.encryption");
         assert_eq!(held(&unit), kept);
         let v1 = doc(&out, "v1alpha1", "").unwrap();
-        assert_eq!(s(get(v1, &["machine", "token"])), "unit-machine-token\n");
+        assert_eq!(
+            s(get(v1, &["machine", "token"])),
+            json!("unit-machine-token")
+        );
         assert_eq!(
             s(get(v1, &["cluster", "etcd", "ca", "key"])),
-            "unit-etcd-key\n"
+            json!("unit-etcd-key")
         );
         assert!(get(v1, &["machine", "network", "interfaces"]).is_some());
         assert!(doc(&out, "KubeAPIServerCAConfig", "").is_some());
         assert!(doc(&out, "EtcFileConfig", "signer/ca.pem").is_some());
         assert!(doc(&out, "ExtensionServiceConfig", "operator-lan").is_some());
         let api = doc(&out, "KubeAPIServerConfig", "").unwrap();
-        assert_eq!(s(get(api, &["certExtraSANs"])), "- unit-a\n- 10.50.0.1\n");
+        assert_eq!(
+            s(get(api, &["certExtraSANs"])),
+            json!(["unit-a", "10.50.0.1"])
+        );
         let state = doc(&out, "VolumeConfig", "STATE").unwrap();
         assert!(get(state, &["encryption"]).is_some());
     }
@@ -759,8 +762,8 @@ image: kubelet:new
         let p = "version: v1alpha1\n---\napiVersion: v1alpha1\nkind: KubeletConfig\nencryption: kept\ncertExtraSANs: [kept]\n";
         let out = parse(&merge(UNIT, p).unwrap()).unwrap();
         let k = doc(&out, "KubeletConfig", "").unwrap();
-        assert_eq!(s(get(k, &["encryption"])), "kept\n");
-        assert_eq!(s(get(k, &["certExtraSANs"])), "- kept\n");
+        assert_eq!(s(get(k, &["encryption"])), json!("kept"));
+        assert_eq!(s(get(k, &["certExtraSANs"])), json!(["kept"]));
     }
 
     #[test]

@@ -10,7 +10,6 @@ use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, PodSpec};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams};
 use kube::{Api, Client};
-use serde::Deserialize;
 
 use crate::unit::Ref;
 
@@ -44,15 +43,10 @@ async fn timed<T>(f: impl std::future::Future<Output = kube::Result<T>>) -> anyh
 
 /// Objects in a manifest stream, empty documents skipped.
 fn objects(manifests: &str) -> anyhow::Result<Vec<DynamicObject>> {
-    let mut out = Vec::new();
-    for de in serde_yaml::Deserializer::from_str(manifests) {
-        let v = serde_yaml::Value::deserialize(de)?;
-        if v.is_null() {
-            continue;
-        }
-        out.push(serde_yaml::from_value(v).context("a seed document is not a Kubernetes object")?);
-    }
-    Ok(out)
+    edge_bundle::yaml::documents(manifests)?
+        .into_iter()
+        .map(|v| serde_json::from_value(v).context("a seed document is not a Kubernetes object"))
+        .collect()
 }
 
 /// What a FluxInstance applied, `v2.6.4@sha256:…`, else the version it asks for.

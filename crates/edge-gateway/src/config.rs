@@ -282,7 +282,7 @@ pub struct Fragment {
 impl Fragment {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let mut f: Fragment =
-            serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("parsing: {e}"))?;
+            serde_saphyr::from_str(text).map_err(|e| anyhow::anyhow!("parsing: {e}"))?;
         anyhow::ensure!(
             f.authz_backend.is_some() || f.authz_protocol.is_none(),
             "authz_protocol without authz_backend"
@@ -325,7 +325,7 @@ impl Config {
 
     fn parse_checked(text: &str, require_tls: bool) -> anyhow::Result<Self> {
         let mut cfg: Config =
-            serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("parsing: {e}"))?;
+            serde_saphyr::from_str(text).map_err(|e| anyhow::anyhow!("parsing: {e}"))?;
         cfg.validate(require_tls)?;
         cfg.routes.sort_by(Route::precedence);
         Ok(cfg)
@@ -598,10 +598,10 @@ routes:
 
     #[test]
     fn deployed_config_parses() {
-        use serde::Deserialize;
         let manifests = include_str!("../../../deploy/edge-gateway.yaml");
-        let config = serde_yaml::Deserializer::from_str(manifests)
-            .filter_map(|doc| serde_yaml::Value::deserialize(doc).ok())
+        let config = serde_saphyr::from_multiple::<serde_json::Value>(manifests)
+            .unwrap()
+            .into_iter()
             .find_map(|doc| doc["data"]["edge-gateway.yaml"].as_str().map(str::to_owned))
             .expect("the edge-gateway ConfigMap");
         let c = Config::parse(&config).unwrap();

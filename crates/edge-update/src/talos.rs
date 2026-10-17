@@ -67,7 +67,7 @@ impl Node {
     fn channel(&self) -> anyhow::Result<Channel> {
         let text = std::fs::read_to_string(&self.talosconfig)
             .with_context(|| format!("read {}", self.talosconfig.display()))?;
-        let tc: Talosconfig = serde_yaml::from_str(&text)?;
+        let tc: Talosconfig = serde_saphyr::from_str(&text)?;
         let ctx = tc
             .contexts
             .get(&tc.context)
@@ -139,7 +139,7 @@ impl Node {
                 let s = pb::cosi::MachineConfigSpec::decode(spec.proto_spec.as_slice())?;
                 return Ok(String::from_utf8(s.yaml_marshalled)?);
             }
-            return Ok(serde_yaml::from_str::<String>(&spec.yaml_spec)?);
+            return Ok(serde_saphyr::from_str::<String>(&spec.yaml_spec)?);
         }
         bail!("the node has no machine config")
     }

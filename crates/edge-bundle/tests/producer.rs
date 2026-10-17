@@ -418,19 +418,14 @@ fn manifests_the_refs_do_not_name_are_kept() {
 
 /// The same documents, in any order, their keys in any order.
 fn same_docs(a: &str, b: &str) {
-    use serde::Deserialize;
-    let docs = |y: &str| -> Vec<serde_yaml::Value> {
-        serde_yaml::Deserializer::from_str(y)
-            .map(|d| serde_yaml::Value::deserialize(d).unwrap())
-            .collect()
-    };
+    let docs = |y: &str| edge_bundle::yaml::documents(y).unwrap();
     let (a, b) = (docs(a), docs(b));
     assert_eq!(a.len(), b.len());
     for d in &a {
         assert!(
             b.contains(d),
             "{} has no match",
-            serde_yaml::to_string(d).unwrap()
+            serde_saphyr::to_string(d).unwrap()
         );
     }
 }

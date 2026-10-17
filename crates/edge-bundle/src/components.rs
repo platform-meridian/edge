@@ -300,7 +300,7 @@ pub fn modules_dir(
     }
     if let Some((ns, cm)) = record {
         resources.push_str("  - installed.yaml\n");
-        let mut data = serde_yaml::Mapping::new();
+        let mut data = serde_json::Map::new();
         let names: Vec<&str> = modules.keys().map(String::as_str).collect();
         data.insert(MODULES_KEY.into(), names.join(" ").into());
         for m in modules.values() {
@@ -318,7 +318,7 @@ pub fn modules_dir(
         });
         files.push((
             format!("{MODULES}/installed.yaml"),
-            serde_yaml::to_string(&doc)?.into_bytes(),
+            serde_saphyr::to_string(&doc)?.into_bytes(),
         ));
     }
     let resources = if resources.is_empty() {
@@ -514,7 +514,10 @@ mod tests {
     #[test]
     fn a_base_is_its_bundle_less_its_modules() {
         let i = installed();
-        assert_eq!(i.base.patch, PATCH);
+        assert_eq!(
+            crate::yaml::documents(&i.base.patch).unwrap(),
+            crate::yaml::documents(PATCH).unwrap()
+        );
         assert!(i.base.manifest.contains_key("TALOS_VERSION"));
         assert!(!i.base.manifest.contains_key("MODULE_A"));
         assert!(!i.base.manifest.contains_key(MODULES_KEY));
@@ -724,18 +727,18 @@ mod tests {
                 "modules/kustomization.yaml"
             ]
         );
-        let k: serde_yaml::Value =
-            serde_yaml::from_str(&tree["modules/kustomization.yaml"]).unwrap();
+        let k: serde_json::Value =
+            serde_saphyr::from_str(&tree["modules/kustomization.yaml"]).unwrap();
         assert_eq!(k["kind"], "Component");
         assert_eq!(k["resources"][0], "a.yaml");
-        let ops: serde_yaml::Value =
-            serde_yaml::from_str(k["patches"][0]["patch"].as_str().unwrap()).unwrap();
+        let ops: serde_json::Value =
+            serde_saphyr::from_str(k["patches"][0]["patch"].as_str().unwrap()).unwrap();
         let cm = &ops[0]["value"]["configMap"];
         assert_eq!(cm["name"], "edge-gateway-routes-a");
         assert_eq!(cm["optional"], true);
         assert_eq!(cm["items"][0]["path"], "routes.d/60-a.yaml");
-        let record: serde_yaml::Value =
-            serde_yaml::from_str(&tree["modules/installed.yaml"]).unwrap();
+        let record: serde_json::Value =
+            serde_saphyr::from_str(&tree["modules/installed.yaml"]).unwrap();
         assert_eq!(record["metadata"]["name"], "installed");
         assert_eq!(record["data"]["MODULE_A"], "r/modules/a:1@sha256:1");
         assert_eq!(record["data"][MODULES_KEY], "a");

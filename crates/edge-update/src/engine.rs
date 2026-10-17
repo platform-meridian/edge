@@ -2469,13 +2469,9 @@ fn phase_word(p: &Phase) -> &'static str {
 
 /// The same documents, whatever their order or formatting.
 fn same_config(a: &str, b: &str) -> bool {
-    let docs = |y: &str| -> Option<Vec<serde_yaml::Value>> {
-        let mut d: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(y)
-            .map(serde_yaml::Value::deserialize)
-            .collect::<Result<_, _>>()
-            .ok()?;
-        d.retain(|v| !v.is_null());
-        d.sort_by_key(|v| serde_yaml::to_string(v).unwrap_or_default());
+    let docs = |y: &str| -> Option<Vec<serde_json::Value>> {
+        let mut d = edge_bundle::yaml::documents(y).ok()?;
+        d.sort_by_key(serde_json::Value::to_string);
         Some(d)
     };
     docs(a).is_some_and(|a| Some(a) == docs(b))
@@ -2483,10 +2479,8 @@ fn same_config(a: &str, b: &str) -> bool {
 
 /// The installer a machine config names: its unattended install's, else `machine.install`'s.
 fn installer_of(config: &str) -> String {
-    let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(config)
-        .filter_map(|d| serde_yaml::Value::deserialize(d).ok())
-        .collect();
-    let image = |d: &serde_yaml::Value, path: &[&str]| {
+    let docs = edge_bundle::yaml::documents(config).unwrap_or_default();
+    let image = |d: &serde_json::Value, path: &[&str]| {
         path.iter()
             .try_fold(d, |v, k| v.get(k))
             .and_then(|v| v.as_str())

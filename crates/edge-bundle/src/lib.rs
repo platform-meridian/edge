@@ -38,6 +38,7 @@ pub mod oci;
 pub mod sigstore;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub mod yaml;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

@@ -2666,7 +2666,8 @@ async fn a_bundle_without_a_base_keeps_the_base_and_the_modules_it_does_not_name
         "the base is the one the unit ran"
     );
     assert!(stack["modules/kustomization.yaml"].contains("  - a.yaml\n  - b.yaml\n"));
-    let record: serde_yaml::Value = serde_yaml::from_str(&stack["modules/installed.yaml"]).unwrap();
+    let record: serde_json::Value =
+        serde_saphyr::from_str(&stack["modules/installed.yaml"]).unwrap();
     assert_eq!(record["metadata"]["name"], "modules");
     assert_eq!(record["data"]["MODULES"], "a b");
 }

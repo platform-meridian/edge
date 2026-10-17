@@ -30,7 +30,7 @@ prost-types = "0.14"
 connectrpc = { version = "0.9", default-features = false, features = ["server"] }
 buffa = { version = "0.9", features = ["json"] }
 base64 = "0.22"
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
 http.workspace = true
 
 [build-dependencies]

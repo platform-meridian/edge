@@ -14,7 +14,7 @@ testkit = []
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
 tar.workspace = true
 flate2.workspace = true
 # Offline only; aws-lc-rs is sigstore-crypto's only provider.

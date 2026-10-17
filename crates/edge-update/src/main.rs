@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn settings(path: &str) -> anyhow::Result<unit::Settings> {
-    serde_yaml::from_str(&std::fs::read_to_string(path).context("read the settings")?)
+    serde_saphyr::from_str(&std::fs::read_to_string(path).context("read the settings")?)
         .context("parse the settings")
 }
 

@@ -123,10 +123,7 @@ impl Config {
 
     fn with(&self, text: &str) -> anyhow::Result<Self> {
         // An empty or comment-only file is an empty fragment.
-        let f: Fragment = match serde_yaml::from_str(text)? {
-            serde_yaml::Value::Null => Fragment::default(),
-            v => serde_yaml::from_value(v)?,
-        };
+        let f = serde_saphyr::from_str::<Option<Fragment>>(text)?.unwrap_or_default();
         let mut cfg = self.clone();
         cfg.timeout_secs = f.timeout_secs.unwrap_or(cfg.timeout_secs);
         cfg.interval_secs = f.interval_secs.unwrap_or(cfg.interval_secs);
