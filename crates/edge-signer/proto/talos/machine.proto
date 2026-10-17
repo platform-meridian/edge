@@ -1,0 +1,33 @@
+// The corner of Talos's machine API (siderolabs/talos api/machine/machine.proto)
+// that edge-signer uses. Names and field numbers are upstream's; fields left out
+// are skipped by the decoder.
+syntax = "proto3";
+
+package machine;
+
+import "google/protobuf/duration.proto";
+
+service MachineService {
+    rpc GenerateClientConfiguration(GenerateClientConfigurationRequest) returns (GenerateClientConfigurationResponse);
+}
+
+message Metadata {
+    string hostname = 1;
+    string error = 2;
+}
+
+message GenerateClientConfigurationRequest {
+    repeated string roles = 1;
+    google.protobuf.Duration crt_ttl = 2;
+}
+
+message GenerateClientConfiguration {
+    Metadata metadata = 1;
+    bytes ca = 2;
+    bytes crt = 3;
+    bytes key = 4;
+}
+
+message GenerateClientConfigurationResponse {
+    repeated GenerateClientConfiguration messages = 1;
+}

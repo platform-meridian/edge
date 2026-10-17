@@ -156,6 +156,8 @@ fn dir_of(file: &Path) -> PathBuf {
 }
 
 const SERVICE_ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+/// apid, on the host's network.
+const TALOS_API: u16 = 50000;
 
 fn kube(rules: Rules) -> (Rules, Option<u16>) {
     let port = std::env::var("KUBERNETES_SERVICE_PORT")
@@ -264,12 +266,13 @@ pub fn idle(proc_dir: &Path, cgroup_root: &Path, health: &str) -> Rules {
     }
 }
 
-pub fn signer(health: &str) -> Rules {
+/// Talos renews the talosconfig in place, so the grant is its directory.
+pub fn signer(health: &str, access: &str, talosconfig: &Path) -> Rules {
     let (rules, api) = kube(Rules::default());
     Rules {
-        bind_tcp: Some(port(health).into_iter().collect()),
-        connect_tcp: api.map(|api| vec![api]),
-        ..rules
+        bind_tcp: Some(port(health).into_iter().chain(port(access)).collect()),
+        connect_tcp: api.map(|api| vec![api, TALOS_API]),
+        ..rules.with(Access::Read, [dir_of(talosconfig)])
     }
 }
 
@@ -751,17 +754,28 @@ mod tests {
         let (_api, api) = listening();
         let (_x, unlisted) = listening();
         let ((_port, port), (_health, health)) = (listening(), listening());
+        let (_access, access) = listening();
+        let talos = d.join("talos");
+        std::fs::create_dir_all(&talos).unwrap();
+        std::fs::write(talos.join("config"), "x").unwrap();
         sandboxed(
             || {
                 set_api_port(api);
-                signer(&format!("0.0.0.0:{health}"))
+                signer(
+                    &format!("0.0.0.0:{health}"),
+                    &format!("127.0.0.1:{access}"),
+                    &talos.join("config"),
+                )
             },
             || {
                 denied("read outside", read(&secret))?;
                 denied("write outside", write_in(d))?;
+                allowed("read the talosconfig", read(talos.join("config")))?;
+                denied("write beside the talosconfig", write_in(&talos))?;
                 allowed("dial the apiserver", dial(api))?;
                 denied("dial another port", dial(unlisted))?;
                 allowed("bind its health port", bind(health))?;
+                allowed("bind its access port", bind(access))?;
                 denied("bind", bind(port))
             },
         );

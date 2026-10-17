@@ -3,7 +3,10 @@
 //! future once the clock steps back, and kubelet renews it only at its equally future
 //! refresh time, so the signer deletes that pod for its controller to recreate.
 //! It does the same when the node gains an address a `node` certificate lacks.
+//! With no CA Secret it makes the unit's own. On loopback it issues operators
+//! short-lived access (`access`).
 
+mod access;
 mod api;
 mod ca;
 mod kubelet;
@@ -55,10 +58,46 @@ fn main() -> anyhow::Result<()> {
         "NODE_NAME: unset; set it from spec.nodeName"
     );
     let unit = Unit::new(&env("EDGE_SIGNER_DOMAIN"));
-    let health =
-        std::env::var("EDGE_SIGNER_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:9750".into());
-    edge_common::sandbox::restrict(&edge_common::sandbox::signer(&health));
-    run(health, &node, &unit)
+    let address = match env("EDGE_SIGNER_ADDRESS").trim() {
+        "" => None,
+        a => Some(
+            a.parse()
+                .map_err(|e| anyhow::anyhow!("EDGE_SIGNER_ADDRESS: {a:?}: {e}"))?,
+        ),
+    };
+    let apiserver_port = match env("EDGE_SIGNER_APISERVER_PORT").trim() {
+        "" => 6443,
+        p => p
+            .parse()
+            .map_err(|e| anyhow::anyhow!("EDGE_SIGNER_APISERVER_PORT: {p:?}: {e}"))?,
+    };
+    let or = |name, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let paths = Paths {
+        health: or("EDGE_SIGNER_HEALTH_LISTEN", "0.0.0.0:9750"),
+        access: or("EDGE_SIGNER_ACCESS_LISTEN", "127.0.0.1:9751"),
+        talosconfig: or(
+            "EDGE_SIGNER_TALOSCONFIG",
+            "/var/run/secrets/talos.dev/config",
+        )
+        .into(),
+    };
+    edge_common::sandbox::restrict(&edge_common::sandbox::signer(
+        &paths.health,
+        &paths.access,
+        &paths.talosconfig,
+    ));
+    let reach = access::Reach {
+        unit: node.clone(),
+        address,
+        apiserver_port,
+    };
+    run(paths, &node, &unit, reach)
+}
+
+struct Paths {
+    health: String,
+    access: String,
+    talosconfig: std::path::PathBuf,
 }
 
 fn now() -> i64 {
@@ -68,12 +107,12 @@ fn now() -> i64 {
 }
 
 #[tokio::main]
-async fn run(health: String, node: &str, unit: &Unit) -> anyhow::Result<()> {
+async fn run(paths: Paths, node: &str, unit: &Unit, reach: access::Reach) -> anyhow::Result<()> {
     let mut term = edge_common::Terminator::new();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let heartbeat = Heartbeat::default();
     tokio::spawn(edge_common::health::serve(
-        health,
+        paths.health,
         heartbeat.clone(),
         STALE_AFTER,
     ));
@@ -83,6 +122,7 @@ async fn run(health: String, node: &str, unit: &Unit) -> anyhow::Result<()> {
         ca = ca::SECRET,
         node,
         ?unit,
+        ?reach,
         "edge-signer: ready"
     );
 
@@ -99,9 +139,38 @@ async fn run(health: String, node: &str, unit: &Unit) -> anyhow::Result<()> {
             _ = term.wait() => return Ok(()),
         }
     };
+    // apid on the host: the pod shares the host's network.
+    let service = access::Service::new(
+        client.clone(),
+        access::Talos::new(&paths.talosconfig, "127.0.0.1:50000"),
+        reach.clone(),
+        SERVICE_ACCOUNT_CA.into(),
+    );
+    tokio::spawn(serve_access(paths.access, service));
     tokio::select! {
-        r = serve(client, node, unit, host_addresses, &heartbeat) => r,
+        r = serve(client, node, unit, &reach, host_addresses, &heartbeat) => r,
         _ = term.wait() => Ok(()),
+    }
+}
+
+const SERVICE_ACCOUNT_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+
+/// Retried: a predecessor on the host's network may still hold the port.
+async fn serve_access(listen: String, service: access::Service) {
+    use access::pb::edge::signer::v1::AccessServiceExt as _;
+    let router = std::sync::Arc::new(service).register(connectrpc::Router::new());
+    let mut outage = edge_common::Outage::default();
+    let bound = loop {
+        let r = connectrpc::Server::bind(&listen).await;
+        outage.observe("access API bind", &r);
+        if let Ok(b) = r {
+            break b;
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    };
+    tracing::info!(%listen, "access API: serving");
+    if let Err(e) = bound.serve(router).await {
+        tracing::error!(error = %e, "the access API stopped");
     }
 }
 
@@ -176,6 +245,7 @@ async fn serve(
     client: Client,
     node: &str,
     unit: &Unit,
+    reach: &access::Reach,
     host: impl Fn() -> nix::Result<Vec<IpAddr>>,
     heartbeat: &Heartbeat,
 ) -> anyhow::Result<()> {
@@ -215,6 +285,7 @@ async fn serve(
     let mut pod_outage = edge_common::Outage::default();
     let mut approval_outage = edge_common::Outage::default();
     let mut address_outage = edge_common::Outage::default();
+    let mut creation_outage = edge_common::Outage::default();
     let mut unit = unit.clone();
     let mut held = Vec::new();
     let mut tick = tokio::time::interval(RETRY_INTERVAL);
@@ -243,6 +314,15 @@ async fn serve(
         let approved = approve_kubelets(&csrs, &nodes, &mut kubelet_csrs, heartbeat, now).await;
         approval_outage.observe("certificatesigningrequest approval", &approved);
 
+        if secret.known() == Some(None) {
+            let r = bounded(create_ca(&secrets, &unit, reach, now)).await;
+            heartbeat.beat();
+            creation_outage.observe("node CA creation", &r);
+            if let Ok(s) = r {
+                tracing::info!(secret = ca::SECRET, "node CA created");
+                secret.apply(Event::Apply(s));
+            }
+        }
         let Some(known) = secret.known() else {
             continue;
         };
@@ -401,6 +481,20 @@ async fn approve_kubelets(
         }
     }
     result
+}
+
+/// Create-only: a Secret already there, the operator's own, is never replaced.
+async fn create_ca(
+    secrets: &Api<Secret>,
+    unit: &Unit,
+    reach: &access::Reach,
+    now: i64,
+) -> kube::Result<Secret> {
+    let secret = Ca::generate(&reach.unit, unit.domain.as_deref(), reach.address, now)
+        .map_err(|e| kube::Error::Service(e.into()))?;
+    secrets
+        .create(&kube::api::PostParams::default(), &secret)
+        .await
 }
 
 async fn bounded<T>(call: impl Future<Output = kube::Result<T>>) -> kube::Result<T> {
@@ -588,6 +682,14 @@ mod tests {
 
     fn unit() -> Unit {
         Unit::new("example.lan")
+    }
+
+    fn reach() -> access::Reach {
+        access::Reach {
+            unit: "n".into(),
+            address: Some("10.50.0.1".parse().unwrap()),
+            apiserver_port: 6443,
+        }
     }
 
     fn request(csr: Vec<u8>, annotations: &[(&str, &str)], max: i32) -> PodCertificateRequest {
@@ -1123,10 +1225,7 @@ mod tests {
                                 }))
                             };
                             let mut code = 200;
-                            let resp = if method == "GET"
-                                && uri.contains("/secrets")
-                                && world.secrets_forbidden
-                            {
+                            let resp = if uri.contains("/secrets") && world.secrets_forbidden {
                                 code = 403;
                                 status(403)
                             } else if method == "GET" && uri.contains("watch=") {
@@ -1167,7 +1266,9 @@ mod tests {
                                 }
                                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
                                 let pod = serde_json::json!({ "apiVersion": "v1", "kind": "Pod" });
-                                let echo = if uri.contains("clustertrustbundles") {
+                                let echo = if uri.contains("clustertrustbundles")
+                                    || uri.contains("/secrets")
+                                {
                                     v.clone()
                                 } else if uri.contains("/pods/") {
                                     pod
@@ -1246,7 +1347,8 @@ mod tests {
         let hb = Heartbeat::default();
         let beat = hb.clone();
         let host = move || Ok(held.lock().unwrap().clone());
-        let task = tokio::spawn(async move { serve(client, "n", &unit(), host, &beat).await });
+        let task =
+            tokio::spawn(async move { serve(client, "n", &unit(), &reach(), host, &beat).await });
         (task, hb)
     }
 
@@ -1339,8 +1441,18 @@ mod tests {
             .collect()
     }
 
+    fn created_ca(w: &[(String, String, serde_json::Value)]) -> Option<String> {
+        w.iter()
+            .find(|w| w.0 == "POST" && w.1.contains("/secrets"))
+            .map(|w| {
+                let crt = w.2["data"]["tls.crt"].as_str().unwrap();
+                let crt = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, crt);
+                String::from_utf8(crt.unwrap()).unwrap()
+            })
+    }
+
     #[tokio::test]
-    async fn missing_secret_signs_ephemeral_until_it_appears() {
+    async fn missing_secret_is_created_and_an_operators_replaces_it() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (url, writes, watch) = fake_apiserver(World {
             pcrs: vec![pcr_json(
@@ -1355,18 +1467,16 @@ mod tests {
         .await;
         let (task, _hb) = start(&url);
         wait_for_writes(&writes, |w| {
-            !bundles(w).is_empty() && w.iter().any(|w| w.1.contains("/status"))
+            created_ca(w).is_some_and(|ca| bundles(w).contains(&ca))
+                && w.iter().any(|w| w.1.contains("/status"))
         })
         .await;
-        let ephemeral = bundles(&writes.lock().unwrap())[0].clone();
         assert_eq!(
             status_writes(&writes)[0].2["status"]["conditions"][0]["type"],
             "Issued",
-            "a missing Secret still signs"
         );
 
         let r = root("r", now() - 60, now() + 86_400 * 365);
-        assert_ne!(ephemeral, r.pem);
         watch
             .secrets
             .send(serde_json::json!({ "type": "ADDED", "object": ca_secret(&r) }))
@@ -1686,7 +1796,8 @@ mod tests {
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
         let hb = Heartbeat::default();
         let unit = unit();
-        let mut serving = std::pin::pin!(serve(client, "n", &unit, || Ok(vec![]), &hb));
+        let reach = reach();
+        let mut serving = std::pin::pin!(serve(client, "n", &unit, &reach, || Ok(vec![]), &hb));
         let poll = Duration::from_millis(500);
 
         let beating = poll * 2;

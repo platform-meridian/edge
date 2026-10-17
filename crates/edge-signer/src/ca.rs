@@ -6,8 +6,9 @@ use std::net::IpAddr;
 use anyhow::{Context, ensure};
 use k8s_openapi::api::core::v1::Secret;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType, SubjectPublicKeyInfo,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    NameConstraints, PKCS_ECDSA_P256_SHA256, SanType, SubjectPublicKeyInfo,
 };
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -15,7 +16,7 @@ use time::OffsetDateTime;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 
-const EPHEMERAL_LIFETIME: i64 = 10 * 365 * 86_400;
+const CA_LIFETIME: i64 = 10 * 365 * 86_400;
 /// The shortest leaf kube-apiserver accepts: a CA with less left cannot sign.
 pub const MIN_LEAF_LIFETIME: i64 = 3600;
 
@@ -97,12 +98,67 @@ impl Ca {
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = datetime(now)?;
-        params.not_after = datetime(now + EPHEMERAL_LIFETIME)?;
+        params.not_after = datetime(now + CA_LIFETIME)?;
         let cert = params.self_signed(&key)?;
         let pem = format!("{}{}", key.serialize_pem(), cert.pem());
         Ok(Self {
             ephemeral: true,
             ..Self::parse(pem.as_bytes(), now)?
+        })
+    }
+
+    /// The unit's own CA, as the Secret it is kept in: constrained to the names
+    /// operators reach the unit by, and loopback.
+    pub fn generate(
+        unit: &str,
+        domain: Option<&str>,
+        address: Option<IpAddr>,
+        now: i64,
+    ) -> anyhow::Result<Secret> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, format!("{unit} CA"));
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.not_before = datetime(now)?;
+        params.not_after = datetime(now + CA_LIFETIME)?;
+        let mut permitted: Vec<GeneralSubtree> = domain
+            .into_iter()
+            .chain(["localhost"])
+            .map(|d| GeneralSubtree::DnsName(d.into()))
+            .collect();
+        permitted.extend(
+            [
+                CidrSubnet::from_v4_prefix([127, 0, 0, 0], 8),
+                CidrSubnet::from_v6_prefix(std::net::Ipv6Addr::LOCALHOST.octets(), 128),
+            ]
+            .into_iter()
+            .chain(
+                address
+                    .map(|a| CidrSubnet::from_addr_prefix(a, if a.is_ipv4() { 32 } else { 128 })),
+            )
+            .map(GeneralSubtree::IpAddress),
+        );
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: permitted,
+            excluded_subtrees: vec![],
+        });
+        let cert = params.self_signed(&key)?;
+        let data = [("tls.key", key.serialize_pem()), ("tls.crt", cert.pem())]
+            .into_iter()
+            .map(|(k, v)| (k.into(), k8s_openapi::ByteString(v.into_bytes())))
+            .collect();
+        Ok(Secret {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(SECRET.into()),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/tls".into()),
+            data: Some(data),
+            ..Default::default()
         })
     }
 
@@ -464,7 +520,6 @@ fn datetime(unix: i64) -> anyhow::Result<OffsetDateTime> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use rcgen::{GeneralSubtree, NameConstraints};
     use std::io::Write;
     use x509_parser::prelude::parse_x509_certificate;
 
@@ -1004,6 +1059,43 @@ pub(crate) mod tests {
         assert_eq!(x.validity().not_before.timestamp(), NOW);
         assert_eq!(x.validity().not_after.timestamp(), NOW + 3650 * 86_400);
         assert_ne!(Ca::ephemeral(NOW).unwrap().root(), ca.root());
+    }
+
+    #[test]
+    fn a_generated_ca_is_kept_and_names_only_how_the_unit_is_reached() {
+        let at = "10.50.0.1".parse().unwrap();
+        let secret = Ca::generate("u1", Some("example.lan"), Some(at), NOW).unwrap();
+        assert_eq!(secret.metadata.name.as_deref(), Some(SECRET));
+        assert_eq!(secret.type_.as_deref(), Some("kubernetes.io/tls"));
+        let ca = Ca::from_secret(Some(&secret), NOW).unwrap();
+        let der = &ders(ca.root())[0];
+        let (_, x) = parse_x509_certificate(der).unwrap();
+        assert_eq!(x.subject().to_string(), "CN=u1 CA");
+        assert_eq!(x.validity().not_after.timestamp(), NOW + 3650 * 86_400);
+        assert!(ca.permits(at));
+        assert!(ca.permits("127.0.0.1".parse().unwrap()));
+        assert!(ca.permits("::1".parse().unwrap()));
+        assert!(!ca.permits("10.50.0.2".parse().unwrap()));
+        let leaf = ca
+            .issue(
+                &requested_key(&csr(&PKCS_ECDSA_P256_SHA256).1).unwrap(),
+                &["a.example.lan".into()],
+                &[at],
+                NOW,
+                864_000,
+            )
+            .unwrap();
+        verify(&leaf.chain, ca.root(), "a.example.lan", NOW + 60).unwrap();
+        let elsewhere = ca
+            .issue(
+                &requested_key(&csr(&PKCS_ECDSA_P256_SHA256).1).unwrap(),
+                &["a.other.lan".into()],
+                &[],
+                NOW,
+                864_000,
+            )
+            .unwrap();
+        assert!(verify(&elsewhere.chain, ca.root(), "a.other.lan", NOW + 60).is_err());
     }
 
     fn issued_with_key(

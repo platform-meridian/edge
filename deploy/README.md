@@ -6,6 +6,7 @@ substitute:
 | Placeholder | Value |
 |---|---|
 | `@OPERATOR_DOMAIN@` | the domain operators reach the device on |
+| `@OPERATOR_ADDR@` | the address operators reach the device at |
 | `@APISERVER_HOST@`, `@APISERVER_PORT@` | the node's kube-apiserver |
 | `@CLUSTER_DNS@` | the kubelet's `clusterDNS` address |
 | `@BUILD_EPOCH@` | the build time, the earliest the clock may read (edge-scope) |
@@ -16,12 +17,16 @@ The images are the published `ghcr.io/platform-meridian/edge-<name>`, tagged in
 Then provide:
 
 - the Gateway API CRDs;
-- the CA edge-signer signs with: Secret `edge-signer-ca` in `edge`, type
-  `kubernetes.io/tls`, `tls.key` its PKCS#8 P-256 key and `tls.crt` the chain
-  from the issuing CA up to the root. Until it exists the signer uses an
-  ephemeral CA;
-- for edge-update: Talos API access with `os:admin` for namespace `edge`
-  (`KubeTalosAPIAccessConfig`), the `edge-registry` user volume, a
+- optionally, the CA edge-signer signs with: Secret `edge-signer-ca` in `edge`,
+  type `kubernetes.io/tls`, `tls.key` its PKCS#8 P-256 key and `tls.crt` the
+  chain from the issuing CA up to the root. Without it the signer creates the
+  device's own, constrained to the names above and loopback;
+- Talos API access with `os:admin` for namespace `edge`
+  (`KubeTalosAPIAccessConfig`): edge-update applies updates with it, and
+  edge-signer issues operators access with it. A caller of edge-signer's access
+  API on loopback presents its service account token and needs verb `issue` on
+  `signers` named `edge.meridian/access`;
+- for edge-update: the `edge-registry` user volume, a
   PersistentVolume of at least 16Gi for claim `edge/edge-update-state` (class
   `""`, e.g. a local PV on a user volume), and ConfigMap `edge-update` in
   `edge` holding Sigstore's `trusted_root.json` and a `config.yaml` naming

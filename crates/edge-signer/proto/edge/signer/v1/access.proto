@@ -1,0 +1,22 @@
+// Short-lived administrator access to the unit's Talos and Kubernetes APIs. The
+// caller presents its Kubernetes service account token, and must be allowed
+// verb `issue` on `signers` named `edge.meridian/access`.
+syntax = "proto3";
+
+package edge.signer.v1;
+
+service AccessService {
+  rpc IssueAccess(IssueAccessRequest) returns (IssueAccessResponse);
+}
+
+message IssueAccessRequest {
+  // Who the access is for, named in the Kubernetes certificate.
+  string by = 1;
+}
+
+message IssueAccessResponse {
+  bytes talosconfig = 1;
+  bytes kubeconfig = 2;
+  // Unix seconds.
+  int64 expires_at = 3;
+}

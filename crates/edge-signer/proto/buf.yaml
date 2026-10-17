@@ -1,0 +1,8 @@
+version: v2
+modules:
+  - path: .
+    excludes: [talos]
+lint:
+  use: [STANDARD]
+breaking:
+  use: [FILE]
