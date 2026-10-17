@@ -1,41 +1,34 @@
-//! A new OS's boot files, signed by the unit for its own firmware: the
-//! installer image a verified release names, with its UKI and boot loader
-//! re-signed by the unit's keys laid over it as one more layer.
+//! A new OS's boot files, signed by the unit for its own firmware. Its keys
+//! unseal only early in a boot, before anything else runs: the update stages
+//! the verified release for the next boot to sign, then lays the signed files
+//! over the installer image as one more layer.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use edge_boot::Signer;
+use edge_bundle::{MANIFEST, SIGNATURE, SUMS};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::unit::Registry;
 
-/// Where the unit's boot signing keys are, and what in an installer image they sign.
+/// Where the boot signs, and where in an installer image its files go.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
-    /// The TPM holding the keys ([`edge_boot::tpm`]).
-    pub tpm: PathBuf,
-    pub phases: edge_boot::Phases,
+    /// The host directory the boot reads `staged/` from and writes `signed/`
+    /// or `refused` into; it holds `keys` while the unit has them.
+    pub dir: PathBuf,
     /// The UKI's path in the installer image.
     pub uki: String,
     /// The boot loader's path in the installer image.
     pub bootloader: String,
 }
 
-/// The unit's boot signing keys, unlocked for one signing; `None` if it has none.
-pub trait Keys: Send + Sync {
-    fn unlock(&self) -> anyhow::Result<Option<Box<dyn Signer>>>;
-}
-
-pub struct Tpm(pub PathBuf);
-
-impl Keys for Tpm {
-    fn unlock(&self) -> anyhow::Result<Option<Box<dyn Signer>>> {
-        Ok(edge_boot::tpm::TpmKeys::open(&self.0)?.map(|k| Box::new(k) as Box<dyn Signer>))
+impl Settings {
+    pub fn has_keys(&self) -> bool {
+        self.dir.join("keys").exists()
     }
 }
 
@@ -69,89 +62,119 @@ fn arch() -> &'static str {
     }
 }
 
-/// `image` (by digest, held by `registry`) with its boot files signed: the
-/// derived image, imported and named by digest.
-pub fn derive(
-    registry: &dyn Registry,
-    signer: &dyn Signer,
-    s: &Settings,
-    image: &str,
-    scratch: &Path,
-) -> anyhow::Result<String> {
-    let (repo, _) = image
-        .split_once('@')
-        .with_context(|| format!("{image} is not pinned by digest"))?;
-    let mut digest = registry
-        .digest(image)
-        .with_context(|| format!("the unit holds no {image}"))?;
-    let mut manifest: Value = serde_json::from_slice(&registry.read(&digest)?)?;
-    if let Some(children) = manifest.get("manifests").and_then(Value::as_array) {
-        digest = children
-            .iter()
-            .find(|c| c["platform"]["architecture"] == arch())
-            .and_then(|c| c["digest"].as_str())
-            .with_context(|| format!("{image} has no {} image", arch()))?
-            .to_string();
-        manifest = serde_json::from_slice(&registry.read(&digest)?)?;
-    }
+/// The image's manifest, this machine's of an index, and its digest.
+fn image_manifest(registry: &dyn Registry, digest: &str) -> anyhow::Result<(String, Value)> {
+    let manifest: Value = serde_json::from_slice(&registry.read(digest)?)?;
+    let Some(children) = manifest.get("manifests").and_then(Value::as_array) else {
+        return Ok((digest.into(), manifest));
+    };
+    let d = children
+        .iter()
+        .find(|c| c["platform"]["architecture"] == arch())
+        .and_then(|c| c["digest"].as_str())
+        .with_context(|| format!("no {} image", arch()))?;
+    Ok((d.into(), serde_json::from_slice(&registry.read(d)?)?))
+}
 
-    let mut files: [Option<Vec<u8>>; 2] = [None, None];
-    let wanted = [
-        s.uki.trim_start_matches('/'),
-        s.bootloader.trim_start_matches('/'),
-    ];
+/// Stages a release (its signed sums, any signature and its MANIFEST, in
+/// `release`) and the installer it pins, for the next boot to sign.
+pub fn stage(
+    registry: &dyn Registry,
+    s: &Settings,
+    release: &Path,
+    installer: &str,
+) -> anyhow::Result<()> {
+    let (_, digest) = installer
+        .split_once('@')
+        .with_context(|| format!("{installer} is not pinned by digest"))?;
+    let next = s.dir.join("staged.new");
+    let _ = std::fs::remove_dir_all(&next);
+    for old in ["staged", "signed"] {
+        let _ = std::fs::remove_dir_all(s.dir.join(old));
+    }
+    let _ = std::fs::remove_file(s.dir.join("refused"));
+    let blobs = next.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs)?;
+    for f in [SUMS, SIGNATURE, MANIFEST] {
+        match std::fs::copy(release.join(f), next.join(f)) {
+            Err(e) if f == SIGNATURE && e.kind() == std::io::ErrorKind::NotFound => {}
+            r => {
+                r.with_context(|| format!("the release's {f}"))?;
+            }
+        }
+    }
+    let put = |d: &str| -> anyhow::Result<()> {
+        let mut out = std::fs::File::create(blobs.join(d.trim_start_matches("sha256:")))?;
+        std::io::copy(&mut registry.open(d)?, &mut out)?;
+        Ok(out.sync_all()?)
+    };
+    let (d, manifest) =
+        image_manifest(registry, digest).with_context(|| format!("the installer {installer}"))?;
+    for m in [digest, d.as_str()] {
+        std::fs::write(
+            blobs.join(m.trim_start_matches("sha256:")),
+            registry.read(m)?,
+        )?;
+    }
     for layer in manifest["layers"]
         .as_array()
         .context("the installer has no layers")?
     {
-        let d = layer["digest"]
+        put(layer["digest"]
             .as_str()
-            .context("a layer without a digest")?;
-        let mut blob = registry.open(d)?;
-        let mut magic = [0u8; 2];
-        blob.read_exact(&mut magic)?;
-        let blob = std::io::Cursor::new(magic).chain(blob);
-        let tar: Box<dyn Read> = match magic {
-            [0x1f, 0x8b] => Box::new(flate2::read::GzDecoder::new(blob)),
-            _ => Box::new(blob),
-        };
-        let mut tar = tar::Archive::new(tar);
-        for entry in tar.entries()? {
-            let mut entry = entry?;
-            let path = entry
-                .path()?
-                .to_string_lossy()
-                .trim_start_matches("./")
-                .to_string();
-            if let Some(i) = wanted.iter().position(|w| *w == path) {
-                let mut b = Vec::new();
-                entry.read_to_end(&mut b)?;
-                files[i] = Some(b);
-            }
-        }
+            .context("a layer without a digest")?)?;
     }
-    let [Some(uki), Some(bootloader)] = files else {
-        bail!("{image} has no {} or {}", s.uki, s.bootloader);
-    };
+    std::fs::rename(&next, s.dir.join("staged"))?;
+    Ok(())
+}
+
+/// The installer the boot signed; or why it did not.
+pub fn signed(s: &Settings) -> anyhow::Result<String> {
+    match std::fs::read_to_string(s.dir.join("signed/INSTALLER_REF")) {
+        Ok(r) => Ok(r.trim().to_string()),
+        Err(_) => match std::fs::read_to_string(s.dir.join("refused")) {
+            Ok(why) => bail!("{}", why.trim()),
+            Err(_) => bail!("the boot left no signed files"),
+        },
+    }
+}
+
+/// `image` (by digest, held by `registry`) with the boot's signed files over
+/// it: the derived image, imported and named by digest.
+pub fn derive(
+    registry: &dyn Registry,
+    s: &Settings,
+    image: &str,
+    scratch: &Path,
+) -> anyhow::Result<String> {
+    let (repo, digest) = image
+        .split_once('@')
+        .with_context(|| format!("{image} is not pinned by digest"))?;
+    let signed = signed(s)?;
+    anyhow::ensure!(
+        signed.ends_with(&format!("@{digest}")),
+        "the boot signed {signed}, not {image}"
+    );
+    let (_, mut manifest) =
+        image_manifest(registry, digest).with_context(|| format!("the installer {image}"))?;
+
     let _ = std::fs::remove_dir_all(scratch);
     let blobs = scratch.join("blobs/sha256");
     std::fs::create_dir_all(&blobs)?;
-    // The layer streams to a file: a UKI is large, and signing it holds it twice already.
+    // Streamed to a file: a UKI is large.
     let mut layer = tar::Builder::new(Hashed {
         file: std::fs::File::create(scratch.join("layer"))?,
         hash: Sha256::new(),
         len: 0,
     });
-    let signed = [
-        edge_boot::sign_uki(signer, uki, &s.phases).context("signing the UKI")?,
-        edge_boot::sign_image(signer, bootloader).context("signing the boot loader")?,
-    ];
-    for (path, contents) in wanted.iter().zip(signed) {
+    for path in [&s.uki, &s.bootloader] {
+        let name = Path::new(path).file_name().context("a boot file path")?;
+        let mut f = std::fs::File::open(s.dir.join("signed").join(name))?;
         let mut h = tar::Header::new_gnu();
-        h.set_size(contents.len() as u64);
+        h.set_size(f.metadata()?.len());
         h.set_mode(0o644);
         h.set_cksum();
-        layer.append_data(&mut h, path, contents.as_slice())?;
+        layer.append_data(&mut h, path.trim_start_matches('/'), &mut f)?;
     }
     let layer = layer.into_inner()?;
     let layer_digest = format!("sha256:{}", hex::encode(layer.hash.finalize()));
@@ -159,9 +182,12 @@ pub fn derive(
     layer.file.sync_all()?;
     std::fs::rename(scratch.join("layer"), blobs.join(&layer_digest[7..]))?;
 
-    let config_desc = &manifest["config"];
     let mut config: Value = serde_json::from_slice(
-        &registry.read(config_desc["digest"].as_str().context("no config digest")?)?,
+        &registry.read(
+            manifest["config"]["digest"]
+                .as_str()
+                .context("no config digest")?,
+        )?,
     )?;
     config["rootfs"]["diff_ids"]
         .as_array_mut()
@@ -203,7 +229,10 @@ pub fn derive(
         scratch.join("index.json"),
         serde_json::to_vec(&json!({
             "schemaVersion": 2,
-            "manifests": [{"mediaType": media_type, "digest": manifest_digest, "size": manifest_bytes.len()}],
+            "manifests": [{
+                "mediaType": media_type, "digest": manifest_digest, "size": manifest_bytes.len(),
+                "annotations": {"io.containerd.image.name": format!("{repo}:unit-signed")},
+            }],
         }))?,
     )?;
     registry.import(scratch)?;
@@ -215,7 +244,7 @@ pub fn derive(
 mod tests {
     use super::*;
     use crate::registry::Registry as Store;
-    use edge_boot::testkit::{Soft, image, uki};
+    use std::io::Read;
 
     fn targz(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -233,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn the_installer_gets_a_layer_of_its_boot_files_signed() {
+    fn a_release_is_staged_then_its_signed_files_laid_over_the_installer() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store")).unwrap();
         let layout = dir.path().join("layout");
@@ -243,15 +272,16 @@ mod tests {
             std::fs::write(blobs.join(&digest_of(b)[7..]), b).unwrap();
             json!({"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": digest_of(b), "size": b.len()})
         };
-        let boot = image(&[(".text", &[0xc3; 600]), (".sbat", b"sbat,1\n")]);
         let layers = [
             put(&targz(&[("usr/bin/installer", b"#!")])),
             put(&targz(&[
-                ("usr/install/amd64/vmlinuz.efi", &uki()),
-                ("usr/install/amd64/systemd-boot.efi", &boot),
+                ("usr/install/amd64/vmlinuz.efi", b"uki"),
+                ("usr/install/amd64/systemd-boot.efi", b"boot"),
             ])),
         ];
-        let config = put(br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":["sha256:aa","sha256:bb"]},"history":[]}"#);
+        let config = put(
+            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":["sha256:aa","sha256:bb"]},"history":[]}"#,
+        );
         let manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": config, "layers": layers,
@@ -273,47 +303,73 @@ mod tests {
         .unwrap();
         store.import(&layout).unwrap();
 
-        let soft = Soft::default();
-        let settings = Settings {
-            tpm: "/dev/null".into(),
-            phases: edge_boot::Phases {
-                signed: vec!["a:b".into()],
-                running: "a:b:c".into(),
-            },
+        let release = dir.path().join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        for f in [SUMS, MANIFEST] {
+            std::fs::write(release.join(f), f).unwrap();
+        }
+        let s = Settings {
+            dir: dir.path().join("boot-signing"),
             uki: "/usr/install/amd64/vmlinuz.efi".into(),
             bootloader: "/usr/install/amd64/systemd-boot.efi".into(),
         };
+        std::fs::create_dir_all(&s.dir).unwrap();
         let image = format!("127.0.0.1:5000/installer@{}", digest_of(&manifest));
-        let derived = derive(
-            &store,
-            &soft,
-            &settings,
-            &image,
-            &dir.path().join("scratch"),
+        stage(&store, &s, &release, &image).unwrap();
+        let staged = s.dir.join("staged");
+        assert!(!staged.join(SIGNATURE).exists());
+        assert_eq!(
+            std::fs::read(staged.join(MANIFEST)).unwrap(),
+            MANIFEST.as_bytes()
+        );
+        for d in [
+            digest_of(&manifest).as_str(),
+            layers[0]["digest"].as_str().unwrap(),
+            layers[1]["digest"].as_str().unwrap(),
+        ] {
+            assert!(staged.join("blobs/sha256").join(&d[7..]).exists(), "{d}");
+        }
+
+        let scratch = dir.path().join("scratch");
+        assert!(derive(&store, &s, &image, &scratch).is_err());
+        std::fs::write(s.dir.join("refused"), "the release is unsigned\n").unwrap();
+        let e = derive(&store, &s, &image, &scratch).unwrap_err();
+        assert_eq!(e.to_string(), "the release is unsigned");
+
+        let signed = s.dir.join("signed");
+        std::fs::create_dir_all(&signed).unwrap();
+        std::fs::write(signed.join("vmlinuz.efi"), b"signed uki").unwrap();
+        std::fs::write(signed.join("systemd-boot.efi"), b"signed boot").unwrap();
+        std::fs::write(
+            signed.join("INSTALLER_REF"),
+            "127.0.0.1:5000/installer@sha256:00\n",
         )
         .unwrap();
-        assert!(derived.starts_with("127.0.0.1:5000/installer@sha256:"));
-        assert_eq!(soft.granted.lock().unwrap().len(), 1);
+        assert!(derive(&store, &s, &image, &scratch).is_err());
 
+        std::fs::write(signed.join("INSTALLER_REF"), format!("{image}\n")).unwrap();
+        let derived = derive(&store, &s, &image, &scratch).unwrap();
+        assert!(derived.starts_with("127.0.0.1:5000/installer@sha256:"));
         let d = store.digest(&derived).unwrap();
         let m: Value = serde_json::from_slice(&store.read(&d).unwrap()).unwrap();
         let layers = m["layers"].as_array().unwrap();
         assert_eq!(layers.len(), 3);
         let top = store.read(layers[2]["digest"].as_str().unwrap()).unwrap();
-        let mut names = Vec::new();
+        let mut files = Vec::new();
         for e in tar::Archive::new(top.as_slice()).entries().unwrap() {
             let mut e = e.unwrap();
-            let mut b = Vec::new();
-            e.read_to_end(&mut b).unwrap();
-            let pe = edge_boot::pe::Pe::parse(&b).unwrap();
-            assert!(pe.sections.len() > 1);
-            names.push(e.path().unwrap().to_string_lossy().to_string());
+            let mut b = String::new();
+            e.read_to_string(&mut b).unwrap();
+            files.push((e.path().unwrap().to_string_lossy().to_string(), b));
         }
         assert_eq!(
-            names,
+            files,
             [
-                "usr/install/amd64/vmlinuz.efi",
-                "usr/install/amd64/systemd-boot.efi"
+                ("usr/install/amd64/vmlinuz.efi".into(), "signed uki".into()),
+                (
+                    "usr/install/amd64/systemd-boot.efi".into(),
+                    "signed boot".into()
+                )
             ]
         );
         let c: Value =

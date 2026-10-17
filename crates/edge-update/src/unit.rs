@@ -143,7 +143,7 @@ pub struct Settings {
     /// The node path of boot-commit's record of the boot it blessed.
     pub bless: String,
     pub stack: Stack,
-    /// The unit's own boot signing keys: they sign each new OS's boot files.
+    /// The unit's own boot keys sign each new OS's boot files, at a boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_signing: Option<crate::boot::Settings>,
 }

@@ -60,6 +60,11 @@ pub enum Phase {
     },
     Starting,
     Importing,
+    /// Rebooting for the boot to sign the new OS's boot files; empty until staged.
+    Signing {
+        boot_id: String,
+        asked: Option<i64>,
+    },
     Snapshotting,
     Staging,
     Installing,
@@ -425,8 +430,6 @@ pub struct Engine {
     pub detail: String,
     pub unit: Unit,
     pub progress: Arc<Progress>,
-    /// Sign each new OS's boot files with, when the settings say to.
-    pub boot_keys: Option<Arc<dyn crate::boot::Keys>>,
 }
 
 enum Next {
@@ -481,12 +484,7 @@ impl Engine {
             detail: String::new(),
             unit: Unit::default(),
             progress: Arc::default(),
-            boot_keys: None,
         })
-    }
-
-    pub fn settings(&self) -> &Settings {
-        &self.settings
     }
 
     pub fn uploads(&self) -> Uploads {
@@ -794,6 +792,7 @@ impl Engine {
             Phase::Verifying { sha256 } => return self.verifying(&sha256).await,
             Phase::Starting => self.starting().await?,
             Phase::Importing => self.importing().await?,
+            Phase::Signing { boot_id, asked } => self.signing(boot_id, asked).await?,
             Phase::Snapshotting => self.snapshotting().await?,
             Phase::Staging => self.staging().await?,
             Phase::Installing => self.installing().await?,
@@ -1596,7 +1595,81 @@ impl Engine {
             edge_common::durable_write(&d.join(format!("{tag}.json")), &set)
                 .context("record the installed set")?;
         }
-        Ok(Go(Phase::Snapshotting))
+        Ok(Go(Phase::Signing {
+            boot_id: String::new(),
+            asked: None,
+        }))
+    }
+
+    /// Whether the release changes the OS, not only its config.
+    async fn changes_os(&mut self) -> anyhow::Result<bool> {
+        let (m, installer) = (
+            self.release()?.manifest.clone(),
+            self.before()?.installer.clone(),
+        );
+        Ok(os_changes(&m, &self.talos.version().await?, &installer))
+    }
+
+    /// Boot signing, on a unit with boot keys.
+    fn boot_keys(&self) -> Option<crate::boot::Settings> {
+        self.settings
+            .boot_signing
+            .clone()
+            .filter(crate::boot::Settings::has_keys)
+    }
+
+    /// Stages the release's OS for the boot to sign.
+    async fn stage_for_signing(&mut self, s: crate::boot::Settings) -> anyhow::Result<Next> {
+        self.detail = "staging the new OS for the unit to sign".into();
+        let installer = self.release()?.get("INSTALLER_REF").to_string();
+        let (registry, release) = (self.registry.clone(), self.release_dir(&self.release()?.id));
+        tokio::task::spawn_blocking(move || {
+            crate::boot::stage(&*registry, &s, &release, &installer)
+        })
+        .await??;
+        Ok(Go(Phase::Signing {
+            boot_id: self.boot_id().await?,
+            asked: None,
+        }))
+    }
+
+    /// A new OS on a unit with boot keys: staged, then a reboot for the boot
+    /// to sign it while the keys unseal.
+    async fn signing(&mut self, before: String, asked: Option<i64>) -> anyhow::Result<Next> {
+        let Some(s) = self.boot_keys() else {
+            return Ok(Go(Phase::Snapshotting));
+        };
+        if before.is_empty() {
+            if self.release()?.os_done || !self.changes_os().await? {
+                return Ok(Go(Phase::Snapshotting));
+            }
+            return self.stage_for_signing(s).await;
+        }
+        let installer = self.release()?.get("INSTALLER_REF").to_string();
+        if self.boot_id().await? == before {
+            let now = (self.now)();
+            if asked.is_none_or(|t| now - t > 2 * self.reboot_secs().max(REBOOT)) {
+                self.talos.reboot().await?;
+                self.record.phase = Phase::Signing {
+                    boot_id: before,
+                    asked: Some(now),
+                };
+                self.save()?;
+            }
+            return poll(30, "rebooting for the unit to sign the new OS");
+        }
+        match crate::boot::signed(&s) {
+            Ok(signed) if signed == installer => {
+                self.note(format!("the unit signed {installer}'s boot files"));
+                Ok(Go(Phase::Snapshotting))
+            }
+            Ok(signed) => Ok(Fail(format!(
+                "the unit signed {signed}, not {installer}. The OS and stack are unchanged"
+            ))),
+            Err(e) => Ok(Fail(format!(
+                "the unit did not sign {installer}'s boot files: {e:#}. The OS and stack are unchanged"
+            ))),
+        }
     }
 
     async fn snapshotting(&mut self) -> anyhow::Result<Next> {
@@ -1698,11 +1771,8 @@ impl Engine {
                 asked: None,
             }));
         }
-        let rel = self.release()?.clone();
-        let installer = installer_pin(rel.get("INSTALLER_REF"));
-        if installer == installer_pin(&self.before()?.installer)
-            && self.talos.version().await? == rel.get("TALOS_VERSION")
-        {
+        let installer = installer_pin(self.release()?.get("INSTALLER_REF"));
+        if !self.changes_os().await? {
             // The unit runs this OS already: the config alone, and no reboot.
             let config = self.os_config().await?;
             match self.talos.apply_config(&config).await {
@@ -1714,6 +1784,14 @@ impl Engine {
                     return Ok(Go(Phase::Seeding));
                 }
                 Err(e) => {
+                    let signed = self.release()?.get("INSTALLER_REF").to_string();
+                    if let Some(s) = self.boot_keys()
+                        && crate::boot::signed(&s).ok() != Some(signed)
+                    {
+                        // The staged config applies at the signing reboot.
+                        tracing::warn!(error = %e, "the config needs a reboot: rebooting for the unit to sign the OS");
+                        return self.stage_for_signing(s).await;
+                    }
                     tracing::warn!(error = %e, "the config needs a reboot: installing the OS as usual");
                 }
             }
@@ -1746,34 +1824,24 @@ impl Engine {
         }))
     }
 
-    /// The installer to install: with boot signing, one with its boot files signed by the unit.
+    /// The installer to install: on a unit with boot keys, with the boot files it signed.
     async fn signed_installer(&mut self, installer: &str) -> anyhow::Result<String> {
-        let Some(s) = self.settings.boot_signing.clone() else {
+        let Some(s) = self.boot_keys() else {
             return Ok(installer.into());
         };
-        let keys = self
-            .boot_keys
-            .clone()
-            .context("boot signing is set, but the unit has no boot keys")?;
-        self.detail = "signing the new OS's boot files with the unit's keys".into();
         let (registry, image, scratch) = (
             self.registry.clone(),
             installer.to_string(),
             self.dir.join("boot-signing"),
         );
-        let signed = tokio::task::spawn_blocking(move || match keys.unlock()? {
-            Some(signer) => {
-                crate::boot::derive(&*registry, &*signer, &s, &image, &scratch).map(Some)
-            }
-            None => Ok(None),
+        let derived = tokio::task::spawn_blocking(move || {
+            crate::boot::derive(&*registry, &s, &image, &scratch)
         })
         .await??;
-        let Some(signed) = signed else {
-            self.note("the unit holds no boot signing keys: the new OS boots as built");
-            return Ok(installer.into());
-        };
-        self.note(format!("the unit signed the new OS's boot files: {signed}"));
-        Ok(signed)
+        self.note(format!(
+            "the new OS with the boot files the unit signed: {derived}"
+        ));
+        Ok(derived)
     }
 
     async fn rebooting(&mut self, before: String, asked: Option<i64>) -> anyhow::Result<Next> {
@@ -2384,6 +2452,7 @@ fn phase_word(p: &Phase) -> &'static str {
         Phase::Verifying { .. } => "verifying",
         Phase::Starting => "starting",
         Phase::Importing => "importing the images",
+        Phase::Signing { .. } => "rebooting for the unit to sign the new OS's boot files",
         Phase::Snapshotting => "copying the store",
         Phase::Staging => "staging the machine config",
         Phase::Installing => "installing the OS",

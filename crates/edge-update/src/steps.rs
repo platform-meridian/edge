@@ -54,7 +54,11 @@ pub fn of(phase: &Phase) -> Option<Step> {
     Some(match phase {
         Phase::Idle => return None,
         Phase::Verifying { .. } => Step::Verify,
-        Phase::Starting | Phase::Importing | Phase::Snapshotting | Phase::Staging => Step::Stage,
+        Phase::Starting
+        | Phase::Importing
+        | Phase::Signing { .. }
+        | Phase::Snapshotting
+        | Phase::Staging => Step::Stage,
         Phase::Installing => Step::Install,
         Phase::Rebooting { .. } => Step::Reboot,
         Phase::Trial | Phase::Settling => Step::OsTrial,

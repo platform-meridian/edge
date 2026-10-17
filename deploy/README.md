@@ -52,15 +52,16 @@ Then provide:
     judge: flux-system/my-stack-commit  # good, previous, trial, rolled_back
     modules: flux-system/my-modules     # optional: the installed modules, written into each stack
   bootSigning:                        # optional: the unit signs each new OS's boot files
-    tpm: /dev/tpmrm0                  # its keys (crates/edge-boot); a unit without them installs as built
-    phases:                           # PCR 11 phase paths, as systemd-measure --phase
-      signed: [enter-initrd:leave-initrd]
-      running: enter-initrd:leave-initrd:ready
+    dir: /var/mnt/boot-signing        # mounted at the same path; the host's boot signs what is staged here
     uki: /usr/install/amd64/vmlinuz.efi       # in the installer image
     bootloader: /usr/install/amd64/systemd-boot.efi
   ```
 
-  With `bootSigning`, the pod needs the TPM device: run it privileged.
+  With `bootSigning`, a new OS costs one more reboot: edge-update stages the
+  verified release in `dir/staged/` and reboots, the host's early boot verifies
+  and signs it while the unit's boot keys unseal (`signed/`, or why not in
+  `refused`), and the installer is installed with the signed files over it. The
+  host marks `dir/keys` on a unit with keys; without it the OS installs as built.
 - any static routes, as ConfigMaps projected into edge-gateway's
   `routes.d/`, merged in name order:
 

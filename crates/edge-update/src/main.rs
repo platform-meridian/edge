@@ -144,11 +144,6 @@ async fn serve() -> anyhow::Result<()> {
         )))?),
         now,
     )?;
-    engine.boot_keys = engine
-        .settings()
-        .boot_signing
-        .as_ref()
-        .map(|b| Arc::new(boot::Tpm(b.tpm.clone())) as Arc<dyn boot::Keys>);
 
     let (tx, rx) = mpsc::channel(8);
     let (publish, status) = watch::channel(Snapshot::default());

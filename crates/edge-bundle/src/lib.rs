@@ -187,12 +187,19 @@ pub fn unpack_counting(
 
 type Sums = BTreeMap<PathBuf, [u8; 32]>;
 
-/// The first entries, the sums and any signature, verified; the signer, and
-/// the entry after them.
+/// A bundle's sums and any signature over them, verified, as it carries them.
+struct Signed {
+    sums: Sums,
+    signer: String,
+    raw: Vec<u8>,
+    signature: Option<Vec<u8>>,
+}
+
+/// The first entries, the sums and any signature, verified; and the entry after them.
 fn signed_sums<'a, R: Read>(
     entries: &mut tar::Entries<'a, R>,
     trust: &dyn Trust,
-) -> anyhow::Result<(Sums, String, Option<tar::Entry<'a, R>>)> {
+) -> anyhow::Result<(Signed, Option<tar::Entry<'a, R>>)> {
     let mut first = |want: &str, max: u64| -> anyhow::Result<Option<(Vec<u8>, _)>> {
         let Some(mut e) = entries.next().transpose()? else {
             return Ok(None);
@@ -222,7 +229,15 @@ fn signed_sums<'a, R: Read>(
         sums.contains_key(Path::new(MANIFEST)),
         "the signed sums do not cover {MANIFEST}"
     );
-    Ok((sums, signer, next))
+    Ok((
+        Signed {
+            sums,
+            signer,
+            raw: sums_bytes,
+            signature: sig,
+        },
+        next,
+    ))
 }
 
 /// What a bundle says of itself, signed: readable before the rest has arrived.
@@ -267,7 +282,7 @@ impl<R: Read> Read for Start<R> {
 fn head_of(start: &mut impl Read, trust: &dyn Trust) -> anyhow::Result<Head> {
     let mut archive = tar::Archive::new(start);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let (sums, signer, next) = signed_sums(&mut entries, trust)?;
+    let (Signed { sums, signer, .. }, next) = signed_sums(&mut entries, trust)?;
     let mut entries = next.map(Ok).into_iter().chain(entries);
     let mut head = Head {
         signer,
@@ -357,9 +372,15 @@ impl<R: Read> Read for Counting<'_, R> {
 fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result<Unpacked> {
     let mut archive = tar::Archive::new(tar);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let (sums, signer, next) = signed_sums(&mut entries, trust)?;
+    let (signed, next) = signed_sums(&mut entries, trust)?;
+    let Signed { sums, signer, .. } = &signed;
 
+    // Kept as signed: the unit's boot verifies a base again.
     std::fs::create_dir_all(dest)?;
+    std::fs::write(dest.join(SUMS), &signed.raw)?;
+    if let Some(sig) = &signed.signature {
+        std::fs::write(dest.join(SIGNATURE), sig)?;
+    }
     let mut seen = BTreeSet::new();
     for e in next.map(Ok).into_iter().chain(entries) {
         let mut e = e?;
@@ -406,8 +427,11 @@ fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result
     }
     sync_fs(dest)?;
     let manifest = parse_manifest(&std::fs::read_to_string(dest.join(MANIFEST))?)?;
-    signed_format(&sums, &manifest)?;
-    Ok(Unpacked { manifest, signer })
+    signed_format(sums, &manifest)?;
+    Ok(Unpacked {
+        manifest,
+        signer: signer.clone(),
+    })
 }
 
 /// An unpacked bundle's FluxInstance, if it carries one.

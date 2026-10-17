@@ -112,6 +112,10 @@ pub(crate) struct World {
     staged_configs: Vec<String>,
     /// The FluxInstance applied, and the stack it applied on.
     instance: Option<(String, String)>,
+    /// The host's boot signing directory: a reboot signs what is staged there.
+    boot_signing: Option<PathBuf>,
+    /// The boot refuses what is staged, saying why.
+    sign_refuses: Option<String>,
 }
 
 impl World {
@@ -155,6 +159,8 @@ impl World {
             log: Vec::new(),
             staged_configs: Vec::new(),
             instance: None,
+            boot_signing: None,
+            sign_refuses: None,
             calls: 0,
             changes: 0,
             crash_at: None,
@@ -385,7 +391,11 @@ impl Talos for FakeTalos {
             w.staged.is_some() || w.active.contains("store:update-new"),
             "installed before staging"
         );
-        assert!(image.ends_with(&format!("@{DIGEST}")) && !image.contains(":update-new@"));
+        let derived = w.boot_signing.is_some();
+        assert!(
+            image.ends_with(&format!("@{DIGEST}")) != derived && !image.contains(":update-new@"),
+            "{image}"
+        );
         anyhow::ensure!(!w.install_fails, "pulling {image}: not found");
         let entry = format!("Talos-v1.14.1~{}.efi", w.entries.len());
         w.entries
@@ -400,6 +410,9 @@ impl Talos for FakeTalos {
         w.calls += 1;
         if !w.reboot_hangs {
             w.power_cycle();
+            if let Some(dir) = &w.boot_signing {
+                boot_sign(dir, w.sign_refuses.as_deref());
+            }
         }
         w.change("reboot".into())
     }
@@ -872,9 +885,19 @@ impl Harness {
     fn reopen(&mut self) {
         let w = self.world.clone();
         let clock = self.clock.clone();
+        let mut settings = settings();
+        settings.boot_signing = self
+            .w()
+            .boot_signing
+            .clone()
+            .map(|dir| crate::boot::Settings {
+                dir,
+                uki: "/usr/install/amd64/vmlinuz.efi".into(),
+                bootloader: "/usr/install/amd64/systemd-boot.efi".into(),
+            });
         let mut e = Engine::open(
             &self.state(),
-            settings(),
+            settings,
             Arc::new(testkit::trust()),
             Arc::new(FakeTalos(w.clone())),
             Arc::new(FakeCluster(w.clone())),
@@ -1049,6 +1072,89 @@ impl Harness {
 }
 
 /// The unit's config names `installer`, as a provisioned one does.
+/// The host's boot: signs what is staged, or says why not.
+fn boot_sign(dir: &Path, refuses: Option<&str>) {
+    let staged = dir.join("staged");
+    let Ok(manifest) = std::fs::read_to_string(staged.join(crate::bundle::MANIFEST)) else {
+        return;
+    };
+    match refuses {
+        Some(why) => std::fs::write(dir.join("refused"), why).unwrap(),
+        None => {
+            let signed = dir.join("signed");
+            std::fs::create_dir_all(&signed).unwrap();
+            for f in ["vmlinuz.efi", "systemd-boot.efi"] {
+                std::fs::write(signed.join(f), format!("signed {f}")).unwrap();
+            }
+            let installer = manifest
+                .lines()
+                .find_map(|l| l.strip_prefix("INSTALLER_REF="))
+                .unwrap();
+            std::fs::write(signed.join("INSTALLER_REF"), format!("{installer}\n")).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(staged).unwrap();
+}
+
+impl Harness {
+    /// A unit with boot keys, and the installer image the bundles name.
+    fn with_boot_keys(&mut self) {
+        let dir = self.dir.path().join("boot-signing");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keys"), "").unwrap();
+        let layer = b"layer".to_vec();
+        let config = br#"{"rootfs":{"type":"layers","diff_ids":["sha256:aa"]}}"#.to_vec();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": "sha256:c0", "size": config.len()},
+            "layers": [{"digest": "sha256:1a", "size": layer.len()}],
+        });
+        let mut w = self.w();
+        w.blobs
+            .insert(DIGEST.into(), manifest.to_string().into_bytes());
+        w.blobs.insert("sha256:c0".into(), config);
+        w.blobs.insert("sha256:1a".into(), layer);
+        w.boot_signing = Some(dir);
+        drop(w);
+        self.reopen();
+    }
+}
+
+#[tokio::test]
+async fn a_new_os_is_signed_at_a_reboot_then_installed_with_the_signed_files() {
+    let mut h = Harness::new();
+    h.with_boot_keys();
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
+    assert_eq!(
+        h.w().log,
+        [
+            "import",
+            "import",
+            "reboot",
+            "stage",
+            "import",
+            "install",
+            "reboot",
+            "seed",
+            "repoint update-new",
+            "collect"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_release_the_boot_refuses_installs_nothing() {
+    let mut h = Harness::new();
+    h.with_boot_keys();
+    h.w().sign_refuses = Some("the release is unsigned".into());
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Failed);
+    assert!(e.detail.contains("the release is unsigned"), "{}", e.detail);
+    assert!(!h.w().log.iter().any(|l| l == "install" || l == "stage"));
+}
+
 fn running_installer(h: &Harness, installer: &str) {
     let mut w = h.w();
     w.active = format!(
