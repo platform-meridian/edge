@@ -1,0 +1,14 @@
+2026-10-27T16:15:39.969089Z  INFO edge_gateway::controller::discovered: declared routes configmap=map/martin-routes routes=1
+2026-10-27T16:15:39.969632Z  INFO edge_gateway::controller::run: route table updated total=2 static_routes=1
+2026-10-27T16:15:43.355402Z  INFO edge_gateway::controller::run: route table updated total=1 static_routes=1
+2026-10-27T16:15:46.526020Z  INFO edge_gateway::controller::discovered: declared routes configmap=map/martin-routes routes=1
+2026-10-27T16:15:46.526487Z  INFO edge_gateway::controller::run: route table updated total=2 static_routes=1
+2026-10-27T16:15:49.931480Z ERROR edge_gateway::controller::discovered: declared routes refused configmap=map/martin-routes error=parsing: error: line 1 column 1: unknown field `authz_backend`, expected one of routes
+2026-10-27T16:15:49.931926Z  INFO edge_gateway::controller::run: route table updated total=1 static_routes=1
+2026-10-27T16:16:31.026306Z  INFO edge_gateway::controller::discovered: declared routes configmap=map/martin-routes routes=1
+2026-10-27T16:16:31.026975Z  INFO edge_gateway::controller::run: route table updated total=2 static_routes=1
+2026-10-27T16:16:34.348743Z  INFO edge_gateway::controller::run: route table updated total=1 static_routes=1
+2026-10-27T16:16:37.558828Z  INFO edge_gateway::controller::discovered: declared routes configmap=map/martin-routes routes=1
+2026-10-27T16:16:37.559226Z  INFO edge_gateway::controller::run: route table updated total=2 static_routes=1
+2026-10-27T16:16:40.844666Z ERROR edge_gateway::controller::discovered: declared routes refused configmap=map/martin-routes error=parsing: error: line 1 column 1: unknown field `authz_backend`, expected one of routes
+2026-10-27T16:16:40.845029Z  INFO edge_gateway::controller::run: route table updated total=1 static_routes=1

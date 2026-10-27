@@ -1,0 +1,9 @@
+== core (system:serviceaccount:meridian:platform-core), audience edge-registry
+PUT manifest 1.0.0 as core: 201
+GET manifest 1.0.0, no token: 200
+PUT as app-fusion: 401
+PUT as core with an apiserver-audience token: 401
+PUT with no token: 401
+DELETE as core: 403
+DELETE as the controller: 202
+GET manifest 1.0.0 after: 404

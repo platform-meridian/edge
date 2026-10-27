@@ -1,0 +1,7 @@
+before any ConfigMap: martin.unit.lan -> 404
+map/martin-routes created (labelled edge.meridian/routes): martin.unit.lan -> 200, body: martin says hello
+label removed: martin.unit.lan -> 404
+label back: martin.unit.lan -> 200
+routes.yaml declares an authz_backend (refused): martin.unit.lan -> 404
+ConfigMap deleted: martin.unit.lan -> 404
+the config file's own route, unit.lan, throughout: 502 (its backend :18081 is down: 502 is routed)
