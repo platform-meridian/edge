@@ -44,6 +44,60 @@ impl Store {
         Ok(swept)
     }
 
+    /// Removes the tags in `repo` that name `digest`. The caller holds the lock.
+    pub(crate) fn untag(&self, repo: &str, digest: &Digest) -> std::io::Result<()> {
+        let mut any = false;
+        for t in self.tags()? {
+            if t.repo == repo
+                && t.digest.as_ref() == Some(digest)
+                && let Some(tag) = &t.tag
+            {
+                self.remove_tag(repo, tag)?;
+                any = true;
+            }
+        }
+        if any {
+            sync_dir(&self.tag_dir().join(repo_dir(repo)))?;
+        }
+        Ok(())
+    }
+
+    /// Removes the manifest `digest`. The caller holds the lock.
+    pub(crate) fn remove_manifest(&self, digest: &Digest) -> std::io::Result<()> {
+        remove(&self.manifest_dir().join(digest.hex()))?;
+        sync_dir(&self.manifest_dir())
+    }
+
+    /// Removes the blobs no manifest names that are older than `age`. The
+    /// caller holds the lock.
+    pub(crate) fn sweep_unnamed_blobs(&self, age: std::time::Duration) -> std::io::Result<usize> {
+        let mut named = HashSet::new();
+        for (name, _) in entries(&self.manifest_dir())? {
+            if let Some((_, blobs)) =
+                Digest::from_hex(&name).and_then(|d| self.children_and_blobs(&d))
+            {
+                named.extend(blobs);
+            }
+        }
+        let old = |p: &Path| {
+            p.symlink_metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|e| e > age)
+        };
+        let mut n = 0;
+        for (name, path) in entries(&self.blob_dir())? {
+            if Digest::from_hex(&name).is_some_and(|d| named.contains(&d)) || !old(&path) {
+                continue;
+            }
+            remove(&path)?;
+            n += 1;
+        }
+        sync_dir(&self.blob_dir())?;
+        Ok(n)
+    }
+
     /// What [`Store::retain`] would delete, deleting nothing.
     pub fn reclaimable(&self, keep: &[ImageRef]) -> anyhow::Result<Swept> {
         let live = self.live(keep)?;

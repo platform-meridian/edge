@@ -1,4 +1,6 @@
-//! The read side of the OCI Distribution API: what containerd needs to pull.
+//! The OCI Distribution API: the read side, what containerd needs to pull,
+//! from the base's store and the pushed one; and, with a pushed store, the
+//! write side its authority allows (`push`).
 
 use std::convert::Infallible;
 use std::io;
@@ -23,12 +25,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::ReaderStream;
 
+use crate::push::{Pushed, Role};
 use crate::reference::normalize_repo;
 use crate::{Digest, Store};
 
-type Body = UnsyncBoxBody<Bytes, io::Error>;
+pub(crate) type Body = UnsyncBoxBody<Bytes, io::Error>;
 
-const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
+pub(crate) const DOCKER_CONTENT_DIGEST: HeaderName =
+    HeaderName::from_static("docker-content-digest");
 
 /// Serves `store` on `listen` until `stop`, passing misses through to `upstream`.
 pub async fn serve(
@@ -37,13 +41,14 @@ pub async fn serve(
     upstream: Option<SocketAddr>,
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    serve_waiting(store, listen, upstream, Duration::ZERO, stop).await
+    serve_waiting(store, None, listen, upstream, Duration::ZERO, stop).await
 }
 
 /// [`serve`], a miss waiting out an upstream that refuses for up to `wait`
 /// from the start, until it has first answered: one coming up after this one.
 pub async fn serve_waiting(
     store: Option<Store>,
+    pushed: Option<Arc<Pushed>>,
     listen: SocketAddr,
     upstream: Option<SocketAddr>,
     wait: Duration,
@@ -65,14 +70,16 @@ pub async fn serve_waiting(
             }
         });
     }
-    let state = Arc::new((
+    let state = Arc::new(State {
         store,
-        Upstream {
+        pushed,
+        upstream: Upstream {
             addr: upstream,
             until: tokio::time::Instant::now() + wait,
             seen: AtomicBool::new(false),
         },
-    ));
+        host: listen.to_string(),
+    });
     let mut term = edge_common::Terminator::new();
     tokio::pin!(stop);
     loop {
@@ -93,7 +100,7 @@ pub async fn serve_waiting(
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, Infallible>(respond(state.0.as_ref(), &state.1, &req).await) }
+                async move { Ok::<_, Infallible>(state.handle(req).await) }
             });
             if let Err(e) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), svc)
@@ -102,6 +109,134 @@ pub async fn serve_waiting(
                 tracing::debug!(error = %e, "connection ended");
             }
         });
+    }
+}
+
+struct State {
+    store: Option<Store>,
+    pushed: Option<Arc<Pushed>>,
+    upstream: Upstream,
+    /// The registry's own name, `127.0.0.1:5000`, when a request's Host is absent.
+    host: String,
+}
+
+impl State {
+    async fn handle(&self, req: Request<hyper::body::Incoming>) -> Response<Body> {
+        let mut resp = match (req.method(), &self.pushed) {
+            (&Method::GET | &Method::HEAD, _) => {
+                let pushed = self.pushed.as_ref().map(|p| &p.store);
+                respond(self.store.as_ref(), pushed, &self.upstream, &req).await
+            }
+            (_, Some(p)) => self.write(p, req).await,
+            (_, None) => error(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "read-only"),
+        };
+        resp.headers_mut().insert(
+            "docker-distribution-api-version",
+            HeaderValue::from_static("registry/2.0"),
+        );
+        resp
+    }
+
+    async fn write(&self, p: &Arc<Pushed>, req: Request<hyper::body::Incoming>) -> Response<Body> {
+        let auth = req
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let role = match p.accounts.role(auth) {
+            Ok(r) => r,
+            Err(why) => {
+                let mut r = error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", &why);
+                r.headers_mut().insert(
+                    http::header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Bearer realm=\"edge-registry\""),
+                );
+                return r;
+            }
+        };
+        let Some(w) = write_route(req.method(), req.uri().path(), req.uri().query()) else {
+            return error(StatusCode::NOT_FOUND, "UNSUPPORTED", "no such write");
+        };
+        let wants = match w {
+            Write::Delete { .. } => Role::Delete,
+            _ => Role::Push,
+        };
+        if role != wants {
+            return error(StatusCode::FORBIDDEN, "DENIED", "not this caller's to do");
+        }
+        let host = req
+            .headers()
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or(&self.host)
+            .to_string();
+        let body = req.into_body();
+        match crate::push::write(p, &host, w, body).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), "write refused");
+                error(StatusCode::BAD_REQUEST, "UNSUPPORTED", &format!("{e:#}"))
+            }
+        }
+    }
+}
+
+/// A write the API names.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Write {
+    /// `POST /v2/<name>/blobs/uploads/`, whole when it names the digest.
+    Begin {
+        name: String,
+        digest: Option<Digest>,
+    },
+    /// `PATCH /v2/<name>/blobs/uploads/<id>`.
+    Append { name: String, id: String },
+    /// `PUT /v2/<name>/blobs/uploads/<id>?digest=`.
+    Finish {
+        name: String,
+        id: String,
+        digest: Digest,
+    },
+    /// `PUT /v2/<name>/manifests/<reference>`.
+    Manifest { name: String, reference: String },
+    /// `DELETE /v2/<name>/manifests/<digest>`.
+    Delete { name: String, digest: Digest },
+}
+
+fn write_route(method: &Method, path: &str, query: Option<&str>) -> Option<Write> {
+    let rest = path.strip_prefix("/v2/")?;
+    let digest = query.and_then(|q| {
+        form_urlencoded::parse(q.as_bytes())
+            .find_map(|(k, v)| (k == "digest").then(|| v.parse::<Digest>().ok()))
+            .flatten()
+    });
+    if let Some((name, id)) = rest.rsplit_once("/blobs/uploads/") {
+        let (name, id) = (decode(name)?, decode(id)?);
+        if name.is_empty() {
+            return None;
+        }
+        return match (method, id.is_empty()) {
+            (&Method::POST, true) => Some(Write::Begin { name, digest }),
+            (&Method::PATCH, false) => Some(Write::Append { name, id }),
+            (&Method::PUT, false) => Some(Write::Finish {
+                name,
+                id,
+                digest: digest?,
+            }),
+            _ => None,
+        };
+    }
+    let (name, reference) = rest.rsplit_once("/manifests/")?;
+    let (name, reference) = (decode(name)?, decode(reference)?);
+    if name.is_empty() || reference.is_empty() {
+        return None;
+    }
+    match *method {
+        Method::PUT => Some(Write::Manifest { name, reference }),
+        Method::DELETE => Some(Write::Delete {
+            name,
+            digest: reference.parse().ok()?,
+        }),
+        _ => None,
     }
 }
 
@@ -164,30 +299,35 @@ fn decode(segment: &str) -> Option<String> {
         .map(|s| s.into_owned())
 }
 
+/// Reads: the base's store, then the pushed one, then upstream.
 async fn respond<B>(
     store: Option<&Store>,
+    pushed: Option<&Store>,
     upstream: &Upstream,
     req: &Request<B>,
 ) -> Response<Body> {
-    let head = match *req.method() {
-        Method::GET => false,
-        Method::HEAD => true,
-        _ => return error(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "read-only"),
-    };
+    let head = *req.method() == Method::HEAD;
     let range = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
-    let held = match (route(req.uri().path(), req.uri().query()), store) {
-        (Some(Route::Base), _) => Some(json(StatusCode::OK, Bytes::from_static(b"{}"))),
-        (
+    let mut held = None;
+    let route = route(req.uri().path(), req.uri().query());
+    for store in store.into_iter().chain(pushed) {
+        held = match &route {
+            Some(Route::Base) => Some(json(StatusCode::OK, Bytes::from_static(b"{}"))),
             Some(Route::Manifest {
                 name,
                 ns,
                 reference,
-            }),
-            Some(store),
-        ) => manifest(store, &name, ns.as_deref(), &reference),
-        (Some(Route::Blob(digest)), Some(store)) => blob(store, &digest, range).await,
-        _ => None,
-    };
+            }) => manifest(store, name, ns.as_deref(), reference),
+            Some(Route::Blob(digest)) => blob(store, digest, range).await,
+            None => None,
+        };
+        if held.is_some() {
+            break;
+        }
+    }
+    if held.is_none() && matches!(route, Some(Route::Base)) {
+        held = Some(json(StatusCode::OK, Bytes::from_static(b"{}")));
+    }
     let mut resp = match held {
         Some(r) => r,
         None => match upstream.fetch(req).await {
@@ -198,10 +338,6 @@ async fn respond<B>(
     if head {
         *resp.body_mut() = Body::default();
     }
-    resp.headers_mut().insert(
-        "docker-distribution-api-version",
-        HeaderValue::from_static("registry/2.0"),
-    );
     resp
 }
 
@@ -416,7 +552,7 @@ fn byte_range(header: &str, len: u64) -> Range {
     Range::Part(start, end)
 }
 
-fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
+pub(crate) fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
     let body = serde_json::json!({ "errors": [{ "code": code, "message": message }] });
     json(status, Bytes::from(body.to_string()))
 }
@@ -429,7 +565,7 @@ fn json(status: StatusCode, body: Bytes) -> Response<Body> {
     resp
 }
 
-fn full(b: Bytes) -> Body {
+pub(crate) fn full(b: Bytes) -> Body {
     BodyExt::boxed_unsync(Full::new(b).map_err(|never| match never {}))
 }
 
