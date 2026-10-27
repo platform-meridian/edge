@@ -30,3 +30,11 @@ message GetResponse {
 message MachineConfigSpec {
     bytes yaml_marshalled = 1;
 }
+
+// talos api/resource/definitions/block: a volume's phase (BlockVolumePhase,
+// READY = 6, FAILED = 1), where its raw device is, and why it failed.
+message VolumeStatusSpec {
+    int32 phase = 1;
+    string location = 2;
+    string error_message = 3;
+}

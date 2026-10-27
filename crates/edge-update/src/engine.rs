@@ -86,11 +86,19 @@ pub enum Phase {
     Collecting,
 }
 
+/// A change to the unit's provisioned user volumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VolumeEdit {
+    /// The volume, of this many MiB.
+    Add(machineconfig::Provisioned, u64),
+    Remove(machineconfig::Provisioned),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Release {
     /// Minted by the unit: it tags the release's stack.
     pub id: String,
-    /// The bundle's; none for an uninstall.
+    /// The bundle's.
     pub sha256: String,
     pub manifest: Manifest,
     pub refs: BTreeSet<String>,
@@ -117,13 +125,6 @@ pub struct Release {
     /// The stack its set was composed on.
     #[serde(default)]
     pub composed_on: Option<String>,
-    /// What the bundle itself brought: a base or not, its modules, and those it removed.
-    #[serde(default)]
-    pub brings_base: bool,
-    #[serde(default)]
-    pub modules: BTreeSet<String>,
-    #[serde(default)]
-    pub removes: BTreeSet<String>,
     /// Each ref of the installed set and what it belongs to: `base` or a module.
     #[serde(default)]
     pub owners: BTreeMap<String, String>,
@@ -379,9 +380,6 @@ pub fn mint() -> String {
 /// refused as soon as its head has arrived.
 pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
     use anyhow::ensure;
-    if !bundle::has_base(m) {
-        return Ok(());
-    }
     let get = |k: &str| m.get(k).map(String::as_str).unwrap_or_default();
     get("BUILT_EPOCH")
         .parse::<i64>()
@@ -525,6 +523,36 @@ impl Engine {
         self.record.phase == Phase::Idle
     }
 
+    /// Adds or removes a provisioned user volume (the storage provisioner's,
+    /// `crate::volumes`) in the config the node runs and boots. The engine is
+    /// the machine config's one writer, so this waits out an update: refused
+    /// unless idle with nothing staged for the next boot. Repeating one is a
+    /// no-op.
+    pub async fn edit_volume(&mut self, edit: VolumeEdit) -> anyhow::Result<()> {
+        anyhow::ensure!(self.idle(), "an update is in progress");
+        let running = self.talos.running_config().await?;
+        anyhow::ensure!(
+            same_config(&running, &self.talos.machine_config().await?),
+            "a config is staged for the next boot"
+        );
+        let have = machineconfig::provisioned(&running)?;
+        let next = match &edit {
+            VolumeEdit::Add(v, mib) => match have.get(v) {
+                Some(had) if had == mib => return Ok(()),
+                Some(had) => anyhow::bail!(
+                    "{} is {had} MiB, not {mib}: a claim is not resized",
+                    v.name()
+                ),
+                None => machineconfig::with_provisioned(&running, v, *mib)?,
+            },
+            VolumeEdit::Remove(v) if !have.contains_key(v) => return Ok(()),
+            VolumeEdit::Remove(v) => machineconfig::without_provisioned(&running, v)?,
+        };
+        self.talos.apply_config(&next).await?;
+        tracing::info!(edit = ?edit, "provisioned volumes changed");
+        Ok(())
+    }
+
     /// While idle, or on a stack trial that cannot end by itself, which it ends.
     pub async fn request_verify(&mut self, sha256: &str) -> anyhow::Result<()> {
         let stuck = match self.idle() {
@@ -603,18 +631,6 @@ impl Engine {
         }
         self.record.took_over = stuck.unwrap_or_default();
         self.go(Phase::Starting)
-    }
-
-    /// The apps installed in the stack the unit runs.
-    pub async fn apps(&self) -> anyhow::Result<BTreeMap<String, components::Module>> {
-        let (_, on) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        let set = self
-            .installed(&on)?
-            .context("this unit's installed set is unknown: install a bundle with a base first")?;
-        Ok(set.installed.modules)
     }
 
     /// The stack trial a new bundle may end, read afresh.
@@ -962,34 +978,21 @@ impl Engine {
         }
     }
 
-    /// With no recorded set, a bundle stands for the whole of it: it brings a
-    /// base and every module the unit runs, as the release it runs or its
-    /// stack's record of modules says.
-    async fn covers_what_runs(&self, on: &str, c: &Components) -> anyhow::Result<()> {
+    /// With no recorded set, the base becomes the whole of it: the unit must
+    /// run no module, as the release it runs or its stack's record says,
+    /// since a bundle brings none to carry.
+    async fn runs_no_module(&self, on: &str) -> anyhow::Result<()> {
         let said = match self.record.running(on) {
             Some(r) => r.manifest.get(components::MODULES_KEY).cloned(),
             None => self.recorded_modules().await?,
         };
-        let runs: BTreeSet<&str> = said
+        let runs = said
             .as_deref()
-            .context(
-                "this unit's installed modules are unknown: bring a base and every module it runs",
-            )?
-            .split_whitespace()
-            .collect();
-        let missing: Vec<&str> = runs
-            .iter()
-            .filter(|m| !c.modules.contains_key(**m) && !c.remove.contains(**m))
-            .copied()
-            .collect();
+            .context("this unit's installed modules are unknown, so a base cannot carry them")?
+            .trim();
         anyhow::ensure!(
-            c.base.is_some() && missing.is_empty(),
-            "this unit's installed modules are unknown to this engine: bring a base and every module it runs{}",
-            if missing.is_empty() {
-                String::new()
-            } else {
-                format!(" (this bundle lacks {})", missing.join(", "))
-            }
+            runs.is_empty(),
+            "this unit runs modules ({runs}) its installed set does not record, so a base cannot carry them"
         );
         Ok(())
     }
@@ -1006,7 +1009,8 @@ impl Engine {
             .and_then(|m| m.get(components::MODULES_KEY).cloned()))
     }
 
-    /// Merges the bundle into the unit's installed set and composes its stack.
+    /// Installs the bundle's base into the unit's set and composes its stack,
+    /// the modules it runs carried as they are.
     async fn compose(&self, rel: &mut Release) -> anyhow::Result<()> {
         let dir = self.release_dir(&rel.id);
         let c = Components::read(&dir)?;
@@ -1016,36 +1020,23 @@ impl Engine {
             .await?;
         let current = self.installed(&on)?;
         if current.is_none() {
-            self.covers_what_runs(&on, &c).await?;
+            self.runs_no_module(&on).await?;
         }
-        let patch = match &c.base {
-            Some(_) => Some(std::fs::read_to_string(dir.join(bundle::PATCH))?),
-            None => None,
-        };
+        let patch = std::fs::read_to_string(dir.join(bundle::PATCH))?;
         let next = Installed::after(
             current.as_ref().map(|c| &c.installed),
             &rel.manifest,
-            patch.as_deref(),
+            &patch,
             &c,
         )?;
-        let (stack, repo) = match &current {
-            _ if c.base.is_some() => {
-                let digest = rel.get("STACK_DIGEST");
-                let repo = bundle::layout_images(&dir.join(bundle::IMAGES))?
-                    .into_iter()
-                    .find(|(_, d)| d == digest)
-                    .and_then(|(r, _)| r.rsplit_once(':').map(|(repo, _)| repo.to_string()));
-                (digest.to_string(), repo)
-            }
-            Some(cur) => (cur.stack.clone(), Some(cur.repo.clone())),
-            None => anyhow::bail!("the unit's stack {on} has no installed set"),
-        };
-        rel.manifest = next.manifest(&rel.manifest, &c);
+        let digest = rel.get("STACK_DIGEST").to_string();
+        let repo = bundle::layout_images(&dir.join(bundle::IMAGES))?
+            .into_iter()
+            .find(|(_, d)| *d == digest)
+            .and_then(|(r, _)| r.rsplit_once(':').map(|(repo, _)| repo.to_string()));
+        rel.manifest = next.manifest();
         rel.composed_on = Some(on);
-        rel.brings_base = c.base.is_some();
-        rel.modules = c.modules.keys().cloned().collect();
-        rel.removes = c.remove.clone();
-        self.compose_set(rel, next, &stack, repo)
+        self.compose_set(rel, next, &digest, repo)
     }
 
     /// `next` composed on the stack artifact `base`, tagged in `repo`, else
@@ -1192,43 +1183,6 @@ impl Engine {
         steps::close(&mut self.record.steps, State::Done, (self.now)());
         self.note("verified");
         self.go(Phase::Idle)
-    }
-
-    /// Composes the installed set without the module `name` as a release to apply.
-    pub async fn request_uninstall(&mut self, name: &str, by: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(self.idle(), "an update is in progress");
-        let (_, on) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        let cur = self
-            .installed(&on)?
-            .context("this unit's installed set is unknown: install a bundle with a base first")?;
-        let next = cur.installed.without(name)?;
-        let now = (self.now)();
-        self.record.steps = vec![Taken {
-            step: Step::Verify,
-            state: State::Running,
-            started: now,
-            finished: 0,
-        }];
-        self.record.log.clear();
-        self.record.by = by.into();
-        self.note(format!("uninstalling {name}{}", from(by)));
-        self.refresh_unit().await;
-        let mut rel = Release {
-            id: (self.mint)(),
-            manifest: next.manifest(&Manifest::new(), &Components::default()),
-            composed_on: Some(on),
-            removes: [name.to_string()].into(),
-            ..Release::default()
-        };
-        std::fs::create_dir_all(self.release_dir(&rel.id))?;
-        if let Err(e) = self.compose_set(&mut rel, next, &cur.stack, Some(cur.repo)) {
-            let _ = std::fs::remove_dir_all(self.release_dir(&rel.id));
-            return Err(e);
-        }
-        self.verified(rel).await
     }
 
     /// What verification found, for a person: each check passed or not, and

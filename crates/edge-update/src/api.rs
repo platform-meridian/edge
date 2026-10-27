@@ -1,8 +1,7 @@
-//! The update API over ConnectRPC. Uploads and pulls are handled here;
+//! The update API over ConnectRPC. Uploads are handled here;
 //! verifying and applying are handed to the engine, whose status every client
 //! watches.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use connectrpc::{
@@ -10,12 +9,10 @@ use connectrpc::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::bundle::components::{MODULES_KEY, Module, REMOVE_KEY};
 use crate::diff::{Change, Component, Diff};
 use crate::engine::{self, Entry, Outcome, Phase, Power, Record, Release, Storage, Unit};
 use crate::judge::{Check, CheckState};
 use crate::pb::edge::update::v1 as pb;
-use crate::pull::Puller;
 use crate::steps::{self, State, Step, Taken};
 use crate::upload::{Upload, Uploads};
 
@@ -25,13 +22,12 @@ pub enum Command {
     Verify(String, Reply<()>),
     /// The release's id, and who applies it.
     Apply(String, String, Reply<()>),
-    /// The app, and who uninstalls it.
-    Uninstall(String, String, Reply<()>),
-    Apps(Reply<BTreeMap<String, Module>>),
     Power(Power, Reply<String>),
     Commit(String, String, Reply<()>),
     RollBack(String, String, Reply<String>),
     Storage(Reply<Storage>),
+    /// From the storage provisioner, never the API.
+    Volume(engine::VolumeEdit, Reply<()>),
     /// Drop the previous release's images too.
     Collect(bool, Reply<u64>),
 }
@@ -49,7 +45,6 @@ pub struct Service {
     commands: mpsc::Sender<Command>,
     status: watch::Receiver<Snapshot>,
     uploads: Arc<Mutex<Uploads>>,
-    puller: Puller,
 }
 
 impl Service {
@@ -57,13 +52,11 @@ impl Service {
         commands: mpsc::Sender<Command>,
         status: watch::Receiver<Snapshot>,
         uploads: Uploads,
-        puller: Puller,
     ) -> Self {
         Self {
             commands,
             status,
             uploads: Arc::new(Mutex::new(uploads)),
-            puller,
         }
     }
 
@@ -164,9 +157,6 @@ fn upload(u: &Upload) -> pb::Upload {
                     .collect(),
                 notes: h.notes.clone().unwrap_or_default(),
                 signer: h.signer.clone(),
-                brings_base: crate::bundle::has_base(&h.manifest),
-                modules: listed(&h.manifest, MODULES_KEY),
-                removes: listed(&h.manifest, REMOVE_KEY),
                 ..Default::default()
             })
             .into(),
@@ -201,12 +191,6 @@ fn component(c: &Component) -> pb::Component {
         owner: c.owner.clone(),
         ..Default::default()
     }
-}
-
-fn listed(m: &crate::bundle::Manifest, key: &str) -> Vec<String> {
-    m.get(key)
-        .map(|v| v.split_whitespace().map(String::from).collect())
-        .unwrap_or_default()
 }
 
 fn diff(d: &Diff) -> pb::Diff {
@@ -257,22 +241,6 @@ fn release(r: &Release) -> pb::Release {
         checks: r.checks.iter().map(check).collect(),
         diff: r.diff.as_ref().map(diff).into(),
         components: r.components().iter().map(component).collect(),
-        brings_base: r.brings_base,
-        modules: r.modules.iter().cloned().collect(),
-        removes: r.removes.iter().cloned().collect(),
-        ..Default::default()
-    }
-}
-
-fn app(name: &str, m: &Module) -> pb::App {
-    pb::App {
-        name: name.into(),
-        version: m.version.clone(),
-        epoch: m.epoch,
-        images: m.refs.iter().cloned().collect(),
-        requires_talos: m.requires.talos.clone(),
-        requires_kubernetes: m.requires.kubernetes.clone(),
-        requires_flux: m.requires.flux.iter().cloned().collect(),
         ..Default::default()
     }
 }
@@ -572,50 +540,9 @@ impl pb::UpdateService for Service {
         _: RequestContext,
         request: ServiceRequest<'_, pb::InstallRequest>,
     ) -> ServiceResult<pb::InstallResponse> {
-        use pb::__buffa::view::oneof::install_request::Source;
-        let by = request.by.to_string();
-        let fetched = match &request.source {
-            Some(Source::Upload(sha)) => Ok(hex32(sha)?),
-            Some(Source::Reference(r)) => {
-                self.idle()?;
-                self.puller.pull(r, &self.uploads, &by).await
-            }
-            Some(Source::Url(u)) => {
-                self.idle()?;
-                self.puller.download(u, &self.uploads, &by).await
-            }
-            None => return Err(ConnectError::invalid_argument("no source")),
-        };
-        let sha = fetched.map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))?;
+        let sha = hex32(request.upload)?;
         Response::ok(pb::InstallResponse {
             status: self.command(|tx| Command::Verify(sha, tx)).await?.into(),
-            ..Default::default()
-        })
-    }
-
-    async fn uninstall(
-        &self,
-        _: RequestContext,
-        request: ServiceRequest<'_, pb::UninstallRequest>,
-    ) -> ServiceResult<pb::UninstallResponse> {
-        let (name, by) = (request.name.to_string(), request.by.to_string());
-        Response::ok(pb::UninstallResponse {
-            status: self
-                .command(|tx| Command::Uninstall(name, by, tx))
-                .await?
-                .into(),
-            ..Default::default()
-        })
-    }
-
-    async fn list_apps(
-        &self,
-        _: RequestContext,
-        _: ServiceRequest<'_, pb::ListAppsRequest>,
-    ) -> ServiceResult<pb::ListAppsResponse> {
-        let apps = self.ask(Command::Apps).await?;
-        Response::ok(pb::ListAppsResponse {
-            apps: apps.iter().map(|(name, m)| app(name, m)).collect(),
             ..Default::default()
         })
     }
@@ -790,12 +717,7 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::channel(1);
         let (publish, status) = watch::channel(Snapshot::default());
-        let svc = Arc::new(Service::new(
-            tx,
-            status,
-            Uploads::new(dir),
-            Puller::new(None).unwrap(),
-        ));
+        let svc = Arc::new(Service::new(tx, status, Uploads::new(dir)));
         let bound = connectrpc::Server::bind("127.0.0.1:0").await.unwrap();
         let addr = bound.local_addr().unwrap();
         tokio::spawn(bound.serve(svc.register(connectrpc::Router::new())));
@@ -923,10 +845,7 @@ mod tests {
         });
         let s = c
             .install(pb::InstallRequest {
-                source: Some(pb::__buffa::oneof::install_request::Source::Upload(vec![
-                    9;
-                    32
-                ])),
+                upload: vec![9; 32],
                 ..Default::default()
             })
             .await
@@ -1248,25 +1167,7 @@ mod tests {
         u.head.as_mut().unwrap().notes = Some("# 2".into());
         u.head.as_mut().unwrap().signer =
             "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1".into();
-        let m = &mut u.head.as_mut().unwrap().manifest;
-        m.insert("MODULES".into(), "gw esm".into());
-        m.insert("REMOVE".into(), "old".into());
         let p = upload(&u);
-        let h = p.head.as_option().unwrap();
-        assert_eq!(
-            (h.brings_base, h.modules.clone(), h.removes.clone()),
-            (
-                false,
-                vec!["gw".to_string(), "esm".into()],
-                vec!["old".into()]
-            )
-        );
-        u.head
-            .as_mut()
-            .unwrap()
-            .manifest
-            .insert("STACK_DIGEST".into(), "sha256:s".into());
-        assert!(upload(&u).head.as_option().unwrap().brings_base);
         assert_eq!(
             (
                 p.sha256.clone(),
@@ -1328,9 +1229,6 @@ mod tests {
             signer: "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v2".into(),
             images: [("r.io/app:2".to_string(), "sha256:2".to_string())].into(),
             owners: [("r.io/app:2".to_string(), "gw".to_string())].into(),
-            brings_base: true,
-            modules: ["gw".to_string()].into(),
-            removes: ["old".to_string()].into(),
             checks: vec![
                 Check::new("space", CheckState::Fail, "full"),
                 Check::new("reboot", CheckState::Note, "needed"),
@@ -1420,10 +1318,6 @@ mod tests {
         assert_eq!(
             (to.carried, from.carried, to.owner.as_str()),
             (true, false, "gw")
-        );
-        assert_eq!(
-            (p.brings_base, p.modules.clone(), p.removes.clone()),
-            (true, vec!["gw".to_string()], vec!["old".to_string()])
         );
         assert_eq!(to.kind, pb::ComponentKind::COMPONENT_KIND_IMAGE);
         let comps: Vec<_> = p

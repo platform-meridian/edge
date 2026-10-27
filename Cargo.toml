@@ -18,7 +18,6 @@ members = [
     "crates/edge-registry",
     "crates/edge-bundle",
     "crates/edge-update",
-    "crates/edge-pack",
 ]
 
 [workspace.package]

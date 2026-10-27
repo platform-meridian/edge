@@ -436,6 +436,12 @@ impl Talos for FakeTalos {
         w.power_cycle();
         w.change("shutdown".into())
     }
+    async fn volume(&self, _: &str) -> anyhow::Result<Option<crate::unit::Volume>> {
+        Ok(None)
+    }
+    async fn drop_partition(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -648,8 +654,10 @@ pub(crate) struct Spec {
     carried: Vec<String>,
     notes: Option<String>,
     instance: Option<String>,
-    /// What the bundle brings; with a base, a real stack artifact `reg/stack:<tag>`.
+    /// The base's refs, a real stack artifact `reg/stack:<tag>` among them.
     components: Components,
+    /// `components.json` as written, in place of `components`.
+    raw_components: Option<String>,
 }
 
 impl Spec {
@@ -673,26 +681,20 @@ impl Spec {
             carried,
             notes: None,
             instance: None,
-            components: Components {
-                base: Some(runs),
-                ..Components::default()
-            },
+            components: Components { base: runs },
+            raw_components: None,
         }
     }
 
-    /// The base, with `modules`.
-    fn base(tag: &str, modules: &[&str]) -> Self {
+    /// The base, naming its installer.
+    fn base(tag: &str) -> Self {
         let c = Components {
-            base: Some(
-                [
-                    format!("reg/app:{tag}"),
-                    format!("reg/judge:{tag}"),
-                    stack_ref(tag),
-                ]
-                .into(),
-            ),
-            modules: modules.iter().map(|m| (m.to_string(), module(m))).collect(),
-            remove: BTreeSet::new(),
+            base: [
+                format!("reg/app:{tag}"),
+                format!("reg/judge:{tag}"),
+                stack_ref(tag),
+            ]
+            .into(),
         };
         Self {
             carried: c.refs().into_iter().collect(),
@@ -702,28 +704,6 @@ impl Spec {
                 "{}---\napiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n  image: reg/installer:{tag}@{DIGEST}\n",
                 patch(tag)
             ),
-            ..Self::new(tag)
-        }
-    }
-
-    /// No base: `modules` brought, and `remove` removed.
-    fn modules(tag: &str, epoch: i64, modules: &[&str], remove: &[&str]) -> Self {
-        let c = Components {
-            base: None,
-            modules: modules
-                .iter()
-                .map(|m| {
-                    let mut module = module(m);
-                    module.epoch = epoch;
-                    (m.to_string(), module)
-                })
-                .collect(),
-            remove: remove.iter().map(|m| m.to_string()).collect(),
-        };
-        Self {
-            epoch,
-            carried: c.refs().into_iter().collect(),
-            components: c,
             ..Self::new(tag)
         }
     }
@@ -844,7 +824,6 @@ fn settings() -> Settings {
     Settings {
         trusted_root: "/etc/edge-update/trusted_root.json".into(),
         trust_policy: Default::default(),
-        registry_auth: None,
         store: "/var/lib/etcd/state.log".into(),
         bless: BLESS.into(),
         stack: Stack {
@@ -940,42 +919,24 @@ impl Harness {
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(src.join("images/blobs/sha256")).unwrap();
         let c = &s.components;
-        let base = c.base.is_some();
         let mut manifests: Vec<serde_json::Value> = Vec::new();
         let mut mf = format!("FORMAT={}\n", s.format);
-        if base {
-            let e = stack_artifact(&src.join("images/blobs/sha256"), &s.tag);
-            let stack = e["digest"].as_str().unwrap().to_string();
-            manifests.push(e);
-            mf.push_str(&format!(
-                "STACK_DIGEST={stack}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
-                 TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
-                s.tag, s.talos, s.epoch, s.secureboot, s.extra
-            ));
-        }
-        for m in c.modules.values() {
-            for (k, v) in &m.manifest {
-                mf.push_str(&format!("{k}={v}\n"));
-            }
-        }
-        let names: Vec<&str> = c.modules.keys().map(String::as_str).collect();
-        if !names.is_empty() {
-            mf.push_str(&format!("MODULES={}\n", names.join(" ")));
-        }
-        std::fs::write(
-            src.join(crate::bundle::components::COMPONENTS),
-            serde_json::to_vec(c).unwrap(),
-        )
-        .unwrap();
+        let e = stack_artifact(&src.join("images/blobs/sha256"), &s.tag);
+        let stack = e["digest"].as_str().unwrap().to_string();
+        manifests.push(e);
+        mf.push_str(&format!(
+            "STACK_DIGEST={stack}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
+             TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
+            s.tag, s.talos, s.epoch, s.secureboot, s.extra
+        ));
+        let components = match &s.raw_components {
+            Some(raw) => raw.clone().into_bytes(),
+            None => serde_json::to_vec(c).unwrap(),
+        };
+        std::fs::write(src.join(crate::bundle::components::COMPONENTS), components).unwrap();
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
-        if base {
-            let mut patch = s.patch.clone();
-            for m in c.modules.values() {
-                patch.push_str(&format!("---\n{}", m.machine));
-            }
-            std::fs::write(src.join("config-patch.yaml"), patch).unwrap();
-            std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
-        }
+        std::fs::write(src.join("config-patch.yaml"), &s.patch).unwrap();
+        std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
         if let Some(n) = &s.notes {
             std::fs::write(src.join(crate::bundle::NOTES), n).unwrap();
         }
@@ -2607,12 +2568,26 @@ async fn serving_rotation_is_turned_on_once_the_stack_is_committed() {
     assert!(at("repoint update-new") < at("apply"), "{:?}", w.log);
 }
 
-/// A unit given a base with module `a`, without an OS step.
+/// A unit given a base without an OS step, then, as one installed before
+/// apps were MeridianApps, running the module `a` its installed set records.
 async fn with_a() -> Harness {
+    with_module(module("a")).await
+}
+
+async fn with_module(m: crate::bundle::components::Module) -> Harness {
     let mut h = Harness::new();
     running_installer(&h, &format!("reg/installer:provisioned@{DIGEST}"));
-    let e = h.update(&Spec::base("update-a", &["a"]), |_, _| {}).await;
+    let e = h.update(&Spec::base("update-a"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let p = h.state().join("installed").join("update-a.json");
+    let mut set: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    set["installed"]["modules"]["a"] = serde_json::to_value(m).unwrap();
+    std::fs::write(&p, serde_json::to_vec(&set).unwrap()).unwrap();
+    let run = &mut h.e().record.history[0].release.as_mut().unwrap().manifest;
+    run.insert("MODULES".into(), "a".into());
+    h.e().save().unwrap();
+    h.w().held.insert("reg/a:1".into());
+    h.reopen();
     h
 }
 
@@ -2620,131 +2595,74 @@ fn manifest_of(e: &Entry) -> Manifest {
     e.release.as_ref().unwrap().manifest.clone()
 }
 
+/// A newer base than [`with_a`]'s.
+fn next_base(tag: &str) -> Spec {
+    Spec {
+        epoch: 3000,
+        ..Spec::base(tag)
+    }
+}
+
 #[tokio::test]
-async fn a_bundle_without_a_base_keeps_the_base_and_the_modules_it_does_not_name() {
+async fn a_base_carries_the_modules_the_unit_runs_as_they_are() {
     let mut h = with_a().await;
-    h.w().log.clear();
-    let e = h
-        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |h, _| {
-            h.reopen()
-        })
-        .await;
+    let e = h.update(&next_base("update-b"), |h, _| h.reopen()).await;
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
     let m = manifest_of(&e);
-    assert_eq!(m["MODULES"], "a b");
+    assert_eq!(m["MODULES"], "a");
     assert_eq!(m["MODULE_A"], "reg/modules/a:1@sha256:a");
-    assert_eq!(
-        m["INSTALLER_REF"],
-        format!("reg/installer:update-a@{DIGEST}")
-    );
-    assert_eq!(m["STACK_PATH"], "./base");
-    {
-        let w = h.w();
-        assert!(
-            !w.log.iter().any(|l| l == "install" || l == "reboot"),
-            "{:?}",
-            w.log
-        );
-        assert!(
-            !w.log.iter().any(|l| l == "seed"),
-            "a bundle without a base seeds nothing"
-        );
-        assert_eq!(w.tag, "update-b");
-        for want in [
-            "store:update-a",
-            "name: a-data",
-            "name: b-data",
-            "unit-machine-token",
-        ] {
-            assert!(w.active.contains(want), "the config lacks {want}");
-        }
-        assert!(w.held.contains("reg/a:1") && w.held.contains("reg/app:update-a"));
-    }
     let stack = composed_stack(&h, "update-b");
-    assert_eq!(
-        stack["base/tag"], "update-a",
-        "the base is the one the unit ran"
-    );
-    assert!(stack["modules/kustomization.yaml"].contains("  - a.yaml\n  - b.yaml\n"));
+    assert_eq!(stack["base/tag"], "update-b");
+    assert!(stack["modules/kustomization.yaml"].contains("  - a.yaml\n"));
     let record: serde_json::Value =
         serde_saphyr::from_str(&stack["modules/installed.yaml"]).unwrap();
     assert_eq!(record["metadata"]["name"], "modules");
-    assert_eq!(record["data"]["MODULES"], "a b");
-}
-
-#[tokio::test]
-async fn a_bundle_with_a_base_keeps_the_modules_it_does_not_name() {
-    let mut h = with_a().await;
-    let mut s = Spec::base("update-b", &[]);
-    s.epoch = 3000;
-    let e = h.update(&s, |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    assert_eq!(manifest_of(&e)["MODULES"], "a");
-    let stack = composed_stack(&h, "update-b");
-    assert_eq!(stack["base/tag"], "update-b");
-    assert!(stack.contains_key("modules/a.yaml"));
+    assert_eq!(record["data"]["MODULES"], "a");
     let w = h.w();
     assert!(w.active.contains("store:update-b") && w.active.contains("name: a-data"));
+    assert!(w.held.contains("reg/a:1") && w.held.contains("reg/app:update-b"));
 }
 
 #[tokio::test]
-async fn a_module_goes_only_by_an_explicit_remove() {
+async fn a_bundle_bringing_more_than_a_base_is_refused() {
     let mut h = with_a().await;
-    let e = h
-        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |_, _| {})
-        .await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    let e = h
-        .update(&Spec::modules("update-c", 4000, &[], &["a"]), |_, _| {})
-        .await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    let m = manifest_of(&e);
-    assert_eq!(m["MODULES"], "b");
-    assert!(!m.contains_key("MODULE_A"));
-    let rel = e.release.unwrap();
-    assert!(!rel.refs.contains("reg/a:1") && rel.refs.contains("reg/b:1"));
-    let stack = composed_stack(&h, "update-c");
-    assert!(!stack.contains_key("modules/a.yaml") && stack.contains_key("modules/b.yaml"));
-    let w = h.w();
-    assert!(!w.active.contains("name: a-data") && w.active.contains("name: b-data"));
+    h.w().log.clear();
+    for raw in [
+        r#"{"base": [], "modules": {"b": {"epoch": 1, "flux": "kind: Kustomization\n"}}}"#,
+        r#"{"base": [], "remove": ["a"]}"#,
+    ] {
+        let s = Spec {
+            raw_components: Some(raw.into()),
+            ..next_base("update-b")
+        };
+        refused(&mut h, &s, "a bundle brings the base alone").await;
+    }
 }
 
 #[tokio::test]
-async fn a_bundle_without_a_base_needs_a_set_the_unit_installed() {
-    let mut h = Harness::new();
-    refused(
-        &mut h,
-        &Spec::modules("update-b", 3000, &["b"], &[]),
-        "bring a base and every module it runs",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_rolled_back_bundle_leaves_the_set_it_was_composed_on() {
+async fn a_rolled_back_base_leaves_the_set_it_was_composed_on() {
     let mut h = with_a().await;
     h.w().verdict = Verdict::Bad;
-    let e = h
-        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |_, _| {})
-        .await;
+    let e = h.update(&next_base("update-b"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert_eq!(h.w().tag, "update-a");
     h.e().refresh_unit().await;
-    assert_eq!(h.e().unit.manifest["MODULES"], "a");
+    assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
 
     h.w().verdict = Verdict::Good;
-    let e = h
-        .update(&Spec::modules("update-c", 4000, &["c"], &[]), |_, _| {})
-        .await;
+    let s = Spec {
+        epoch: 4000,
+        ..Spec::base("update-c")
+    };
+    let e = h.update(&s, |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    assert_eq!(manifest_of(&e)["MODULES"], "a c");
+    assert_eq!(manifest_of(&e)["MODULES"], "a");
 }
 
 #[tokio::test]
 async fn a_set_composed_on_another_stack_is_verified_again() {
     let mut h = with_a().await;
-    let s = Spec::modules("update-b", 3000, &["b"], &[]);
-    assert!(h.verify(&s).await.is_none());
+    assert!(h.verify(&next_base("update-b")).await.is_none());
     h.w().tag = OLD_TAG.into();
     h.e().request_apply("update-b", "").await.unwrap();
     h.run(|_, _| {}).await;
@@ -2754,48 +2672,90 @@ async fn a_set_composed_on_another_stack_is_verified_again() {
 }
 
 #[tokio::test]
-async fn with_no_recorded_set_a_bundle_brings_a_base_and_every_module_the_unit_runs() {
+async fn with_no_recorded_set_a_base_is_taken_only_by_a_unit_running_no_module() {
     let mut h = with_a().await;
     // As an engine before installed sets leaves the unit: no record of its set.
     std::fs::remove_dir_all(h.state().join("installed")).unwrap();
     h.reopen();
     h.w().log.clear();
-    let partial = Spec {
-        epoch: 3000,
-        ..Spec::base("update-b", &["b"])
-    };
     refused(
         &mut h,
-        &partial,
-        "bring a base and every module it runs (this bundle lacks a)",
-    )
-    .await;
-    refused(
-        &mut h,
-        &Spec::modules("update-b", 3000, &["a", "b"], &[]),
-        "bring a base and every module it runs",
+        &next_base("update-b"),
+        "this unit runs modules (a) its installed set does not record",
     )
     .await;
 
-    let whole = Spec {
-        epoch: 3000,
-        ..Spec::base("update-b", &["a", "b"])
-    };
-    let e = h.update(&whole, |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    assert_eq!(e.release.unwrap().manifest["MODULES"], "a b");
-}
-
-#[tokio::test]
-async fn a_unit_with_no_record_of_what_it_runs_takes_no_bundle_of_components() {
     let mut h = Harness::new();
     h.w().modules.clear();
     refused(
         &mut h,
-        &Spec::base("update-a", &["a"]),
+        &Spec::base("update-a"),
         "this unit's installed modules are unknown",
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_release_says_who_owns_each_image() {
+    let mut h = with_a().await;
+    assert!(h.verify(&next_base("update-b")).await.is_none());
+    let r = h.e().release().unwrap().clone();
+    let of = |name: &str| {
+        r.components()
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let (a, app) = (of("reg/a"), of("reg/app"));
+    assert_eq!((a.owner.as_str(), a.carried), ("a", false));
+    assert_eq!((app.owner.as_str(), app.carried), ("base", true));
+}
+
+#[tokio::test]
+async fn the_units_modules_are_its_releases_else_as_its_stack_records_them() {
+    let mut h = Harness::new();
+    h.w().modules = BTreeMap::from([("MODULES".into(), "x y".into())]);
+    h.e().refresh_unit().await;
+    assert_eq!(
+        h.e().unit.modules,
+        BTreeSet::from(["x".to_string(), "y".into()])
+    );
+    let mut h = with_a().await;
+    h.w().modules = BTreeMap::from([("MODULES".into(), "stale".into())]);
+    h.e().refresh_unit().await;
+    assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
+}
+
+#[tokio::test]
+async fn a_base_the_modules_it_carries_cannot_run_on_is_refused() {
+    for (set, why) in [
+        (
+            (|r: &mut crate::bundle::components::Requires| r.talos = "v1.15.0".into())
+                as fn(&mut crate::bundle::components::Requires),
+            "a requires Talos v1.15.0 and the unit would run v1.14.1",
+        ),
+        (
+            |r| r.kubernetes = "v1.36.0".into(),
+            "a requires Kubernetes v1.36.0 and the unit runs v1.35.2",
+        ),
+        (
+            |r| r.flux = ["helm-controller".to_string()].into(),
+            "a requires Flux's helm-controller",
+        ),
+    ] {
+        let mut m = module("a");
+        set(&mut m.requires);
+        let mut h = with_module(m).await;
+        h.w().log.clear();
+        refused(&mut h, &next_base("update-b"), why).await;
+    }
+    let mut m = module("a");
+    m.requires.talos = "v1.14.0".into();
+    m.requires.kubernetes = "v1.35.2".into();
+    m.requires.flux = ["source-controller".to_string()].into();
+    let mut h = with_module(m).await;
+    let e = h.update(&next_base("update-b"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
 }
 
 /// The judge's trial of the stack the unit runs, unhealthy, and `good` its last good release.
@@ -2926,144 +2886,58 @@ async fn an_apply_onto_a_trial_that_can_pass_waits_for_it() {
 }
 
 #[tokio::test]
-async fn a_release_says_what_its_bundle_brought_and_who_owns_each_image() {
-    let mut h = with_a().await;
-    let base = h.e().record.history[0].release.clone().unwrap();
-    assert!(base.brings_base && base.removes.is_empty());
-    assert_eq!(base.modules, BTreeSet::from(["a".to_string()]));
-
-    let s = Spec::modules("update-b", 3000, &["b"], &["a"]);
-    assert!(h.verify(&s).await.is_none());
-    let r = h.e().release().unwrap().clone();
-    assert!(!r.brings_base);
-    assert_eq!(
-        (r.modules.clone(), r.removes.clone()),
-        (
-            BTreeSet::from(["b".to_string()]),
-            BTreeSet::from(["a".to_string()])
-        )
-    );
-    let of = |name: &str| {
-        r.components()
-            .into_iter()
-            .find(|c| c.name == name)
-            .unwrap_or_else(|| panic!("no {name}"))
-    };
-    let (b, app) = (of("reg/b"), of("reg/app"));
-    assert_eq!((b.owner.as_str(), b.carried), ("b", true));
-    assert_eq!((app.owner.as_str(), app.carried), ("base", false));
-    let to = |name: &str| {
-        let d = r.diff.as_ref().unwrap();
-        d.components
-            .iter()
-            .find(|c| c.name == name)
-            .and_then(|c| c.to.clone())
-            .unwrap()
-    };
-    assert!(to("reg/b").carried && !to("reg/app").carried);
-}
-
-#[tokio::test]
-async fn the_units_modules_are_its_releases_else_as_its_stack_records_them() {
+async fn a_provisioned_volume_is_added_while_idle_and_kept_by_every_update() {
+    use crate::bundle::machineconfig::Provisioned;
     let mut h = Harness::new();
-    h.w().modules = BTreeMap::from([("MODULES".into(), "x y".into())]);
-    h.e().refresh_unit().await;
-    assert_eq!(
-        h.e().unit.modules,
-        BTreeSet::from(["x".to_string(), "y".into()])
-    );
-    let mut h = with_a().await;
-    h.w().modules = BTreeMap::from([("MODULES".into(), "stale".into())]);
-    h.e().refresh_unit().await;
-    assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
-}
+    let v = Provisioned::for_claim("6a2f0c4e-8d5b-4f3a-9c1e-0b7d2e4f6a8c");
+    h.e()
+        .edit_volume(VolumeEdit::Add(v.clone(), 64))
+        .await
+        .unwrap();
+    assert!(h.w().active.contains(v.name()));
+    let applies = |h: &Harness| h.w().log.iter().filter(|l| *l == "apply").count();
+    let before = applies(&h);
+    h.e()
+        .edit_volume(VolumeEdit::Add(v.clone(), 64))
+        .await
+        .unwrap();
+    assert_eq!(applies(&h), before, "the same volume again changes nothing");
+    let e = h
+        .e()
+        .edit_volume(VolumeEdit::Add(v.clone(), 128))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("not resized"), "{e}");
 
-#[tokio::test]
-async fn an_uninstall_needs_no_bundle_and_drops_the_app_alone() {
-    let mut h = with_a().await;
-    assert_eq!(
-        h.e().apps().await.unwrap().keys().collect::<Vec<_>>(),
-        ["a"]
-    );
-    let e = h.e().request_uninstall("b", "ann").await.unwrap_err();
-    assert!(e.to_string().contains("b is not installed"), "{e}");
-    *h.next.lock().unwrap() = "update-gone".into();
-    h.e().request_uninstall("a", "ann").await.unwrap();
-    let r = h.e().release().unwrap().clone();
-    assert_eq!((r.id.as_str(), r.signer.as_str()), ("update-gone", ""));
-    assert_eq!(r.removes, BTreeSet::from(["a".to_string()]));
-    assert!(!r.refs.contains("reg/a:1"));
-    h.w().log.clear();
-    h.e().request_apply("update-gone", "ann").await.unwrap();
+    // An update holds the machine config: a claim waits it out.
+    let u = Provisioned::for_claim("another");
+    assert!(h.verify(&Spec::new("update-new")).await.is_none());
+    h.e().request_apply("update-new", "").await.unwrap();
+    let e = h
+        .e()
+        .edit_volume(VolumeEdit::Add(u.clone(), 8))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("in progress"), "{e}");
     h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    assert!(!manifest_of(&e).contains_key("MODULES"));
-    assert!(h.e().apps().await.unwrap().is_empty());
-    let stack = composed_stack(&h, "update-gone");
-    assert_eq!(stack["base/tag"], "update-a");
-    assert!(!stack.contains_key("modules/a.yaml"));
-    let w = h.w();
-    assert_eq!(w.tag, "update-gone");
-    assert!(!w.active.contains("name: a-data"));
-    assert!(
-        !w.log.iter().any(|l| l == "install" || l == "seed"),
-        "{:?}",
-        w.log
-    );
-}
+    h.committed("update-new");
+    let active = h.w().active.clone();
+    assert!(active.contains(v.name()), "the update dropped the volume");
+    assert!(active.contains("store:update-new"));
 
-#[tokio::test]
-async fn an_app_older_than_the_one_installed_is_refused() {
-    let mut h = with_a().await;
+    h.w().staged = Some(active.replace("store:update-new", "store:next"));
     let e = h
-        .update(&Spec::modules("update-b", 3000, &["b"], &[]), |_, _| {})
-        .await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.w().log.clear();
-    refused(
-        &mut h,
-        &Spec::modules("update-c", 2999, &["b"], &[]),
-        "REFUSING A DOWNGRADE: the unit's b is version 3000",
-    )
-    .await;
-    // The same app again is taken.
-    let e = h
-        .update(&Spec::modules("update-d", 3000, &["b"], &[]), |_, _| {})
-        .await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-}
+        .e()
+        .edit_volume(VolumeEdit::Add(u.clone(), 8))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("staged"), "{e}");
+    h.w().staged = None;
 
-#[tokio::test]
-async fn an_app_needing_what_the_unit_lacks_is_refused() {
-    let mut h = with_a().await;
-    let needs = |set: &dyn Fn(&mut crate::bundle::components::Requires)| {
-        let mut s = Spec::modules("update-b", 3000, &["b"], &[]);
-        set(&mut s.components.modules.get_mut("b").unwrap().requires);
-        s
-    };
-    for (s, why) in [
-        (
-            needs(&|r| r.talos = "v1.15.0".into()),
-            "b requires Talos v1.15.0 and the unit would run v1.14.1",
-        ),
-        (
-            needs(&|r| r.kubernetes = "v1.36.0".into()),
-            "b requires Kubernetes v1.36.0 and the unit runs v1.35.2",
-        ),
-        (
-            needs(&|r| r.flux = ["helm-controller".to_string()].into()),
-            "b requires Flux's helm-controller",
-        ),
-    ] {
-        h.w().log.clear();
-        refused(&mut h, &s, why).await;
-    }
-    let s = needs(&|r| {
-        r.talos = "v1.14.0".into();
-        r.kubernetes = "v1.35.2".into();
-        r.flux = ["source-controller".to_string()].into();
-    });
-    let e = h.update(&s, |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.e()
+        .edit_volume(VolumeEdit::Remove(v.clone()))
+        .await
+        .unwrap();
+    assert!(!h.w().active.contains(v.name()));
+    h.e().edit_volume(VolumeEdit::Remove(v)).await.unwrap();
 }

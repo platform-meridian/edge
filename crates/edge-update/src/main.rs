@@ -1,4 +1,6 @@
-//! Verifies signed update bundles and applies them to the unit it runs on.
+//! Verifies signed update bundles and applies them to the unit it runs on;
+//! turns claims into Talos user volumes (`volumes`) and labels the node with
+//! what the host offers (`capabilities`).
 //!
 //!   edge-update                 serve the update API and run the engine
 //!   edge-update strip-config    a full machine config on stdin, its patch on stdout
@@ -7,16 +9,17 @@
 
 mod api;
 mod boot;
+mod capabilities;
 mod cluster;
 mod diff;
 mod engine;
 mod judge;
-mod pull;
 mod registry;
 mod steps;
 mod talos;
 mod unit;
 mod upload;
+mod volumes;
 
 mod pb {
     connectrpc::include_generated!();
@@ -113,7 +116,6 @@ async fn serve() -> anyhow::Result<()> {
     ));
     let settings = settings(&env("EDGE_UPDATE_CONFIG", "/etc/edge-update/config.yaml"))?;
     let trust = Arc::new(trust(&settings)?);
-    let puller = pull::Puller::new(settings.registry_auth.as_deref())?;
     let state = PathBuf::from(env("EDGE_UPDATE_STATE", "/var/mnt/edge-update"));
     std::fs::create_dir_all(&state)?;
     // One engine per record, whatever the Deployment does.
@@ -130,13 +132,14 @@ async fn serve() -> anyhow::Result<()> {
         )),
         "127.0.0.1:50000",
     ));
-    let kube = Arc::new(cluster::Kube::new(kube::Client::try_default().await?));
+    let client = kube::Client::try_default().await?;
+    let kube = Arc::new(cluster::Kube::new(client.clone()));
     let now: engine::Clock = Arc::new(engine::unix_now);
     let mut engine = Engine::open(
         &state,
         settings,
         trust,
-        talos,
+        talos.clone(),
         kube,
         Arc::new(registry::Registry::open(&PathBuf::from(env(
             "EDGE_UPDATE_REGISTRY",
@@ -146,8 +149,19 @@ async fn serve() -> anyhow::Result<()> {
     )?;
 
     let (tx, rx) = mpsc::channel(8);
+    let node = std::env::var("NODE_NAME").context("NODE_NAME: the node this runs on")?;
+    tokio::spawn(
+        volumes::Provisioner {
+            client: client.clone(),
+            node: node.clone(),
+            talos: talos.clone(),
+            engine: tx.clone(),
+        }
+        .run(),
+    );
+    tokio::spawn(capabilities::run(client, node, PathBuf::from("/sys")));
     let (publish, status) = watch::channel(Snapshot::default());
-    let service = Arc::new(api::Service::new(tx, status, engine.uploads(), puller));
+    let service = Arc::new(api::Service::new(tx, status, engine.uploads()));
     let listen = env("EDGE_UPDATE_LISTEN", "127.0.0.1:7443");
     let rpc = connectrpc::ConnectRpcService::new(service.register(connectrpc::Router::new()))
         .with_limits(
@@ -266,15 +280,6 @@ async fn run(
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
                         }
-                        Some(Command::Uninstall(name, by, reply)) => {
-                            let r = engine.request_uninstall(&name, &by).await;
-                            publish.send_replace(snap(engine));
-                            let _ = reply.send(r);
-                        }
-                        Some(Command::Apps(reply)) => {
-                            let _ = reply.send(engine.apps().await);
-                            continue;
-                        }
                         Some(Command::Power(p, reply)) => {
                             let _ = reply.send(engine.power(p).await);
                         }
@@ -288,6 +293,10 @@ async fn run(
                             unit.reset_immediately();
                             publish.send_replace(snap(engine));
                             let _ = reply.send(r);
+                        }
+                        Some(Command::Volume(edit, reply)) => {
+                            let _ = reply.send(engine.edit_volume(edit).await);
+                            continue;
                         }
                         Some(Command::Storage(reply)) => {
                             let _ = reply.send(engine.storage().await);

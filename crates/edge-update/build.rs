@@ -1,6 +1,13 @@
 fn main() {
-    let talos = protox::compile(["talos/talos.proto", "talos/cosi.proto"], ["proto"])
-        .expect("parse the Talos API subset");
+    let talos = protox::compile(
+        [
+            "talos/talos.proto",
+            "talos/cosi.proto",
+            "talos/storage.proto",
+        ],
+        ["proto"],
+    )
+    .expect("parse the Talos API subset");
     tonic_prost_build::configure()
         .compile_fds(talos)
         .expect("compile the Talos API subset");

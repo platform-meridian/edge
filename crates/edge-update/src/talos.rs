@@ -20,6 +20,9 @@ pub mod pb {
     pub mod cosi {
         tonic::include_proto!("cosi.resource");
     }
+    pub mod storage {
+        tonic::include_proto!("storage");
+    }
 }
 
 use pb::apply_configuration_request::Mode;
@@ -117,6 +120,25 @@ fn system() -> pb::ContainerdInstance {
 }
 
 impl Node {
+    /// A resource's spec, if it exists.
+    async fn spec(
+        &self,
+        namespace: &str,
+        kind: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<pb::cosi::Spec>> {
+        let get = pb::cosi::GetRequest {
+            namespace: namespace.into(),
+            r#type: kind.into(),
+            id: id.into(),
+        };
+        match StateClient::new(self.channel()?).get(req(get)).await {
+            Ok(r) => Ok(r.into_inner().resource.and_then(|r| r.spec)),
+            Err(e) if e.code() == tonic::Code::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The first of `ids` among the node's machine configs.
     async fn config(&self, ids: &[&str]) -> anyhow::Result<String> {
         let mut client = StateClient::new(self.channel()?);
@@ -325,6 +347,52 @@ impl crate::unit::Talos for Node {
             .into_inner();
         for m in &r.messages {
             upstream(m.metadata.as_ref())?;
+        }
+        Ok(())
+    }
+
+    async fn volume(&self, name: &str) -> anyhow::Result<Option<crate::unit::Volume>> {
+        use crate::unit::{Volume, VolumePhase};
+        // A user volume's status is `u-<name>`.
+        let id = format!("u-{name}");
+        let Some(spec) = self
+            .spec("runtime", "VolumeStatuses.block.talos.dev", &id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let s = pb::cosi::VolumeStatusSpec::decode(spec.proto_spec.as_slice())?;
+        let phase = match s.phase {
+            6 => VolumePhase::Ready,
+            1 => VolumePhase::Failed(s.error_message),
+            _ => VolumePhase::Pending,
+        };
+        Ok(Some(Volume {
+            phase,
+            location: s.location,
+        }))
+    }
+
+    async fn drop_partition(&self, device: &str) -> anyhow::Result<()> {
+        use pb::storage::block_device_wipe_descriptor::Method;
+        let device = device.strip_prefix("/dev/").unwrap_or(device);
+        let r = pb::storage::storage_service_client::StorageServiceClient::new(self.channel()?)
+            .block_device_wipe(req(pb::storage::BlockDeviceWipeRequest {
+                devices: vec![pb::storage::BlockDeviceWipeDescriptor {
+                    device: device.into(),
+                    method: Method::Fast as i32,
+                    skip_volume_check: false,
+                    drop_partition: true,
+                }],
+            }))
+            .await?
+            .into_inner();
+        for m in &r.messages {
+            if let Some(e) = m.metadata.as_ref().map(|m| m.error.as_str())
+                && !e.is_empty()
+            {
+                bail!("{e}");
+            }
         }
         Ok(())
     }

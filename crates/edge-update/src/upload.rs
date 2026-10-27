@@ -169,52 +169,6 @@ impl Uploads {
         Ok(u)
     }
 
-    /// Where a bundle fetched whole is written as it arrives, and what it is
-    /// fetched from.
-    pub fn download(&self) -> (PathBuf, PathBuf) {
-        (
-            self.dir.join("download.part"),
-            self.dir.join("download.from"),
-        )
-    }
-
-    /// A bundle fetched whole into [`Uploads::download`] taken as the
-    /// upload, complete, its head read.
-    pub fn adopt(&self, by: &str) -> anyhow::Result<Upload> {
-        let (part, from) = self.download();
-        let (size, sha256) = (std::fs::metadata(&part)?.len(), hash_file(&part)?);
-        ensure!(size > 0, "an empty bundle");
-        let now = (self.now)();
-        if let Some(u) = self.current().filter(|u| u.sha256 != sha256) {
-            ensure!(
-                !u.live_for_other(by, now),
-                "{} is uploading another bundle",
-                u.by
-            );
-        }
-        self.discard();
-        std::fs::rename(&part, self.bundle())?;
-        let _ = std::fs::remove_file(from);
-        let mut u = Upload {
-            sha256,
-            size,
-            chunk_size: CHUNK,
-            received: Vec::new(),
-            complete: true,
-            started: now,
-            finished: now,
-            by: by.into(),
-            active: now,
-            head: None,
-            refused: String::new(),
-        };
-        u.received = vec![0xff; u.chunks().div_ceil(8) as usize];
-        self.read_head(&mut u);
-        self.save(&u)?;
-        ensure!(u.refused.is_empty(), "the bundle is refused: {}", u.refused);
-        Ok(u)
-    }
-
     pub fn put(
         &self,
         sha256: &str,
