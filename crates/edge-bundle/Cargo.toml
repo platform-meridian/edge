@@ -20,8 +20,8 @@ flate2.workspace = true
 # Offline only; aws-lc-rs is sigstore-crypto's only provider.
 sigstore-verify = { version = "=0.15.0", default-features = false, features = ["aws-lc-rs"] }
 sigstore-trust-root = { version = "=0.15.0", default-features = false, features = ["aws-lc-rs"] }
-sigstore-types = { version = "=0.15.0", default-features = false }
-sha2 = "0.10"
+sigstore-types = { version = "=0.15.1", default-features = false }
+sha2 = "0.11"
 hex = "0.4"
 nix = { workspace = true, features = ["fs"] }
 
