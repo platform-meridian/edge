@@ -1,0 +1,30 @@
+$ kubectl get pv,pvc -A
+NAME                                           CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
+persistentvolume/pv-899191f1dc39c0faa77207ef   256Mi      RWO            Retain           Bound    phase3/fusion-data   edge-local     <unset>                          7m47s
+
+NAMESPACE   NAME                                STATUS   VOLUME                        CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+phase3      persistentvolumeclaim/fusion-data   Bound    pv-899191f1dc39c0faa77207ef   256Mi      RWO            edge-local     <unset>                 7m48s
+
+$ talosctl get volumestatus | grep u-
+NODE          NAMESPACE   TYPE           ID                                  VERSION   TYPE        PHASE   LOCATION    SIZE
+10.10.0.167   runtime     VolumeStatus   u-pv-899191f1dc39c0faa77207ef       2         partition   ready   /dev/sda9   268 MB
+10.10.0.167   runtime     VolumeStatus   u-pv-9888256d2c164c666d569bea       2         partition   ready   /dev/sda7   101 MB
+10.10.0.167   runtime     VolumeStatus   u-pv-bbf19f51e17d88e49466fd39       2         partition   ready   /dev/sda8   268 MB
+
+$ talosctl get discoveredvolumes (partitions)
+ID LABEL PARTITIONLABEL 
+sda gpt  
+sda1 vfat EFI EFI
+sda2 BIOS  
+sda3 xfs BOOT BOOT
+sda4 talosmeta META 
+sda5 xfs STATE STATE
+sda6 xfs EPHEMERAL EPHEMERAL
+sda7 ext4 u-pv-9888256d2c164c666d569bea 
+sda8 ext4 u-pv-bbf19f51e17d88e49466fd39 
+sda9 ext4 u-pv-899191f1dc39c0faa77207ef 
+
+$ kubectl get node labels
+"capability.platform.meridian/gpu":"true"
+"capability.platform.meridian/host-network":"true"
+"capability.platform.meridian/persistent-storage":"true"

@@ -1,0 +1,8 @@
+2026-10-27T16:09:09.871641Z  INFO edge_update::capabilities: node labelled node=talos-8ip-fc5 capabilities=["persistent-storage", "host-network", "gpu"]
+2026-10-27T16:09:10.167858Z  INFO edge_update::engine: provisioned volumes changed edit=Add(Provisioned("pv-899191f1dc39c0faa77207ef"), 256)
+2026-10-27T16:09:10.283153Z  INFO edge_update::engine: provisioned volumes changed edit=Add(Provisioned("pv-26829e5572bcd4f638c19821"), 96)
+2026-10-27T16:09:10.610571Z  INFO edge_update::volumes: provisioned claim=phase3/fusion-data volume="pv-899191f1dc39c0faa77207ef" mib=256
+2026-10-27T16:09:10.678759Z  INFO edge_update::volumes: provisioned claim=phase3/scratch volume="pv-26829e5572bcd4f638c19821" mib=96
+2026-10-27T16:10:03.907812Z  INFO edge_update::engine: provisioned volumes changed edit=Remove(Provisioned("pv-26829e5572bcd4f638c19821"))
+2026-10-27T16:10:03.974732Z  INFO edge_update::volumes: released volume="pv-26829e5572bcd4f638c19821" partition=Some("/dev/sda10")
+2026-10-27T16:10:45.248868Z  WARN edge_update::volumes: provisioning error="ServiceError: client error (Connect): client error (Connect): tcp connect error: Connection refused (os error 111)"
