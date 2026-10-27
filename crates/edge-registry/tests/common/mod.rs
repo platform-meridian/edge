@@ -205,8 +205,19 @@ impl Registry {
         volume: Option<&Path>,
         wait: u64,
     ) -> Registry {
+        Registry::spawn(root, upstream, volume, wait, &[])
+    }
+
+    fn spawn(
+        root: &Path,
+        upstream: u16,
+        volume: Option<&Path>,
+        wait: u64,
+        extra: &[&std::ffi::OsStr],
+    ) -> Registry {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_edge-registry"));
+        cmd.args(extra);
         cmd.args(["--upstream-wait", &wait.to_string()]);
         if let Some(v) = volume {
             cmd.args(["--volume".as_ref(), v.as_os_str()]);
@@ -230,7 +241,28 @@ impl Registry {
         registry
     }
 
+    /// Takes pushes, its accounts' tokens checked against `keys`.
+    pub fn pushing(root: &Path, keys: &Path) -> Registry {
+        Registry::spawn(
+            root,
+            free_port(),
+            None,
+            0,
+            &["--push-keys".as_ref(), keys.as_os_str()],
+        )
+    }
+
     pub fn request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Response {
+        self.send(method, path, headers, &[])
+    }
+
+    pub fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
         let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         let mut req =
@@ -238,8 +270,12 @@ impl Registry {
         for (k, v) in headers {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
+        if !body.is_empty() || matches!(method, "PUT" | "POST" | "PATCH") {
+            req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
         req.push_str("\r\n");
         s.write_all(req.as_bytes()).unwrap();
+        s.write_all(body).unwrap();
         let mut raw = Vec::new();
         s.read_to_end(&mut raw).unwrap();
         let split = raw

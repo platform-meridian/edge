@@ -1,8 +1,11 @@
-//! A power-cut-safe OCI image store, and the read-only registry that serves it.
+//! A power-cut-safe OCI image store, and the registry that serves it: read
+//! by anyone on the host, written by the identities its [`push::Authority`]
+//! names.
 
 mod digest;
 mod import;
 mod manifest;
+pub mod push;
 mod reference;
 mod server;
 mod store;

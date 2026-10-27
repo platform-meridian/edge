@@ -289,11 +289,14 @@ pub fn layers(root: &Path, state: &Path, image_caches: &Path, registry: &Path) -
 }
 
 /// Writes the store only to remove what fails its digest.
-pub fn registry(root: &Path, port: u16, upstream_port: u16) -> Rules {
+/// `push_keys`: the apiserver's ServiceAccount keys, read at each write.
+pub fn registry(root: &Path, push_keys: Option<&Path>, port: u16, upstream_port: u16) -> Rules {
     Rules {
         bind_tcp: Some(vec![port]),
         connect_tcp: Some(vec![upstream_port]),
-        ..Rules::default().with(Access::Write, [root])
+        ..Rules::default()
+            .with(Access::Write, [root])
+            .with(Access::Read, push_keys.map(dir_of))
     }
 }
 
@@ -792,7 +795,7 @@ mod tests {
         let (_upstream, upstream) = listening();
         let (_tcp, tcp) = listening();
         sandboxed(
-            || registry(&root, listen, upstream),
+            || registry(&root, None, listen, upstream),
             || {
                 allowed("durable write in the store", write_in(root.join("blobs")))?;
                 denied("read outside", read(&secret))?;

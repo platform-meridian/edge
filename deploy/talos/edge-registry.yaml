@@ -1,5 +1,8 @@
 # The registry containerd and Flux pull through, up before the kubelet; misses
-# pass through to Talos's registryd.
+# pass through to Talos's registryd. Core pushes apps into it and the app
+# controller deletes them, each with a projected ServiceAccount token for the
+# audience edge-registry, checked against the apiserver's ServiceAccount keys,
+# which Talos renders under /system/secrets.
 name: edge-registry
 depends:
   - path: /var/mnt/edge-registry
@@ -13,11 +16,16 @@ container:
     - EDGE_REGISTRY_VOLUME=/var/mnt/edge-registry
     - EDGE_REGISTRY_LISTEN=127.0.0.1:5000
     - EDGE_REGISTRY_UPSTREAM=127.0.0.1:3172
+    - EDGE_REGISTRY_PUSH_KEYS=/system/secrets/kubernetes/kube-apiserver/service-account.pub
   mounts:
     - source: /var/mnt
       destination: /var/mnt
       type: bind
       options: [rbind, rslave, rw]
+    - source: /system/secrets
+      destination: /system/secrets
+      type: bind
+      options: [rbind, rslave, ro]
   security:
     writeableRootfs: false
     writeableSysfs: false
