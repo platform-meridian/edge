@@ -22,10 +22,7 @@ fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         std::env::var("EDGE_GATEWAY_CONFIG").unwrap_or_else(|_| "edge-gateway.yaml".into())
     });
-    let (cfg, skipped) = config::Config::load(path.as_ref())?;
-    for e in skipped {
-        tracing::error!(error = %e, "route fragment skipped");
-    }
+    let cfg = config::Config::load(path.as_ref())?;
     let tls: Vec<&std::path::Path> = cfg
         .tls
         .iter()

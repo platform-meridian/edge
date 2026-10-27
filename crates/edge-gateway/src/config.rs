@@ -1,6 +1,6 @@
 pub use crate::path::{normalize_host, segment_prefix};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -269,49 +269,29 @@ pub struct Config {
     pub routes: Vec<Route>,
 }
 
+/// The routes one labelled ConfigMap declares (`controller::discovered`):
+/// routes alone, so no app sets what the whole gateway does.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Fragment {
-    #[serde(default)]
-    pub authz_backend: Option<Backend>,
-    #[serde(default)]
-    pub authz_protocol: Option<AuthzProtocol>,
+pub struct RouteSet {
     pub routes: Vec<Route>,
 }
 
-impl Fragment {
+impl RouteSet {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let mut f: Fragment =
+        let mut f: RouteSet =
             serde_saphyr::from_str(text).map_err(|e| anyhow::anyhow!("parsing: {e}"))?;
-        anyhow::ensure!(
-            f.authz_backend.is_some() || f.authz_protocol.is_none(),
-            "authz_protocol without authz_backend"
-        );
         canonicalize_routes(&mut f.routes)?;
         Ok(f)
     }
 }
 
-pub const FRAGMENT_DIR: &str = "routes.d";
-
 impl Config {
-    pub fn load(path: &Path) -> anyhow::Result<(Self, Vec<anyhow::Error>)> {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
         let shown = path.display();
         let text =
             std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {shown}: {e}"))?;
-        let mut cfg = Self::parse(&text).map_err(|e| anyhow::anyhow!("{shown}: {e}"))?;
-        let dir = path.parent().unwrap_or(Path::new(".")).join(FRAGMENT_DIR);
-        let (fragments, mut skipped) = fragment_files(&dir);
-        for f in fragments {
-            let merged = std::fs::read_to_string(&f)
-                .map_err(anyhow::Error::from)
-                .and_then(|text| Fragment::parse(&text))
-                .and_then(|frag| cfg.merge(frag));
-            if let Err(e) = merged {
-                skipped.push(anyhow::anyhow!("{}: {e}", f.display()));
-            }
-        }
-        Ok((cfg, skipped))
+        Self::parse(&text).map_err(|e| anyhow::anyhow!("{shown}: {e}"))
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
@@ -329,28 +309,6 @@ impl Config {
         cfg.validate(require_tls)?;
         cfg.routes.sort_by(Route::precedence);
         Ok(cfg)
-    }
-
-    /// The sort is stable: on a tie the config file, then the earlier fragment, wins.
-    pub fn merge(&mut self, f: Fragment) -> anyhow::Result<()> {
-        if let Some(backend) = f.authz_backend {
-            let protocol = f.authz_protocol.unwrap_or_default();
-            match &self.authz_backend {
-                None => {
-                    self.authz_backend = Some(backend);
-                    self.authz_protocol = protocol;
-                }
-                Some(have) => anyhow::ensure!(
-                    *have == backend && self.authz_protocol == protocol,
-                    "a second authz_backend: {}:{} is already configured",
-                    have.host,
-                    have.port
-                ),
-            }
-        }
-        self.routes.extend(f.routes);
-        self.routes.sort_by(Route::precedence);
-        Ok(())
     }
 
     fn validate(&mut self, require_tls: bool) -> anyhow::Result<()> {
@@ -418,32 +376,6 @@ fn canonicalize_routes(routes: &mut [Route]) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// Dot entries are the kubelet's ConfigMap projection internals.
-fn fragment_files(dir: &Path) -> (Vec<PathBuf>, Vec<anyhow::Error>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (vec![], vec![]),
-        Err(e) => {
-            return (
-                vec![],
-                vec![anyhow::anyhow!("reading {}: {e}", dir.display())],
-            );
-        }
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| !n.starts_with('.') && n.ends_with(".yaml"))
-                && p.is_file()
-        })
-        .collect();
-    files.sort();
-    (files, vec![])
 }
 
 impl Route {
@@ -693,49 +625,6 @@ routes:
         }
     }
 
-    /// The kubelet's projected ConfigMap: `routes.d` behind a `..data` symlink
-    /// that is swapped whole on update.
-    struct Projected {
-        dir: tempfile::TempDir,
-        generation: u32,
-    }
-
-    impl Projected {
-        fn new(main: &str, fragments: &[(&str, &str)]) -> Self {
-            let mut p = Self {
-                dir: tempfile::tempdir().unwrap(),
-                generation: 0,
-            };
-            p.publish(main, fragments);
-            std::os::unix::fs::symlink("..data/edge-gateway.yaml", p.config()).unwrap();
-            std::os::unix::fs::symlink("..data/routes.d", p.dir.path().join(FRAGMENT_DIR)).unwrap();
-            p
-        }
-
-        fn publish(&mut self, main: &str, fragments: &[(&str, &str)]) {
-            self.generation += 1;
-            let generation = format!("..v{}", self.generation);
-            let real = self.dir.path().join(&generation);
-            std::fs::create_dir_all(real.join(FRAGMENT_DIR)).unwrap();
-            std::fs::write(real.join("edge-gateway.yaml"), main).unwrap();
-            for (name, body) in fragments {
-                std::fs::write(real.join(FRAGMENT_DIR).join(name), body).unwrap();
-            }
-            let tmp = self.dir.path().join("..data_tmp");
-            std::os::unix::fs::symlink(&generation, &tmp).unwrap();
-            std::fs::rename(&tmp, self.dir.path().join("..data")).unwrap();
-        }
-
-        fn config(&self) -> PathBuf {
-            self.dir.path().join("edge-gateway.yaml")
-        }
-
-        fn load(&self) -> (Config, Vec<String>) {
-            let (c, skipped) = Config::load(&self.config()).unwrap();
-            (c, skipped.iter().map(|e| e.to_string()).collect())
-        }
-    }
-
     fn routes_yaml(routes: &[(Option<&str>, &str, u16)]) -> String {
         let mut s = "routes:\n".to_string();
         for (host, prefix, port) in routes {
@@ -748,186 +637,36 @@ routes:
         s
     }
 
-    fn table(c: &Config) -> Vec<(Option<&str>, &str, u16)> {
-        c.routes
-            .iter()
-            .map(|r| {
-                (
-                    r.hostname.as_deref(),
-                    r.prefix.as_str(),
-                    r.backend.as_ref().unwrap().port,
-                )
-            })
-            .collect()
-    }
-
-    const PLAIN: &str = "listen: 'x:1'\ntls: { cert: c, key: k }\n";
-
     #[test]
-    fn fragments_merge_in_name_order() {
-        let main = format!("{PLAIN}{}", routes_yaml(&[(None, "/", 1)]));
-        let p = Projected::new(
-            &main,
-            &[
-                (
-                    "20-b.yaml",
-                    &routes_yaml(&[(None, "/", 3), (None, "/x", 30)]),
-                ),
-                (
-                    "10-a.yaml",
-                    &routes_yaml(&[(None, "/", 2), (None, "/x", 20)]),
-                ),
-                ("05-c.yml", &routes_yaml(&[(None, "/", 9)])),
-                (".hidden.yaml", &routes_yaml(&[(None, "/", 9)])),
-            ],
-        );
-        let (c, skipped) = p.load();
-        assert!(skipped.is_empty(), "{skipped:?}");
+    fn route_set_is_routes_alone_canonicalised() {
+        let set = RouteSet::parse(&routes_yaml(&[(Some("H.test."), "/a/", 2)])).unwrap();
+        assert_eq!(set.routes[0].hostname.as_deref(), Some("h.test"));
         assert_eq!(
-            table(&c),
-            [
-                (None, "/x", 20),
-                (None, "/x", 30),
-                (None, "/", 1),
-                (None, "/", 2),
-                (None, "/", 3)
-            ]
+            set.routes[0].prefix,
+            crate::path::canonicalize("/a/").unwrap()
         );
-    }
-
-    #[test]
-    fn precedence_spans_fragments() {
-        let main = format!("{PLAIN}{}", routes_yaml(&[(None, "/", 1)]));
-        let p = Projected::new(
-            &main,
-            &[
-                ("a.yaml", &routes_yaml(&[(None, "/a", 2)])),
-                (
-                    "b.yaml",
-                    &routes_yaml(&[(None, "/a/b", 3), (Some("H.test"), "/", 4)]),
-                ),
-            ],
-        );
-        let (c, _) = p.load();
-        assert_eq!(
-            table(&c),
-            [
-                (Some("h.test"), "/", 4),
-                (None, "/a/b", 3),
-                (None, "/a", 2),
-                (None, "/", 1)
-            ]
-        );
-        let first = |host, path| {
-            c.routes
-                .iter()
-                .find(|r| r.matches(host, path))
-                .map(|r| r.backend.as_ref().unwrap().port)
-        };
-        assert_eq!(first(Some("h.test"), "/a/b"), Some(4));
-        assert_eq!(first(None, "/a/b/c"), Some(3));
-        assert_eq!(first(None, "/a/c"), Some(2));
-        assert_eq!(first(None, "/ab"), Some(1));
-    }
-
-    #[test]
-    fn bad_fragment_skipped() {
-        let main = format!("{PLAIN}{}", routes_yaml(&[(None, "/", 1)]));
-        let bad = [
-            ("a.yaml", "routes: [".to_string()),
-            (
-                "b.yaml",
-                format!("listen: 'x:2'\n{}", routes_yaml(&[(None, "/b", 2)])),
+        for bad in [
+            "routes: [".to_string(),
+            String::new(),
+            format!("listen: 'x:2'\n{}", routes_yaml(&[(None, "/b", 2)])),
+            format!(
+                "authz_backend: {{ host: a, port: 1 }}\n{}",
+                routes_yaml(&[])
             ),
-            ("c.yaml", routes_yaml(&[(None, "/c", 3), (None, "c", 3)])),
-            ("d.yaml", routes_yaml(&[(Some("*.d"), "/", 4)])),
-            (
-                "e.yaml",
-                format!("authz_protocol: http\n{}", routes_yaml(&[(None, "/e", 5)])),
-            ),
-            ("f.yaml", String::new()),
-        ];
-        let mut fragments: Vec<(&str, &str)> = bad.iter().map(|(n, b)| (*n, b.as_str())).collect();
-        let good = routes_yaml(&[(None, "/g", 7)]);
-        fragments.push(("g.yaml", &good));
-        let p = Projected::new(&main, &fragments);
-        let (c, skipped) = p.load();
-        assert_eq!(table(&c), [(None, "/g", 7), (None, "/", 1)]);
-        assert_eq!(skipped.len(), bad.len(), "{skipped:?}");
-        for ((name, _), e) in bad.iter().zip(&skipped) {
-            assert!(e.contains(&format!("{FRAGMENT_DIR}/{name}: ")), "{e}");
+            routes_yaml(&[(None, "c", 3)]),
+            routes_yaml(&[(Some("*.d"), "/", 4)]),
+        ] {
+            assert!(RouteSet::parse(&bad).is_err(), "taken: {bad:?}");
         }
     }
 
     #[test]
-    fn no_fragment_dir() {
+    fn bad_config_file_fails() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edge-gateway.yaml");
-        std::fs::write(&path, format!("{PLAIN}{}", routes_yaml(&[(None, "/", 1)]))).unwrap();
-        let (c, skipped) = Config::load(&path).unwrap();
-        assert!(skipped.is_empty());
-        assert_eq!(table(&c), [(None, "/", 1)]);
-        std::fs::write(dir.path().join(FRAGMENT_DIR), "").unwrap();
-        let (_, skipped) = Config::load(&path).unwrap();
-        assert_eq!(skipped.len(), 1, "a file where the directory belongs");
-    }
-
-    #[test]
-    fn bad_config_file_fails() {
-        let p = Projected::new("listen: 'x:1'\nroutes: []\n", &[("a.yaml", "routes: []\n")]);
-        assert!(Config::load(&p.config()).is_err());
-        let missing = p.dir.path().join("absent.yaml");
-        assert!(Config::load(&missing).is_err());
-    }
-
-    #[test]
-    fn fragment_supplies_authz() {
-        let authz = |host: &str, protocol: &str| {
-            format!(
-                "authz_backend: {{ host: {host}, port: 1 }}\n{protocol}{}",
-                routes_yaml(&[])
-            )
-        };
-        let main = format!("{PLAIN}routes: []\n");
-        let p = Projected::new(
-            &main,
-            &[
-                ("a.yaml", &authz("authx", "authz_protocol: http\n")),
-                ("b.yaml", &authz("authx", "authz_protocol: http\n")),
-                ("c.yaml", &authz("other", "authz_protocol: http\n")),
-                ("d.yaml", &authz("authx", "")),
-            ],
-        );
-        let (c, skipped) = p.load();
-        assert_eq!(
-            c.authz_backend.as_ref().map(|b| b.host.as_str()),
-            Some("authx")
-        );
-        assert_eq!(c.authz_protocol, AuthzProtocol::Http);
-        assert_eq!(skipped.len(), 2, "{skipped:?}");
-        assert!(
-            skipped[0].contains("c.yaml") && skipped[1].contains("d.yaml"),
-            "{skipped:?}"
-        );
-
-        let owned = format!("{PLAIN}authz_backend: {{ host: main, port: 1 }}\nroutes: []\n");
-        let p = Projected::new(&owned, &[("a.yaml", &authz("authx", ""))]);
-        let (c, skipped) = p.load();
-        assert_eq!(c.authz_backend.unwrap().host, "main");
-        assert_eq!(skipped.len(), 1);
-
-        let p = Projected::new(&main, &[("a.yaml", &authz("authx", ""))]);
-        let (c, _) = p.load();
-        assert_eq!(c.authz_protocol, AuthzProtocol::Grpc);
-    }
-
-    #[test]
-    fn reload_sees_new_fragments() {
-        let main = format!("{PLAIN}{}", routes_yaml(&[(None, "/", 1)]));
-        let mut p = Projected::new(&main, &[("a.yaml", &routes_yaml(&[(None, "/a", 2)]))]);
-        assert_eq!(table(&p.load().0), [(None, "/a", 2), (None, "/", 1)]);
-        p.publish(&main, &[("b.yaml", &routes_yaml(&[(None, "/b", 3)]))]);
-        assert_eq!(table(&p.load().0), [(None, "/b", 3), (None, "/", 1)]);
+        std::fs::write(&path, "listen: 'x:1'\nroutes: []\n").unwrap();
+        assert!(Config::load(&path).is_err(), "no tls block");
+        assert!(Config::load(&dir.path().join("absent.yaml")).is_err());
     }
 
     use proptest::prelude::*;

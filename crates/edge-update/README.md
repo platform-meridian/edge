@@ -69,10 +69,8 @@ whole set: rolling back returns to the previous one. `Apply` takes the id.
 `modules/` is a kustomize Component, which the stack includes under
 `components:`. It holds one file of Flux objects per module; with
 `stack.modules` set, a ConfigMap of `MODULES` and each module's MANIFEST
-lines; and a patch projecting each module's static routes, ConfigMap
-`edge-gateway-routes-<module>` (optional), into edge-gateway as
-`routes.d/60-<module>.yaml`. A module brings a route by shipping that
-ConfigMap.
+lines. A module brings a static route by shipping a ConfigMap labelled
+`edge.meridian/routes`, which edge-gateway finds.
 The release still says what the bundle itself did: `brings_base`, the
 `modules` it brought and those it `removes`, and each of its components names
 its `owner` (`base` or a module) and whether the bundle `carried` it. A bundle

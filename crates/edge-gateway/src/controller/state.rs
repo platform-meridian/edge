@@ -23,6 +23,8 @@ pub(super) enum Kind {
     Grant,
     TrustBundle,
     Policy,
+    /// ConfigMaps labelled [`super::discovered::LABEL`].
+    Declared,
 }
 
 // Consumed one at a time, never stored; boxing would only allocate.
@@ -107,6 +109,7 @@ pub(super) struct State {
     refs: Refs,
     bundles: Store,
     policies: Store,
+    declared: Store,
 }
 
 pub(super) struct Built {
@@ -128,6 +131,7 @@ impl State {
             Kind::Grant => &mut self.grants,
             Kind::TrustBundle => &mut self.bundles,
             Kind::Policy => &mut self.policies,
+            Kind::Declared => &mut self.declared,
         }
     }
 
@@ -137,6 +141,13 @@ impl State {
             Msg::Event(k, ev) => {
                 let ev = match k {
                     Kind::Service => thin(ev),
+                    Kind::Declared => {
+                        let ev = thin_with(ev, super::discovered::thin);
+                        if let Event::Apply(o) | Event::InitApply(o) = &ev {
+                            super::discovered::report(o);
+                        }
+                        ev
+                    }
                     _ => ev,
                 };
                 let changes = !matches!(ev, Event::Init | Event::InitApply(_));
@@ -209,6 +220,7 @@ impl State {
             && self.refs.values().all(|r| r.listed.is_some())
             && self.bundles.phase != Phase::AwaitingFirstList
             && self.policies.phase != Phase::AwaitingFirstList
+            && self.declared.phase != Phase::AwaitingFirstList
     }
 
     fn sources(&self) -> Sources<'_> {
@@ -224,7 +236,7 @@ impl State {
     /// Without Services the existence check is skipped (the route would only
     /// 502); without ReferenceGrants every cross-namespace backend is refused.
     pub fn build(&self, gateway: &GatewayRef, settings: &Settings) -> Built {
-        let statics = &settings.statics;
+        let statics = &self.statics(settings);
         let our_gateway = self
             .gateways
             .live
@@ -301,6 +313,18 @@ impl State {
             policies,
             gateway: status,
         }
+    }
+
+    /// The config file's routes, then each declaring ConfigMap's, in
+    /// namespace/name order; one that does not parse adds none.
+    fn statics(&self, settings: &Settings) -> Vec<Route> {
+        let declared = self
+            .declared
+            .live
+            .values()
+            .filter_map(|o| super::discovered::routes(o).ok())
+            .flatten();
+        settings.statics.iter().cloned().chain(declared).collect()
     }
 
     /// Gateway API conflict resolution: oldest first, then namespace/name.
@@ -496,14 +520,16 @@ mod tests {
 
     impl Cluster {
         fn new(statics: Vec<Route>) -> Self {
-            Self {
+            let mut c = Self {
                 state: State::default(),
                 routes: Arc::new(ArcSwap::from_pointee(statics.clone())),
                 statics,
                 last: None,
                 world: BTreeMap::new(),
                 hold: false,
-            }
+            };
+            c.list(Kind::Declared, vec![]);
+            c
         }
 
         fn basic() -> Self {
@@ -918,6 +944,76 @@ mod tests {
         let mut s = svc_spec();
         s["parentRefs"] = json!([{ "name": "edge", "namespace": "edge", "kind": "Gateway", "group": GATEWAY_GROUP }]);
         assert_eq!(Cluster::basic().one(s, json!({})).0.len(), 1);
+    }
+
+    fn declaring(ns: &str, name: &str, routes: &str) -> DynamicObject {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": name, "namespace": ns, "labels": { super::super::discovered::LABEL: "true" } },
+            "data": { "routes.yaml": routes, "other": "dropped" },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn declared_routes_join_the_statics_and_follow_their_configmap() {
+        let file = vec![static_route(None, "127.0.0.1")];
+        let mut c = Cluster::new(file.clone());
+        c.list(Kind::Gateway, vec![gateway_obj(all_ns())]);
+        c.fail(Kind::Service);
+        c.fail(Kind::Grant);
+        c.fail(Kind::TrustBundle);
+        c.absent(Kind::Policy);
+        c.list(Kind::Route, vec![]);
+        let map = declaring(
+            "meridian",
+            "map-routes",
+            "routes:\n  - { hostname: Martin.LAN, prefix: /, authz: skip, backend: { host: 127.0.0.1, port: 3000 } }\n",
+        );
+        let bad = declaring(
+            "evil",
+            "bad",
+            "authz_backend: { host: x, port: 1 }\nroutes: []\n",
+        );
+        let mut unsettled = State::default();
+        unsettled.apply(Msg::Event(Kind::Route, Event::InitDone));
+        unsettled.apply(Msg::Event(Kind::Gateway, Event::InitDone));
+        for k in [Kind::Service, Kind::Grant, Kind::TrustBundle, Kind::Policy] {
+            unsettled.apply(Msg::Error(k, true));
+        }
+        assert!(!unsettled.ready(), "ready before the declarations listed");
+        unsettled.apply(Msg::Event(Kind::Declared, Event::InitDone));
+        assert!(unsettled.ready());
+        c.list(Kind::Declared, vec![map.clone(), bad]);
+        let martin = Route {
+            hostname: Some("martin.lan".into()),
+            ..static_route(None, "127.0.0.1")
+        };
+        let martin = Route {
+            backend: Some(Backend {
+                host: "127.0.0.1".into(),
+                port: 3000,
+                tls: None,
+            }),
+            ..martin
+        };
+        assert_eq!(c.table(), [martin.clone(), file[0].clone()]);
+        // Declared hostnames are as unclaimable by an HTTPRoute as the file's.
+        let hijack = http_route(
+            "evil",
+            "hijack",
+            T0,
+            json!({}),
+            json!({ "hostnames": ["martin.lan"], "rules": [{ "backendRefs": [{ "name": "x", "port": 80 }] }] }),
+        );
+        c.list(Kind::Route, vec![hijack]);
+        assert_eq!(c.table(), [martin, file[0].clone()]);
+        // Gone with its ConfigMap, and its hostname with it.
+        c.feed(Msg::Event(Kind::Declared, Event::Delete(map)));
+        let t = c.table();
+        assert!(t.iter().all(|r| r.backend.as_ref().unwrap().port != 3000));
+        assert_eq!(t.len(), 2, "the HTTPRoute now holds martin.lan");
     }
 
     #[test]
