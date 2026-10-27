@@ -1,7 +1,19 @@
 # edge-gateway
 
 A Gateway API ingress on the host's own ports. It reads HTTPRoutes attached to
-its Gateway, and its own config file's static routes, into one route table.
+its Gateway, its own config file's static routes, and the static routes apps
+declare, into one route table.
+
+## Declared routes
+
+A ConfigMap labelled `edge.meridian/routes`, in any namespace, declares static
+routes under its `routes.yaml` key, in the config file's route syntax and
+nothing else (`routes:`; no `authz_backend`). They can name loopback backends,
+which no Service can. edge-gateway watches them, so an app installs its routes
+by shipping that ConfigMap and removes them by deleting it: no app patches
+another's objects. They follow the config file's routes on a tie, in
+namespace/name order; a hostname one of them names is not claimable by an
+HTTPRoute. One that does not parse adds no route, and says why in the log.
 
 ## HTTPRoute
 

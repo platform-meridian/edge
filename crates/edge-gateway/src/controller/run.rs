@@ -116,6 +116,12 @@ async fn run(
         watch_all(GATEWAY_GROUP, "v1beta1", "ReferenceGrant", Kind::Grant),
         watch_all(BUNDLE_GROUP, "v1", "ClusterTrustBundle", Kind::TrustBundle),
         watch_all(GATEWAY_GROUP, "v1", "BackendTLSPolicy", Kind::Policy),
+        watch_labelled(
+            Api::all_with(client.clone(), &api_resource("", "v1", "ConfigMap")),
+            super::discovered::LABEL,
+            Kind::Declared,
+        )
+        .boxed(),
     ]);
     let policy_ar = api_resource(GATEWAY_GROUP, "v1", "BackendTLSPolicy");
 
@@ -240,8 +246,21 @@ fn apply_frontend(tls: &crate::tls::Acceptor, d: &Derived) {
 }
 
 fn watch(api: Api<DynamicObject>, kind: Kind) -> impl Stream<Item = Msg> {
+    watch_with(api, watcher::Config::default(), kind)
+}
+
+/// Only the objects carrying `label`.
+fn watch_labelled(api: Api<DynamicObject>, label: &str, kind: Kind) -> impl Stream<Item = Msg> {
+    watch_with(api, watcher::Config::default().labels(label), kind)
+}
+
+fn watch_with(
+    api: Api<DynamicObject>,
+    config: watcher::Config,
+    kind: Kind,
+) -> impl Stream<Item = Msg> {
     let (what, mut outage) = (format!("{kind:?}"), Outage::default());
-    watcher(api, watcher::Config::default())
+    watcher(api, config)
         .default_backoff()
         .inspect(move |r| outage.observe(&what, r))
         .map(move |r| match r {

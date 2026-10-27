@@ -62,23 +62,24 @@ Then provide:
   and signs it while the unit's boot keys unseal (`signed/`, or why not in
   `refused`), and the installer is installed with the signed files over it. The
   host marks `dir/keys` on a unit with keys; without it the OS installs as built.
-- any static routes, as ConfigMaps projected into edge-gateway's
-  `routes.d/`, merged in name order:
+- any static routes, as ConfigMaps labelled `edge.meridian/routes`, in any
+  namespace, each with its routes under `routes.yaml`. edge-gateway finds and
+  follows them: an app ships its own and patches nothing of edge's. They are
+  served after the config file's on a tie, in namespace/name order, and hold
+  routes alone (no `authz_backend`, which is the config file's):
 
 ```yaml
-patches:
-  - target: { kind: Deployment, name: edge-gateway }
-    patch: |-
-      - op: add
-        path: /spec/template/spec/volumes/0/projected/sources/-
-        value:
-          configMap:
-            name: my-routes
-            items: [{ key: routes.yaml, path: routes.d/10-mine.yaml }]
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-routes
+  namespace: my-app
+  labels: { edge.meridian/routes: "true" }
+data:
+  routes.yaml: |
+    routes:
+      - { hostname: "mine.@OPERATOR_DOMAIN@", prefix: "/", authz: skip, backend: { host: "127.0.0.1", port: 3000 } }
 ```
-
-edge-update projects each installed module's own, ConfigMap
-`edge-gateway-routes-<module>`, as `routes.d/60-<module>.yaml`.
 
 `talos/` holds the Talos extension services: edge-scope, edge-layers,
 edge-watch, edge-registry, edge-dhcp (`operator-lan`) and a minimal edge-cni

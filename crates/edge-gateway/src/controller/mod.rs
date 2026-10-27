@@ -2,6 +2,7 @@
 //! matching and forwarding never see Gateway API types.
 
 mod convert;
+mod discovered;
 mod frontend;
 mod gateway_status;
 mod identity;
@@ -27,7 +28,8 @@ pub type Routes = Arc<ArcSwap<Vec<Route>>>;
 /// What the config file gives the controller.
 #[derive(Clone)]
 pub struct Settings {
-    /// Survive every republish: they reach loopback-bound backends, which no
+    /// The config file's routes. Survive every republish, as do those apps
+    /// declare (`discovered`): they reach loopback-bound backends, which no
     /// Service can name (Endpoints reject 127.0.0.1).
     pub statics: Vec<Route>,
     /// Identity headers no route filter may set.

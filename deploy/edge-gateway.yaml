@@ -1,5 +1,6 @@
-# The one TCP door, :443 on the host. Static routes and their authz service are
-# fragments a consumer projects into routes.d/*.yaml; loopback backends go there.
+# The one TCP door, :443 on the host. Static routes (loopback backends among
+# them) are ConfigMaps labelled edge.meridian/routes, which it finds in any
+# namespace; the authz service is this file's.
 apiVersion: v1
 kind: ConfigMap
 metadata:
