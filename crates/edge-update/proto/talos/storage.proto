@@ -1,0 +1,37 @@
+// talos api/storage: wiping a partition no volume uses, and dropping it.
+syntax = "proto3";
+
+package storage;
+
+service StorageService {
+    rpc BlockDeviceWipe(BlockDeviceWipeRequest) returns (BlockDeviceWipeResponse);
+}
+
+message Metadata {
+    string hostname = 1;
+    string error = 2;
+}
+
+message BlockDeviceWipeRequest {
+    repeated BlockDeviceWipeDescriptor devices = 1;
+}
+
+message BlockDeviceWipeDescriptor {
+    enum Method {
+        FAST = 0;
+        ZEROES = 1;
+    }
+    // Without /dev/: sda5.
+    string device = 1;
+    Method method = 2;
+    bool skip_volume_check = 3;
+    bool drop_partition = 4;
+}
+
+message BlockDeviceWipeResponse {
+    repeated BlockDeviceWipe messages = 1;
+}
+
+message BlockDeviceWipe {
+    Metadata metadata = 1;
+}

@@ -1,4 +1,5 @@
-// Updates the unit from signed bundles, and installs and uninstalls apps.
+// Updates the unit's OS and base from signed bundles. Apps are MeridianApps,
+// which the app controller installs.
 // Every call is safe to repeat; an update in progress survives a reboot or
 // power cut.
 syntax = "proto3";
@@ -10,8 +11,8 @@ service UpdateService {
   rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
   // Stores one chunk. A chunk already held is accepted again.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
-  // Checks a bundle against the trust policy and this unit, changing nothing;
-  // a fetched one goes into the upload first. Refused while an update runs,
+  // Checks an uploaded bundle against the trust policy and this unit, changing
+  // nothing. Refused while an update runs,
   // except on a stack trial that is unhealthy with no good release to roll
   // back to: that trial is ended as failed, and Apply then moves the stack off
   // it. Uploads are taken then too.
@@ -19,10 +20,6 @@ service UpdateService {
   // Applies the verified release. Refused while the OS the unit booted is on
   // trial, since the update's own trial falls back to a blessed one.
   rpc Apply(ApplyRequest) returns (ApplyResponse);
-  // Composes the installed set without an app and verifies it, for Apply.
-  rpc Uninstall(UninstallRequest) returns (UninstallResponse);
-  // The apps installed in the stack the unit runs.
-  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   // The status now, then every change to it.
   rpc WatchStatus(WatchStatusRequest) returns (stream WatchStatusResponse);
@@ -87,10 +84,6 @@ message Head {
   // The workflow identity its Sigstore certificate names, "<workflow>@<ref>",
   // or "unsigned" for a bundle without a signature.
   string signer = 3;
-  // What its MANIFEST says it brings: a base or none, its modules, and those it removes.
-  bool brings_base = 4;
-  repeated string modules = 5;
-  repeated string removes = 6;
 }
 
 message PutChunkRequest {
@@ -117,47 +110,14 @@ message ApplyResponse {
 }
 
 message InstallRequest {
-  oneof source {
-    // The SHA-256 of a complete upload.
-    bytes upload = 1;
-    // An app's OCI artifact: "ghcr.io/<owner>/<app>:<tag>" or "…@sha256:…".
-    string reference = 2;
-    // The bundle's tar over HTTPS.
-    string url = 3;
-  }
+  // The SHA-256 of a complete upload.
+  bytes upload = 1;
   // Who installs, as other clients see it.
   string by = 4;
 }
 
 message InstallResponse {
   Status status = 1;
-}
-
-message UninstallRequest {
-  string name = 1;
-  string by = 2;
-}
-
-message UninstallResponse {
-  Status status = 1;
-}
-
-message ListAppsRequest {}
-
-message ListAppsResponse {
-  repeated App apps = 1;
-}
-
-// An app installed: a module of the unit's installed set.
-message App {
-  string name = 1;
-  string version = 2;
-  int64 epoch = 3;
-  repeated string images = 4;
-  // The oldest Talos and Kubernetes, and the Flux components, it needs.
-  string requires_talos = 5;
-  string requires_kubernetes = 6;
-  repeated string requires_flux = 7;
 }
 
 message GetStatusRequest {}
@@ -453,7 +413,8 @@ message Unit {
   repeated Component components = 10;
   // The MANIFEST of the release the unit runs, if this engine applied it.
   map<string, string> manifest = 11;
-  // The modules installed: the running release's, else as the stack records them.
+  // The modules the stack runs until they are MeridianApps: the running
+  // release's, else as the stack records them. A base update carries them.
   repeated string modules = 12;
 }
 
@@ -463,20 +424,14 @@ message Release {
   string talos_version = 2;
   // The installed set's MANIFEST.
   map<string, string> manifest = 3;
-  // The bundle's; empty for an uninstall.
   bytes sha256 = 4;
   string notes = 5;
-  // Head.signer; empty for an uninstall.
+  // Head.signer.
   string signer = 6;
   // What verification found, passed or not.
   repeated Check checks = 7;
   Diff diff = 8;
   repeated Component components = 9;
-  // What the bundle itself brought, before it was merged into the unit's set:
-  // a base or none, the modules it brought, and those it removed.
-  bool brings_base = 10;
-  repeated string modules = 11;
-  repeated string removes = 12;
 }
 
 enum Outcome {

@@ -1,6 +1,8 @@
-# Applies signed update bundles through the node's Talos API. The consumer supplies
-# ConfigMap edge-update, Talos os:admin for namespace edge, the PersistentVolume
-# for claim edge-update-state, and the edge-registry user volume.
+# Applies signed update bundles through the node's Talos API, turns claims of
+# StorageClass edge-local into Talos user volumes, and labels the node with the
+# host's capabilities. The consumer supplies ConfigMap edge-update, Talos
+# os:admin for namespace edge, the PersistentVolume for claim edge-update-state,
+# and the edge-registry user volume.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -46,6 +48,24 @@ rules:
     verbs: ["get"]
   - apiGroups: ["source.toolkit.fluxcd.io"]
     resources: ["ocirepositories"]
+    verbs: ["get", "patch"]
+  # The storage provisioner: a claim of a class it serves becomes a user
+  # volume and the PersistentVolume that binds it; a released one goes.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # The node's capability.platform.meridian/* labels, server-side applied.
+  - apiGroups: [""]
+    resources: ["nodes"]
     verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -97,6 +117,8 @@ spec:
             - { name: KUBERNETES_SERVICE_HOST, value: "@APISERVER_HOST@" }
             - { name: KUBERNETES_SERVICE_PORT, value: "@APISERVER_PORT@" }
             - { name: EDGE_UPDATE_LISTEN, value: "127.0.0.1:7443" }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
           ports:
             - { name: health, containerPort: 7444, protocol: TCP }
           # grpc.health.v1, NOT_SERVING once the update API has stopped.
@@ -127,3 +149,18 @@ spec:
           persistentVolumeClaim: { claimName: edge-update-state }
         - name: registry
           hostPath: { path: /var/mnt/edge-registry, type: Directory }
+---
+# Apps ask for claims; on the unit each is a Talos user volume of its own
+# (edge-update's provisioner), ext4 on the system disk, keyed as the unit's
+# other user volumes. The default class, so a claim naming none is one. Kept
+# when released: a person deletes an app's data, never an uninstall.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: edge-local
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: edge.meridian/local
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false

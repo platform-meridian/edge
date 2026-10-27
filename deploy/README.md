@@ -40,7 +40,6 @@ Then provide:
         workflow: https://github.com/my-org/my-app/.github/workflows/release.yml
         ref: refs/tags/*
     allowUnsigned: false              # true for development only
-  registryAuth: /etc/edge-update/docker-config.json  # optional: logins to pull apps
   store: /var/lib/etcd/state.log      # copied off before each update
   bless: /var/mnt/my-volume/blessed   # boot-commit's record of the boot it blessed
   stack:
@@ -62,6 +61,10 @@ Then provide:
   and signs it while the unit's boot keys unseal (`signed/`, or why not in
   `refused`), and the installer is installed with the signed files over it. The
   host marks `dir/keys` on a unit with keys; without it the OS installs as built.
+- nothing for app storage: edge-update's provisioner serves the default
+  StorageClass `edge-local` (`edge-update.yaml`), each claim a Talos user
+  volume of its own; and edge-update labels the node with the host's
+  capabilities (`capability.platform.meridian/<name>`);
 - any static routes, as ConfigMaps labelled `edge.meridian/routes`, in any
   namespace, each with its routes under `routes.yaml`. edge-gateway finds and
   follows them: an app ships its own and patches nothing of edge's. They are

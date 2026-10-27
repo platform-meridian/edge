@@ -3,6 +3,8 @@
 //! material put back, so the unit's secrets never travel.
 
 use anyhow::{Context, bail, ensure};
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 /// In the v1alpha1 document. Secrets, then the unit's identity.
@@ -150,7 +152,110 @@ fn set(doc: &mut Value, path: &[&str], value: Value) -> anyhow::Result<()> {
 
 fn held_kind(k: &Key) -> bool {
     matches!(k, Key::Typed(kind, name) if HELD_KINDS.contains(&kind.as_str())
-        || HELD_NAMED.contains(&(kind.as_str(), name.as_str())))
+        || HELD_NAMED.contains(&(kind.as_str(), name.as_str()))
+        || (kind == USER_VOLUME && Provisioned::is(name)))
+}
+
+const USER_VOLUME: &str = "UserVolumeConfig";
+
+/// A Talos user volume edge's storage provisioner made for a claim: the
+/// unit's, kept whole by every merge, never in a build's patch. Named
+/// `pv-<24 hex>` from the claim's uid, within Talos's 34 characters, so no
+/// build's volume is one.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Provisioned(String);
+
+impl Provisioned {
+    const PREFIX: &str = "pv-";
+
+    /// The volume for the claim with uid `uid`.
+    pub fn for_claim(uid: &str) -> Self {
+        use sha2::Digest as _;
+        let h = hex::encode(sha2::Sha256::digest(uid.as_bytes()));
+        Self(format!("{}{}", Self::PREFIX, &h[..24]))
+    }
+
+    /// A name the provisioner gave, read back.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::is(name).then(|| Self(name.into()))
+    }
+
+    fn is(name: &str) -> bool {
+        name.strip_prefix(Self::PREFIX).is_some_and(|h| {
+            h.len() == 24
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    /// Where Talos mounts it.
+    pub fn path(&self) -> String {
+        format!("/var/mnt/{}", self.0)
+    }
+}
+
+/// The provisioned volumes `config` holds, with their sizes in MiB.
+pub fn provisioned(config: &str) -> anyhow::Result<BTreeMap<Provisioned, u64>> {
+    let mut out = BTreeMap::new();
+    for (k, doc) in parse(config)? {
+        if let Key::Typed(kind, name) = &k
+            && kind == USER_VOLUME
+            && let Some(p) = Provisioned::parse(name)
+        {
+            let size = get(&doc, &["provisioning", "maxSize"])
+                .and_then(Value::as_str)
+                .and_then(|s| s.strip_suffix("MiB"))
+                .and_then(|s| s.parse().ok())
+                .with_context(|| format!("{} has no size in MiB", p.name()))?;
+            out.insert(p, size);
+        }
+    }
+    Ok(out)
+}
+
+/// `config` with the provisioned volume `v` of `mib` MiB, ext4 on the system
+/// disk: one filesystem for every claim, since XFS refuses a small one. It
+/// is keyed as the unit's other user volumes are.
+pub fn with_provisioned(config: &str, v: &Provisioned, mib: u64) -> anyhow::Result<String> {
+    let mut docs = parse(config)?;
+    let k = Key::Typed(USER_VOLUME.into(), v.name().into());
+    ensure!(
+        !docs.iter().any(|(d, _)| *d == k),
+        "the config already has {}",
+        v.name()
+    );
+    ensure!(mib > 0, "a volume of no size");
+    let size = format!("{mib}MiB");
+    let encryption = new_volume_encryption(&docs, &k)?;
+    let mut doc = serde_json::json!({
+            "apiVersion": "v1alpha1",
+            "kind": USER_VOLUME,
+            "name": v.name(),
+            "provisioning": {
+                "diskSelector": { "match": "system_disk" },
+                "minSize": size,
+                "maxSize": size,
+            },
+            "filesystem": { "type": "ext4" },
+    });
+    if let Some(e) = encryption {
+        doc["encryption"] = e;
+    }
+    docs.push((k, doc));
+    render(&docs)
+}
+
+/// `config` without the provisioned volume `v`. Talos unmounts it; its
+/// partition stays on the disk.
+pub fn without_provisioned(config: &str, v: &Provisioned) -> anyhow::Result<String> {
+    let mut docs = parse(config)?;
+    let k = Key::Typed(USER_VOLUME.into(), v.name().into());
+    docs.retain(|(d, _)| *d != k);
+    render(&docs)
 }
 
 fn held_fields(k: &Key) -> impl Iterator<Item = &'static str> + '_ {
@@ -315,30 +420,6 @@ pub fn merge(unit: &str, patch: &str) -> anyhow::Result<String> {
         bail!("merging would change what the unit keeps");
     }
     render(&out)
-}
-
-/// Documents a component adds to the base's: each of a kind and name, none the unit's.
-pub fn check_part(part: &str) -> anyhow::Result<()> {
-    for (k, _) in parse(part)? {
-        ensure!(
-            matches!(&k, Key::Typed(_, n) if !n.is_empty()),
-            "{} is not a named document a component can add",
-            describe(&k)
-        );
-        ensure!(!held_kind(&k), "{} is the unit's to keep", describe(&k));
-    }
-    Ok(())
-}
-
-/// `patch` without the documents `parts` carry, by kind and name.
-pub fn without(patch: &str, parts: &[&str]) -> anyhow::Result<String> {
-    let mut theirs = Vec::new();
-    for p in parts {
-        theirs.extend(parse(p)?.into_iter().map(|(k, _)| k));
-    }
-    let mut docs = parse(patch)?;
-    docs.retain(|(k, _)| !theirs.contains(k));
-    render(&docs)
 }
 
 /// Patches as one; a document two of them carry is refused.
@@ -616,6 +697,45 @@ image: kubelet:new
         let out = parse(&merge(UNIT, &render(&patch).unwrap()).unwrap()).unwrap();
         assert!(doc(&out, "UserVolumeConfig", "data").is_none());
         assert!(doc(&out, "VolumeConfig", "STATE").is_some());
+    }
+
+    #[test]
+    fn a_provisioned_volume_is_the_units_through_every_merge() {
+        let v = Provisioned::for_claim("6a2f0c4e-8d5b-4f3a-9c1e-0b7d2e4f6a8c");
+        assert_eq!(v.name().len(), 27);
+        assert_eq!(Provisioned::parse(v.name()), Some(v.clone()));
+        assert_eq!(Provisioned::parse("fusion-data"), None);
+        assert_eq!(Provisioned::parse("pv-NOTHEX0000000000000000"), None);
+        assert_eq!(v.path(), format!("/var/mnt/{}", v.name()));
+
+        let unit = with_provisioned(UNIT, &v, 2048).unwrap();
+        assert!(with_provisioned(&unit, &v, 2048).is_err(), "twice");
+        assert_eq!(provisioned(&unit).unwrap(), [(v.clone(), 2048)].into());
+        let doc_of = |c: &str| doc(&parse(c).unwrap(), "UserVolumeConfig", v.name()).cloned();
+        let ours = doc_of(&unit).unwrap();
+        assert_eq!(ours["filesystem"]["type"], "ext4");
+        let keyed = |c: &str, name: &str| {
+            doc(&parse(c).unwrap(), "UserVolumeConfig", name).unwrap()["encryption"].clone()
+        };
+        assert_eq!(
+            keyed(&unit, v.name()),
+            keyed(UNIT, "data"),
+            "keyed as the unit's"
+        );
+        assert_eq!(ours["provisioning"]["maxSize"], "2048MiB");
+
+        // A build never renders it, yet the next config keeps it whole.
+        let merged = merge(&unit, PATCH).unwrap();
+        assert_eq!(doc_of(&merged).unwrap(), ours);
+        assert!(!strip(&unit).unwrap().contains(v.name()));
+        let carrying = format!("{PATCH}---\n{}", serde_saphyr::to_string(&ours).unwrap());
+        let e = check_patch(&carrying).unwrap_err();
+        assert!(format!("{e:#}").contains("which the unit keeps"), "{e:#}");
+
+        let gone = without_provisioned(&merged, &v).unwrap();
+        assert!(doc_of(&gone).is_none());
+        assert!(provisioned(&gone).unwrap().is_empty());
+        assert!(with_provisioned(UNIT, &v, 0).is_err());
     }
 
     #[test]

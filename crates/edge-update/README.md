@@ -1,8 +1,9 @@
 # edge-update
 
-Verifies signed bundles (`edge-bundle`), a base or apps, and applies them to
-the unit it runs on, through the node's Talos API and the cluster's Flux. It
-installs and uninstalls apps one at a time. The API is
+Verifies signed bundles (`edge-bundle`), each the unit's base (its OS and
+stack), and applies them to the unit it runs on, through the node's Talos API
+and the cluster's Flux. Apps are `MeridianApp`s, which the app controller
+installs (ADR-0015); a bundle brings none. The API is
 `proto/edge/update/v1/update.proto`; a console reaches it through whatever
 fronts the unit.
 
@@ -55,45 +56,29 @@ the unit.
 
 ## Installed sets
 
-Every bundle says what it brings in `components.json` (see `edge-bundle`):
-the base or not, and modules. edge-update merges it into the installed set of
-the stack the unit runs: a module it brings is installed or updated, one it
-does not mention stays as it is, one goes only if the bundle names it in
-`remove`, and without a base the unit keeps its own, installer included, so
-there is no OS step. It composes the stack for the result, the base's
-artifact with `modules/` rewritten, tags it with a release id it mints in the repository the base's
-stack came from, and keeps the set beside that tag. The release's MANIFEST, refs and machine
+Every bundle says in `components.json` (see `edge-bundle`) the base's refs and
+nothing else: one that brings modules, or removes one, is refused. A unit
+that installed modules before apps were `MeridianApp`s still runs them from
+its stack until the appliance's switch-over (ADR-0015, phase 5), so
+edge-update keeps the unit's *installed set*: the base and those modules. A
+base update replaces the base and carries every module as it is: its Flux
+objects, its MANIFEST lines and its machine-config parts. It composes the
+stack for the result, the base's artifact with `modules/` rewritten, tags it
+with a release id it mints in the repository the base's stack came from, and
+keeps the set beside that tag. The release's MANIFEST, refs and machine
 config are then the set's, so the judge, rollback and collection cover the
 whole set: rolling back returns to the previous one. `Apply` takes the id.
 
 `modules/` is a kustomize Component, which the stack includes under
-`components:`. It holds one file of Flux objects per module; with
+`components:`. It holds one file of Flux objects per module and, with
 `stack.modules` set, a ConfigMap of `MODULES` and each module's MANIFEST
-lines. A module brings a static route by shipping a ConfigMap labelled
-`edge.meridian/routes`, which edge-gateway finds.
-The release still says what the bundle itself did: `brings_base`, the
-`modules` it brought and those it `removes`, and each of its components names
-its `owner` (`base` or a module) and whether the bundle `carried` it. A bundle
-without a base on a stack whose set it did not compose is refused, as is one
-applied after the stack moved from the one it was verified on.
+lines. A base applied after the stack moved from the one it was verified on
+is refused, as is one onto a unit whose set is unrecorded while its stack
+says it runs modules.
 
-Anti-rollback is per part: a base older than the installed `BUILT_EPOCH`,
-or a module older than its installed `epoch`, is refused. A module's
-`requires` (Talos, Kubernetes, Flux components) are checked at verify and
-again at apply.
-
-## Apps
-
-An app is a bundle without a base bringing one module (`edge-bundle`).
-`Install` verifies a bundle, an app or a base, from one of:
-
-- `upload`: a complete upload (`BeginUpload`, `PutChunk`);
-- `url`: the tar over HTTPS, resumed by range;
-- `reference`: an app's OCI artifact; registry logins come from the Docker
-  `config.json` that `registryAuth` names.
-
-`Uninstall` composes the set without the app, with no signature to check.
-Either is then applied with `Apply`. `ListApps` lists the installed modules.
+Anti-rollback is the base's: one older than the installed `BUILT_EPOCH` is
+refused. Each carried module's `requires` (Talos, Kubernetes, Flux
+components) are checked at verify and again at apply.
 
 ## What runs, and what a release changes
 
@@ -155,3 +140,38 @@ trial, or one with a release to roll back to, is never taken over.
 holds (kept so a rollback can return to it), and what nothing kept names.
 `CollectGarbage` drops the latter, and the previous release's images too if
 asked, after which a rollback to it is refused: it has no images to run.
+
+## Volumes
+
+An app asks for a PersistentVolumeClaim and never carries machine config.
+edge-update is a Kubernetes external provisioner for StorageClasses whose
+`provisioner` is `edge.meridian/local` (`deploy/edge-update.yaml` ships
+`edge-local`, the default): a claim of one, on this node, becomes a Talos user
+volume of its own, `pv-<24 hex>` from the claim's uid, ext4 on the system disk
+and keyed as the unit's other user volumes, its size the request rounded up to
+MiB. Once Talos says it is ready, the provisioner creates a `local`
+PersistentVolume on `/var/mnt/<volume>`, on this node, bound to the claim.
+
+Not a CSI driver: Talos partitions, keys, formats and mounts the volume, so a
+node plugin would have nothing to do.
+
+The engine is the machine config's one writer: the provisioner asks it to add
+or remove a volume, and it does so only while idle with nothing staged for the
+next boot, so a claim waits out an update. Every new config the engine merges
+keeps the provisioned volumes whole (`edge-bundle`'s `machineconfig`).
+
+Raw block claims, any access mode but `ReadWriteOnce` or `ReadWriteOncePod`, a
+data source, a selector, or a resize are refused, with a `ProvisioningFailed`
+event on the claim. A volume released under `reclaimPolicy: Delete` has its
+partition noted on its PersistentVolume, is removed, then the partition is
+wiped and dropped, then the PersistentVolume deleted. Under `Retain` it stays.
+
+## Capabilities
+
+edge-update labels its node `capability.platform.meridian/<name>: "true"` for
+each capability the host offers, as the app controller's requirement check
+reads them (`meridian_app`'s closed set): `persistent-storage` and
+`host-network` always, `serial-devices` for a USB or ACM serial adapter or a
+UART that is there, `gpu` for an NVIDIA, AMD or Intel display controller. The
+labels are applied server-side under one field manager, so one the host stops
+offering goes.

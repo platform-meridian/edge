@@ -1,19 +1,19 @@
-//! What a bundle brings, and what a unit has installed: a base and modules.
+//! What a bundle brings, and what a unit has installed.
 //!
-//! A bundle brings the base or not, and any modules; it removes a module only
-//! by naming it in `remove`. Installing it merges it into the unit's set: a
-//! module it does not mention stays as it is, and without a base the unit
-//! keeps its own. The stack a unit runs is its base's artifact with `modules/`
-//! rewritten from the set, one file of Flux objects per module.
+//! A bundle brings the base: the OS and the stack, nothing else. Apps are
+//! `MeridianApp`s now. Until the appliance's switch-over (ADR-0015, phase 5)
+//! a unit's stack still runs the modules it installed before, so its
+//! installed set keeps them: a base update composes its stack with them,
+//! as they are, `modules/` rewritten from the set, one file of Flux objects
+//! per module, and their machine-config parts kept.
 //!
-//! Anti-rollback is per part: the base by `BUILT_EPOCH`, each module by its
-//! `epoch`. The same part again is taken.
+//! Anti-rollback is the base's, by `BUILT_EPOCH`. The same base again is taken.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::Path;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -22,18 +22,18 @@ use crate::{Manifest, machineconfig, oci};
 pub const COMPONENTS: &str = "components.json";
 /// The stack artifact's directory the unit's modules are written into.
 pub const MODULES: &str = "modules";
-/// MANIFEST keys the merge owns: the installed modules, and what a bundle removes.
+/// The MANIFEST key naming the installed modules.
 pub const MODULES_KEY: &str = "MODULES";
-pub const REMOVE_KEY: &str = "REMOVE";
 
 const FLUX_CONTENT: &str = "application/vnd.cncf.flux.content.v1.tar+gzip";
 
+/// A module a unit installed before apps were `MeridianApp`s, as its
+/// installed set records it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Module {
     #[serde(default)]
     pub version: String,
-    /// Anti-rollback: a unit refuses one older than the one it runs.
     pub epoch: i64,
     #[serde(default)]
     pub requires: Requires,
@@ -64,87 +64,35 @@ pub struct Requires {
     pub flux: BTreeSet<String>,
 }
 
-/// A bundle's `components.json`.
+/// A bundle's `components.json`: the base's refs, and nothing a bundle could
+/// bring beside them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Components {
-    /// The base's refs; `None` keeps the unit's base, installer included.
-    pub base: Option<BTreeSet<String>>,
-    #[serde(default)]
-    pub modules: BTreeMap<String, Module>,
-    #[serde(default)]
-    pub remove: BTreeSet<String>,
-}
-
-fn module_name(n: &str) -> bool {
-    !n.is_empty()
-        && n.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    pub base: BTreeSet<String>,
 }
 
 impl Components {
-    pub fn check(&self) -> anyhow::Result<()> {
-        let mut keys = BTreeSet::new();
-        for (name, m) in &self.modules {
-            ensure!(module_name(name), "{name:?} is not a module name");
-            ensure!(
-                !self.remove.contains(name),
-                "the bundle both brings and removes {name}"
-            );
-            ensure!(
-                !m.flux.trim().is_empty(),
-                "the {name} module has no objects"
-            );
-            machineconfig::check_part(&m.machine)
-                .with_context(|| format!("the {name} module's machine config"))?;
-            for k in m.manifest.keys() {
-                ensure!(
-                    ![MODULES_KEY, REMOVE_KEY].contains(&k.as_str()) && keys.insert(k.clone()),
-                    "the {name} module's MANIFEST line {k} is another's"
-                );
-            }
-        }
-        for name in &self.remove {
-            ensure!(module_name(name), "{name:?} is not a module name");
-        }
-        Ok(())
-    }
-
-    /// Every ref the bundle's components run.
+    /// Every ref the base runs.
     pub fn refs(&self) -> BTreeSet<String> {
-        self.base
-            .iter()
-            .flatten()
-            .chain(self.modules.values().flat_map(|m| &m.refs))
-            .cloned()
-            .collect()
+        self.base.clone()
     }
 
     pub fn read(dir: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read(dir.join(COMPONENTS)).context("reading the components")?;
-        let c: Self = serde_json::from_slice(&text).context("the components are not JSON")?;
-        c.check()?;
-        Ok(c)
-    }
-
-    /// The MANIFEST keys the bundle's modules bring.
-    fn module_keys(&self) -> BTreeSet<&str> {
-        self.modules
-            .values()
-            .flat_map(|m| m.manifest.keys())
-            .map(String::as_str)
-            .collect()
+        serde_json::from_slice(&text)
+            .context("the components are not a base's: a bundle brings the base alone")
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Base {
-    /// The MANIFEST of the bundle that brought it, less its modules'.
+    /// The MANIFEST of the bundle that brought it.
     pub manifest: Manifest,
     /// Its bundle's `BUILT_EPOCH`.
     pub epoch: i64,
-    /// Its machine config, less its modules'.
+    /// Its machine config.
     pub patch: String,
     pub refs: BTreeSet<String>,
 }
@@ -158,41 +106,26 @@ pub struct Installed {
 }
 
 impl Installed {
-    /// `current` with a bundle installed. Without `current`, the bundle must bring a base.
+    /// `current` with the bundle's base installed, its modules kept as they are.
     pub fn after(
         current: Option<&Installed>,
         manifest: &Manifest,
-        patch: Option<&str>,
+        patch: &str,
         c: &Components,
     ) -> anyhow::Result<Self> {
-        c.check()?;
-        let base = match (&c.base, current) {
-            (Some(refs), _) => {
-                let patch = patch.context("the bundle brings a base without its config patch")?;
-                let parts: Vec<&str> = c.modules.values().map(|m| m.machine.as_str()).collect();
-                let theirs = c.module_keys();
-                let epoch = manifest
-                    .get("BUILT_EPOCH")
-                    .and_then(|e| e.parse().ok())
-                    .context("the MANIFEST has no BUILT_EPOCH")?;
-                Base {
-                    epoch,
-                    manifest: manifest
-                        .iter()
-                        .filter(|(k, _)| {
-                            ![MODULES_KEY, REMOVE_KEY].contains(&k.as_str())
-                                && !theirs.contains(k.as_str())
-                        })
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                    patch: machineconfig::without(patch, &parts)?,
-                    refs: refs.clone(),
-                }
-            }
-            (None, Some(cur)) => cur.base.clone(),
-            (None, None) => bail!(
-                "the bundle brings no base, and the unit's installed set is unknown: install a bundle with a base first"
-            ),
+        let epoch = manifest
+            .get("BUILT_EPOCH")
+            .and_then(|e| e.parse().ok())
+            .context("the MANIFEST has no BUILT_EPOCH")?;
+        let base = Base {
+            epoch,
+            manifest: manifest
+                .iter()
+                .filter(|(k, _)| k.as_str() != MODULES_KEY)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            patch: patch.to_string(),
+            refs: c.base.clone(),
         };
         if let Some(cur) = current {
             not_older(
@@ -200,33 +133,10 @@ impl Installed {
                 (cur.base.epoch, &cur.base),
                 (base.epoch, &base),
             )?;
-            for (name, m) in &c.modules {
-                if let Some(old) = cur.modules.get(name) {
-                    not_older(
-                        &format!("the unit's {name}"),
-                        (old.epoch, old),
-                        (m.epoch, m),
-                    )?;
-                }
-            }
         }
-        let mut modules = current.map(|c| c.modules.clone()).unwrap_or_default();
-        for name in &c.remove {
-            modules.remove(name);
-        }
-        modules.extend(c.modules.clone());
+        let modules = current.map(|c| c.modules.clone()).unwrap_or_default();
         let next = Self { base, modules };
         next.patch()?;
-        Ok(next)
-    }
-
-    /// The set without the module `name`.
-    pub fn without(&self, name: &str) -> anyhow::Result<Self> {
-        let mut next = self.clone();
-        ensure!(
-            next.modules.remove(name).is_some(),
-            "{name} is not installed"
-        );
         Ok(next)
     }
 
@@ -247,16 +157,10 @@ impl Installed {
         machineconfig::join(&all)
     }
 
-    /// What the set says of itself, as a release MANIFEST: the base's, the
-    /// bundle's own lines over it, then the modules'.
-    pub fn manifest(&self, bundle: &Manifest, c: &Components) -> Manifest {
-        let theirs = c.module_keys();
+    /// What the set says of itself, as a release MANIFEST: the base's, then
+    /// the modules'.
+    pub fn manifest(&self) -> Manifest {
         let mut m = self.base.manifest.clone();
-        for (k, v) in bundle {
-            if ![MODULES_KEY, REMOVE_KEY].contains(&k.as_str()) && !theirs.contains(k.as_str()) {
-                m.insert(k.clone(), v.clone());
-            }
-        }
         for module in self.modules.values() {
             m.extend(module.manifest.clone());
         }
@@ -473,131 +377,62 @@ mod tests {
         .into()
     }
 
-    fn base_bundle() -> (Manifest, Components) {
-        let mut m = bundle(1);
+    fn base_bundle(epoch: i64) -> (Manifest, Components) {
+        let mut m = bundle(epoch);
         m.insert("TALOS_VERSION".into(), "v1.14.1".into());
         m.insert("INSTALLER_REF".into(), "r/i:1@sha256:aa".into());
-        let mut a = module("a", "sha256:1");
-        a.machine = VOLUME.into();
-        m.extend(a.manifest.clone());
-        m.insert(MODULES_KEY.into(), "a".into());
         let c = Components {
-            base: Some(["r/base:1".to_string()].into()),
-            modules: [("a".to_string(), a)].into(),
-            remove: BTreeSet::new(),
+            base: [format!("r/base:{epoch}")].into(),
         };
         (m, c)
     }
 
+    /// A set a unit installed before apps were MeridianApps: a base and the module `a`.
     fn installed() -> Installed {
-        let (m, c) = base_bundle();
-        let patch = format!("{PATCH}---\n{VOLUME}");
-        Installed::after(None, &m, Some(&patch), &c).unwrap()
+        let (m, c) = base_bundle(1);
+        let mut i = Installed::after(None, &m, PATCH, &c).unwrap();
+        let mut a = module("a", "sha256:1");
+        a.machine = VOLUME.into();
+        i.modules.insert("a".into(), a);
+        i
     }
 
     #[test]
-    fn a_base_is_its_bundle_less_its_modules() {
-        let i = installed();
-        assert_eq!(
-            crate::yaml::documents(&i.base.patch).unwrap(),
-            crate::yaml::documents(PATCH).unwrap()
-        );
+    fn a_base_is_its_bundle() {
+        let (mut m, c) = base_bundle(1);
+        m.insert(MODULES_KEY.into(), "stale".into());
+        let i = Installed::after(None, &m, PATCH, &c).unwrap();
+        assert_eq!(i.base.patch, PATCH);
         assert!(i.base.manifest.contains_key("TALOS_VERSION"));
-        assert!(!i.base.manifest.contains_key("MODULE_A"));
         assert!(!i.base.manifest.contains_key(MODULES_KEY));
-        assert_eq!(
-            i.refs(),
-            ["r/a:sha256:1", "r/base:1"].map(String::from).into()
-        );
-        assert!(i.patch().unwrap().contains("name: a-data"));
+        assert!(i.modules.is_empty());
+        assert_eq!(i.refs(), c.base);
     }
 
     #[test]
-    fn a_bundle_without_a_module_keeps_it_and_without_a_base_keeps_the_base() {
+    fn a_new_base_keeps_the_modules_the_unit_runs_as_they_are() {
         let i = installed();
-        let c = Components {
-            base: None,
-            modules: [("b".to_string(), module("b", "sha256:2"))].into(),
-            remove: BTreeSet::new(),
-        };
-        let mut m = bundle(2);
-        m.extend(c.modules["b"].manifest.clone());
-        let next = Installed::after(Some(&i), &m, None, &c).unwrap();
-        assert_eq!(next.base, i.base);
-        assert_eq!(next.modules["a"], i.modules["a"]);
-        assert!(next.modules.contains_key("b"));
-        let mf = next.manifest(&m, &c);
-        assert_eq!(mf[MODULES_KEY], "a b");
-        assert_eq!(mf["INSTALLER_REF"], "r/i:1@sha256:aa");
-        assert_eq!(mf["STACK_TAG"], "t2");
-        assert_eq!(mf["MODULE_A"], "r/modules/a:1@sha256:1");
-        assert!(next.patch().unwrap().contains("name: a-data"));
-    }
-
-    #[test]
-    fn a_module_goes_only_when_a_bundle_removes_it() {
-        let i = installed();
-        let c = Components {
-            base: None,
-            modules: BTreeMap::new(),
-            remove: ["a".to_string()].into(),
-        };
-        let mut m = bundle(2);
-        m.insert(REMOVE_KEY.into(), "a".into());
-        let next = Installed::after(Some(&i), &m, None, &c).unwrap();
-        assert!(next.modules.is_empty());
-        assert!(!next.refs().contains("r/a:sha256:1"));
-        assert!(!next.patch().unwrap().contains("a-data"));
-        let mf = next.manifest(&m, &c);
-        assert!(!mf.contains_key("MODULE_A") && !mf.contains_key(MODULES_KEY));
-        assert!(!mf.contains_key(REMOVE_KEY));
-    }
-
-    #[test]
-    fn a_bundle_with_a_base_replaces_the_base_and_keeps_the_modules() {
-        let i = installed();
-        let mut m = bundle(3);
+        let (mut m, c) = base_bundle(2);
         m.insert("TALOS_VERSION".into(), "v1.15.0".into());
-        let c = Components {
-            base: Some(["r/base:2".to_string()].into()),
-            ..Components::default()
-        };
-        let next = Installed::after(Some(&i), &m, Some(PATCH), &c).unwrap();
-        assert_eq!(next.base.refs, ["r/base:2".to_string()].into());
+        let next = Installed::after(Some(&i), &m, PATCH, &c).unwrap();
+        assert_eq!(next.base.refs, c.base);
         assert_eq!(next.base.manifest["TALOS_VERSION"], "v1.15.0");
-        assert!(!next.base.manifest.contains_key("INSTALLER_REF"));
         assert_eq!(next.modules, i.modules);
+        assert!(next.refs().contains("r/a:sha256:1"));
+        assert!(next.patch().unwrap().contains("name: a-data"));
+        let mf = next.manifest();
+        assert_eq!(mf[MODULES_KEY], "a");
+        assert_eq!(mf["MODULE_A"], "r/modules/a:1@sha256:1");
+        assert_eq!(mf["STACK_TAG"], "t2");
     }
 
     #[test]
-    fn an_older_part_is_refused_and_the_same_one_taken() {
+    fn an_older_base_is_refused_and_the_same_one_taken() {
         let i = installed();
-        let mut a = i.modules["a"].clone();
-        let c = |a: &Module| Components {
-            modules: [("a".to_string(), a.clone())].into(),
-            ..Components::default()
-        };
-        Installed::after(Some(&i), &bundle(1), None, &c(&a)).unwrap();
-        a.flux.push_str("# changed\n");
-        let e = Installed::after(Some(&i), &bundle(1), None, &c(&a)).unwrap_err();
-        assert!(
-            format!("{e:#}").contains("REFUSING A DOWNGRADE: the unit's a is version 1"),
-            "{e:#}"
-        );
-        a.epoch = 2;
-        assert_eq!(
-            Installed::after(Some(&i), &bundle(1), None, &c(&a))
-                .unwrap()
-                .modules["a"],
-            a
-        );
-
-        let (m, base) = base_bundle();
-        let patch = format!("{PATCH}---\n{VOLUME}");
-        Installed::after(Some(&i), &m, Some(&patch), &base).unwrap();
-        let mut older = m.clone();
-        older.insert("BUILT_EPOCH".into(), "0".into());
-        let e = Installed::after(Some(&i), &older, Some(&patch), &base).unwrap_err();
+        let (m, c) = base_bundle(1);
+        Installed::after(Some(&i), &m, PATCH, &c).unwrap();
+        let (older, c0) = base_bundle(0);
+        let e = Installed::after(Some(&i), &older, PATCH, &c0).unwrap_err();
         assert!(
             format!("{e:#}").contains("the unit's base is version 1"),
             "{e:#}"
@@ -605,41 +440,18 @@ mod tests {
     }
 
     #[test]
-    fn an_uninstall_drops_the_module_alone() {
-        let i = installed();
-        let next = i.without("a").unwrap();
-        assert!(next.modules.is_empty());
-        assert_eq!(next.base, i.base);
-        assert!(i.without("b").is_err());
-    }
-
-    #[test]
-    fn without_a_set_a_bundle_must_bring_a_base() {
-        let c = Components::default();
-        let e = Installed::after(None, &bundle(1), None, &c).unwrap_err();
-        assert!(
-            format!("{e:#}").contains("install a bundle with a base"),
-            "{e:#}"
-        );
-    }
-
-    #[test]
-    fn components_are_refused_when_they_contradict_themselves() {
-        let mut c = Components {
-            modules: [("a".to_string(), module("a", "sha256:1"))].into(),
-            remove: ["a".to_string()].into(),
-            ..Components::default()
-        };
-        assert!(c.check().is_err());
-        c.remove.clear();
-        c.modules.get_mut("a").unwrap().machine = "version: v1alpha1\n".into();
-        assert!(c.check().is_err());
-        c.modules.get_mut("a").unwrap().machine = VOLUME.into();
-        c.check().unwrap();
-        let mut b = module("b", "sha256:2");
-        b.manifest = c.modules["a"].manifest.clone();
-        c.modules.insert("b".into(), b);
-        assert!(c.check().is_err());
+    fn components_bringing_more_than_a_base_are_refused() {
+        let d = tempfile::tempdir().unwrap();
+        for json in [
+            r#"{"base": [], "modules": {}}"#,
+            r#"{"base": [], "remove": ["a"]}"#,
+            r#"{"modules": {}}"#,
+        ] {
+            std::fs::write(d.path().join(COMPONENTS), json).unwrap();
+            assert!(Components::read(d.path()).is_err(), "{json}");
+        }
+        std::fs::write(d.path().join(COMPONENTS), r#"{"base": ["r/a:1"]}"#).unwrap();
+        assert_eq!(Components::read(d.path()).unwrap().refs().len(), 1);
     }
 
     fn tgz(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -715,7 +527,10 @@ mod tests {
             serde_saphyr::from_str(&tree["modules/kustomization.yaml"]).unwrap();
         assert_eq!(k["kind"], "Component");
         assert_eq!(k["resources"][0], "a.yaml");
-        assert!(k.get("patches").is_none(), "a module patches nothing of edge's");
+        assert!(
+            k.get("patches").is_none(),
+            "a module patches nothing of edge's"
+        );
         let record: serde_json::Value =
             serde_saphyr::from_str(&tree["modules/installed.yaml"]).unwrap();
         assert_eq!(record["metadata"]["name"], "installed");

@@ -32,13 +32,6 @@ sha2 = "0.10"
 hex = "0.4"
 rustls.workspace = true
 base64 = "0.22"
-bytes.workspace = true
-http.workspace = true
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "webpki-tokio"] }
-form_urlencoded = "1"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]

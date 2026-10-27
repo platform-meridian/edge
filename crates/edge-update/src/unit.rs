@@ -33,6 +33,29 @@ pub trait Talos: Send + Sync {
     /// Points sd-boot back at the previous OS and reboots into it.
     async fn rollback(&self) -> anyhow::Result<()>;
     async fn shutdown(&self) -> anyhow::Result<()>;
+    /// The user volume `name`'s status; `None` while Talos has none.
+    async fn volume(&self, name: &str) -> anyhow::Result<Option<Volume>>;
+    /// Wipes the partition `device` (`/dev/sda7`), no volume using it, and
+    /// drops it from its disk.
+    async fn drop_partition(&self, device: &str) -> anyhow::Result<()>;
+}
+
+/// A user volume as Talos reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    pub phase: VolumePhase,
+    /// Its raw partition, `/dev/<name>`.
+    pub location: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VolumePhase {
+    /// Located, provisioned or prepared, not yet mounted.
+    Pending,
+    /// Mounted at its path.
+    Ready,
+    /// Why Talos could not make it.
+    Failed(String),
 }
 
 #[async_trait]
@@ -135,9 +158,6 @@ pub struct Settings {
     /// Sigstore's `trusted_root.json`.
     pub trusted_root: PathBuf,
     pub trust_policy: Policy,
-    /// A Docker `config.json` with registry logins for pulling apps.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_auth: Option<PathBuf>,
     /// The node path of the store log copied before an update.
     pub store: String,
     /// The node path of boot-commit's record of the boot it blessed.

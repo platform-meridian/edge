@@ -97,8 +97,7 @@ impl Build {
             manifest,
             patch: machineconfig::strip(&build_config()).unwrap(),
             components: Components {
-                base: Some(refs.iter().cloned().collect()),
-                ..Components::default()
+                base: refs.iter().cloned().collect(),
             },
             refs,
             images: dir.path().join("images"),
@@ -113,8 +112,8 @@ impl Build {
     fn contents(&self) -> Contents<'_> {
         Contents {
             manifest: &self.manifest,
-            patch: Some(&self.patch),
-            seed: Some("kind: ConfigMap\n"),
+            patch: &self.patch,
+            seed: "kind: ConfigMap\n",
             images: &self.images,
             notes: None,
             instance: None,
@@ -272,7 +271,7 @@ fn a_build_refuses_what_a_unit_would() {
     let out = b.path("b.tar");
     let full = build_config();
     let mut c = b.contents();
-    c.patch = Some(&full);
+    c.patch = &full;
     assert!(err(write(&c, signed_as(SIGNER), 0, &out)).contains("which the unit keeps"));
 
     let bad = Manifest::from([
@@ -299,9 +298,7 @@ fn a_build_refuses_what_a_unit_would() {
 fn full_and_partial_bundles_round_trip_in_the_one_format() {
     let b = Build::new();
     let mut partial = b.components.clone();
-    if let Some(base) = partial.base.as_mut() {
-        base.insert("registry.example/base:v1".into());
-    }
+    partial.base.insert("registry.example/base:v1".into());
     let unformatted: Manifest = b
         .manifest
         .iter()
@@ -346,8 +343,7 @@ fn the_components_must_name_every_carried_image() {
     let b = Build::new();
     let out = b.path("b.tar");
     let some = Components {
-        base: Some(["registry.example/base:v1".to_string()].into()),
-        ..Components::default()
+        base: ["registry.example/base:v1".to_string()].into(),
     };
     let mut c = b.contents();
     c.components = &some;

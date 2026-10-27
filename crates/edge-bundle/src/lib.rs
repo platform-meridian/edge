@@ -4,15 +4,17 @@
 //! unit's [`Trust`]. A bundle without the signature is taken only by a trust
 //! that allows it; its files are still checked against the sums.
 //!
-//! - `MANIFEST`: `KEY=value` lines. `FORMAT=5` ([`FORMAT`]); with a base,
-//!   `STACK_DIGEST`, `INSTALLER_REF` (by digest), `TALOS_VERSION`,
-//!   `BUILT_EPOCH` (the version the base's anti-rollback compares),
-//!   `SECUREBOOT`, optionally `STACK_PATH`, and `LOCK_<KEY>=v`, which the
-//!   unit's stack lock must match. A bundle without a base names neither.
-//! - `components.json`: what the bundle brings and removes ([`components`]).
-//! - `config-patch.yaml`, with a base: the machine config without what the
-//!   unit keeps (`machineconfig`).
-//! - `seed.yaml`, with a base: objects applied server-side before the stack moves.
+//! Every bundle is the unit's base: its OS and the stack. Apps are
+//! `MeridianApp`s, which the app controller installs, never a bundle.
+//!
+//! - `MANIFEST`: `KEY=value` lines. `FORMAT=5` ([`FORMAT`]), `STACK_DIGEST`,
+//!   `INSTALLER_REF` (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version
+//!   the base's anti-rollback compares), `SECUREBOOT`, optionally
+//!   `STACK_PATH`, and `LOCK_<KEY>=v`, which the unit's stack lock must match.
+//! - `components.json`: the base's refs ([`components`]).
+//! - `config-patch.yaml`: the machine config without what the unit keeps
+//!   (`machineconfig`).
+//! - `seed.yaml`: objects applied server-side before the stack moves.
 //! - `images/`: an OCI image layout holding images the components run, the
 //!   installer and the stack artifact, each named in its index by
 //!   `io.containerd.image.name` (`oci`). The unit must already hold any ref
@@ -24,9 +26,6 @@
 //! `MANIFEST` may also name the images a person cares about, one
 //! `COMPONENT_<NAME>=<ref> <digest> <version> dirty=<bool>` line each
 //! ([`components`]).
-//!
-//! An app is a bundle without a base that brings one module, also published
-//! as an OCI artifact whose one layer is the tar ([`APP_ARTIFACT`]).
 //!
 //! A build writes one with [`write`], or [`stage`] then [`seal`], signed
 //! between or not; a unit reads one with [`unpack`] and [`check`], or its signed
@@ -61,17 +60,8 @@ pub const IMAGES: &str = "images";
 pub const NOTES: &str = "NOTES.md";
 pub const INSTANCE: &str = "fluxinstance.yaml";
 
-/// An app's OCI `artifactType`, and the media type of its one layer, the tar.
-pub const APP_ARTIFACT: &str = "application/vnd.meridian.app.v1";
-pub const APP_LAYER: &str = "application/vnd.meridian.bundle.v1.tar";
-
 /// The one layout read and written: any other `FORMAT` is refused.
 pub const FORMAT: &str = "5";
-
-/// The bundle brings a base: its MANIFEST names the stack.
-pub fn has_base(m: &Manifest) -> bool {
-    m.contains_key("STACK_DIGEST")
-}
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIGNATURE: u64 = 64 << 10;
@@ -330,16 +320,11 @@ fn format_check(m: &Manifest) -> anyhow::Result<&'static [&'static str]> {
         !m.contains_key("STACK_TAG"),
         "the MANIFEST names a STACK_TAG: the unit names its releases"
     );
-    if has_base(m) {
-        return Ok(&[components::COMPONENTS, PATCH, SEED]);
-    }
-    if let Some(k) = m
-        .keys()
-        .find(|k| *k == "BUILT_EPOCH" || k.starts_with("LOCK_"))
-    {
-        bail!("a bundle without a base names {k}: only a base does");
-    }
-    Ok(&[components::COMPONENTS])
+    ensure!(
+        m.contains_key("STACK_DIGEST"),
+        "the MANIFEST names no STACK_DIGEST: a bundle is a base, and an app is a MeridianApp"
+    );
+    Ok(&[components::COMPONENTS, PATCH, SEED])
 }
 
 /// A bundle of another format is refused as that, before what it lacks for this one.
@@ -350,10 +335,6 @@ fn signed_format(sums: &Sums, m: &Manifest) -> anyhow::Result<()> {
             "the signed sums do not cover {need}"
         );
     }
-    ensure!(
-        has_base(m) || !sums.contains_key(Path::new(PATCH)),
-        "the bundle carries a config patch, and its MANIFEST names no STACK_DIGEST"
-    );
     Ok(())
 }
 
@@ -492,14 +473,10 @@ fn sync_fs(dir: &Path) -> anyhow::Result<()> {
 /// components and the layout's refs.
 pub fn check(dir: &Path) -> anyhow::Result<(components::Components, BTreeSet<String>)> {
     let c = components::Components::read(dir)?;
-    let manifest = parse_manifest(&std::fs::read_to_string(dir.join(MANIFEST))?)?;
-    ensure!(
-        has_base(&manifest) == c.base.is_some(),
-        "a bundle's MANIFEST names a STACK_DIGEST exactly when it brings a base"
-    );
-    if c.base.is_some() {
-        machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
-    }
+    format_check(&parse_manifest(&std::fs::read_to_string(
+        dir.join(MANIFEST),
+    )?)?)?;
+    machineconfig::check_patch(&std::fs::read_to_string(dir.join(PATCH))?)?;
     let carried = layout_refs(&dir.join(IMAGES))?;
     carries(&c, &carried)?;
     Ok((c, carried))
@@ -507,10 +484,7 @@ pub fn check(dir: &Path) -> anyhow::Result<(components::Components, BTreeSet<Str
 
 /// A carried image the components leave out would be imported, then collected.
 fn carries(c: &components::Components, carried: &BTreeSet<String>) -> anyhow::Result<()> {
-    ensure!(
-        c.base.is_none() || !carried.is_empty(),
-        "the image layout names no image"
-    );
+    ensure!(!carried.is_empty(), "the image layout names no image");
     let runs = c.refs();
     let missing: Vec<&str> = carried.difference(&runs).map(String::as_str).collect();
     ensure!(
@@ -524,16 +498,16 @@ fn carries(c: &components::Components, carried: &BTreeSet<String>) -> anyhow::Re
 /// What a build puts in a bundle.
 pub struct Contents<'a> {
     pub manifest: &'a Manifest,
-    /// From [`machineconfig::strip`]; a bundle without a base has none.
-    pub patch: Option<&'a str>,
-    pub seed: Option<&'a str>,
+    /// From [`machineconfig::strip`].
+    pub patch: &'a str,
+    pub seed: &'a str,
     /// An OCI image layout ([`oci::from_flat_cache`]).
     pub images: &'a Path,
     /// Release notes for a person: [`NOTES`].
     pub notes: Option<&'a str>,
     /// The FluxInstance the release runs on: [`INSTANCE`].
     pub instance: Option<&'a str>,
-    /// What the bundle brings: [`components::COMPONENTS`].
+    /// The base's refs: [`components::COMPONENTS`].
     pub components: &'a components::Components,
 }
 
@@ -620,14 +594,7 @@ pub fn seal(dir: &Path, signature: Option<&[u8]>, mtime: u64, out: &Path) -> any
 /// What a bundle of `contents` holds, by name. Refuses what a unit would.
 fn sources(contents: &Contents) -> anyhow::Result<BTreeMap<String, Source>> {
     let c = contents.components;
-    c.check()?;
-    let base = c.base.is_some();
-    match (contents.patch, contents.seed) {
-        (Some(p), Some(_)) if base => machineconfig::check_patch(p)?,
-        (None, None) if !base => {}
-        _ if base => bail!("a bundle with a base carries its config patch and seed"),
-        _ => bail!("a bundle without a base carries no config patch or seed"),
-    }
+    machineconfig::check_patch(contents.patch)?;
     if let Some(n) = contents.notes {
         ensure!(
             n.len() as u64 <= MAX_NOTES,
@@ -636,10 +603,6 @@ fn sources(contents: &Contents) -> anyhow::Result<BTreeMap<String, Source>> {
         );
     }
     carries(c, &layout_refs(contents.images)?)?;
-    ensure!(
-        has_base(contents.manifest) == base,
-        "a bundle's MANIFEST names a STACK_DIGEST exactly when it brings a base"
-    );
     let mut manifest = contents.manifest.clone();
     if let Some(f) = manifest.insert("FORMAT".into(), FORMAT.into()) {
         ensure!(
@@ -653,12 +616,11 @@ fn sources(contents: &Contents) -> anyhow::Result<BTreeMap<String, Source>> {
         MANIFEST.to_string(),
         Source::Bytes(render_manifest(&manifest)?.into_bytes()),
     );
-    if let Some(p) = contents.patch {
-        files.insert(PATCH.into(), Source::Bytes(p.as_bytes().into()));
-    }
-    if let Some(s) = contents.seed {
-        files.insert(SEED.into(), Source::Bytes(s.as_bytes().into()));
-    }
+    files.insert(
+        PATCH.into(),
+        Source::Bytes(contents.patch.as_bytes().into()),
+    );
+    files.insert(SEED.into(), Source::Bytes(contents.seed.as_bytes().into()));
     files.insert(
         components::COMPONENTS.into(),
         Source::Bytes(serde_json::to_vec_pretty(c)?),
@@ -961,132 +923,68 @@ mod tests {
         assert_eq!((carried.len(), components.refs().len()), (2, 3));
     }
 
-    fn empty_layout(dir: &Path) -> PathBuf {
-        let images = dir.join("images");
-        std::fs::create_dir_all(images.join("blobs/sha256")).unwrap();
-        std::fs::write(
-            images.join("index.json"),
-            r#"{"schemaVersion":2,"manifests":[]}"#,
-        )
-        .unwrap();
-        std::fs::write(images.join("oci-layout"), "{}").unwrap();
-        images
-    }
-
-    fn module() -> components::Module {
-        components::Module {
-            version: "v1.2.0".into(),
-            epoch: 7,
-            flux: "kind: Kustomization\n".into(),
-            ..Default::default()
-        }
+    /// The tree [`tree`] lays out, as what a build puts in a bundle.
+    fn with_contents(src: &Path, manifest: &Manifest, f: impl FnOnce(&Contents)) {
+        let c = components::Components::read(src).unwrap();
+        f(&Contents {
+            manifest,
+            patch: "version: v1alpha1\n",
+            seed: "",
+            images: &src.join(IMAGES),
+            notes: Some("# v1.2.0\n"),
+            instance: None,
+            components: &c,
+        })
     }
 
     #[test]
-    fn an_app_carries_no_patch_seed_or_base_facts() {
-        let d = tempfile::tempdir().unwrap();
-        let images = empty_layout(d.path());
-        let c = components::Components {
-            modules: [("app".to_string(), module())].into(),
-            ..Default::default()
-        };
-        let m = Manifest::new();
-        let contents = Contents {
-            manifest: &m,
-            patch: None,
-            seed: None,
-            images: &images,
-            notes: None,
-            instance: None,
-            components: &c,
-        };
-        let out = d.path().join("b.tar");
+    fn a_bundle_is_a_base() {
+        let c = Case::new();
+        let d = c.dir.path();
+        let out = d.join("b.tar");
         let signer = |s: &[u8]| Ok(sign(SIGNER, s));
-        write(&contents, signer, 1, &out).unwrap();
-        let dest = d.path().join("out");
-        let got = unpack(&out, &dest, &trust()).unwrap();
-        assert_eq!(got.manifest["FORMAT"], FORMAT);
-        assert!(!has_base(&got.manifest));
-        let (read, carried) = check(&dest).unwrap();
-        assert_eq!(read, c);
-        assert!(carried.is_empty());
-        assert!(!dest.join(PATCH).exists() && !dest.join(SEED).exists());
-
-        let patched = Contents {
-            patch: Some("version: v1alpha1\n"),
-            seed: Some(""),
-            ..contents
-        };
-        assert!(write(&patched, signer, 1, &out).is_err());
-        let based = components::Components {
-            base: Some(BTreeSet::new()),
-            ..c.clone()
-        };
-        let unpatched = Contents {
-            components: &based,
-            ..contents
-        };
-        assert!(write(&unpatched, signer, 1, &out).is_err());
-        for (k, v) in [
-            ("BUILT_EPOCH", "3"),
-            ("LOCK_PROFILE", "edge"),
-            ("STACK_TAG", "t"),
-        ] {
-            let named = Manifest::from([(k.into(), v.into())]);
-            let e = write(
-                &Contents {
-                    manifest: &named,
-                    ..contents
-                },
-                signer,
-                1,
-                &out,
-            )
-            .unwrap_err();
-            assert!(format!("{e:#}").contains(k), "{e:#}");
-        }
+        let app = Manifest::from([("MODULE_APP".into(), "r/app:1".into())]);
+        with_contents(&c.src(), &app, |contents| {
+            let e = write(contents, signer, 1, &out).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("an app is a MeridianApp"),
+                "{e:#}"
+            );
+        });
+        std::fs::write(c.src().join(MANIFEST), "FORMAT=5\nBUILT_EPOCH=2\n").unwrap();
+        sign_tree(&c.src(), SIGNER);
+        refused(&c, c.open(HEAD), "an app is a MeridianApp");
     }
 
     #[test]
     fn a_staged_bundle_seals_into_what_write_writes() {
-        let d = tempfile::tempdir().unwrap();
-        let images = empty_layout(d.path());
-        let c = components::Components {
-            modules: [("app".to_string(), module())].into(),
-            ..Default::default()
-        };
-        let m = Manifest::new();
-        let contents = Contents {
-            manifest: &m,
-            patch: None,
-            seed: None,
-            images: &images,
-            notes: Some("# v1.2.0\n"),
-            instance: None,
-            components: &c,
-        };
-        let staged = d.path().join("staged");
-        stage(&contents, &staged).unwrap();
-        assert!(stage(&contents, &staged).is_err(), "staged over");
-        let sums = std::fs::read(staged.join(SUMS)).unwrap();
-        let (sealed, written) = (d.path().join("sealed.tar"), d.path().join("written.tar"));
-        seal(&staged, Some(&sign(SIGNER, &sums)), 7, &sealed).unwrap();
-        write(&contents, |s| Ok(sign(SIGNER, s)), 7, &written).unwrap();
-        assert_eq!(
-            std::fs::read(&sealed).unwrap(),
-            std::fs::read(&written).unwrap()
-        );
-        let u = unpack(&sealed, &d.path().join("out"), &trust()).unwrap();
-        assert_eq!(u.signer, SIGNER);
+        let c = Case::new();
+        let d = c.dir.path();
+        let m = parse_manifest("STACK_DIGEST=sha256:00\nBUILT_EPOCH=2\n").unwrap();
+        with_contents(&c.src(), &m, |contents| {
+            let staged = d.join("staged");
+            stage(contents, &staged).unwrap();
+            assert!(stage(contents, &staged).is_err(), "staged over");
+            let sums = std::fs::read(staged.join(SUMS)).unwrap();
+            let (sealed, written) = (d.join("sealed.tar"), d.join("written.tar"));
+            seal(&staged, Some(&sign(SIGNER, &sums)), 7, &sealed).unwrap();
+            write(contents, |s| Ok(sign(SIGNER, s)), 7, &written).unwrap();
+            assert_eq!(
+                std::fs::read(&sealed).unwrap(),
+                std::fs::read(&written).unwrap()
+            );
+            let u = unpack(&sealed, &d.join("unpacked"), &trust()).unwrap();
+            assert_eq!(u.signer, SIGNER);
 
-        let unsigned = d.path().join("unsigned.tar");
-        seal(&staged, None, 7, &unsigned).unwrap();
-        let e = unpack(&unsigned, &d.path().join("refused"), &trust()).unwrap_err();
-        assert!(format!("{e:#}").contains("unsigned"), "{e:#}");
+            let unsigned = d.join("unsigned.tar");
+            seal(&staged, None, 7, &unsigned).unwrap();
+            let e = unpack(&unsigned, &d.join("refused"), &trust()).unwrap_err();
+            assert!(format!("{e:#}").contains("unsigned"), "{e:#}");
 
-        std::fs::write(staged.join(NOTES), "# edited\n").unwrap();
-        let e = seal(&staged, Some(&sign(SIGNER, &sums)), 7, &sealed).unwrap_err();
-        assert!(format!("{e:#}").contains("stage it again"), "{e:#}");
+            std::fs::write(staged.join(NOTES), "# edited\n").unwrap();
+            let e = seal(&staged, Some(&sign(SIGNER, &sums)), 7, &sealed).unwrap_err();
+            assert!(format!("{e:#}").contains("stage it again"), "{e:#}");
+        });
     }
 
     #[test]
@@ -1101,7 +999,7 @@ mod tests {
                 "FORMAT=5\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\n",
                 "the unit names its releases",
             ),
-            ("FORMAT=5\nLOCK_PROFILE=edge\n", "names LOCK_PROFILE"),
+            ("FORMAT=5\nLOCK_PROFILE=edge\n", "names no STACK_DIGEST"),
         ] {
             let c = Case::new();
             std::fs::write(c.src().join(MANIFEST), mf).unwrap();
