@@ -1,0 +1,60 @@
+---
+kind: NetworkRuleConfig
+name: management
+portSelector:
+  ports:
+  - 50000
+  - 6443
+  protocol: tcp
+---
+kind: NetworkDefaultActionConfig
+---
+kind: NetworkRuleConfig
+name: cluster-tcp
+portSelector:
+  ports:
+  - 1-65535
+  protocol: tcp
+---
+kind: NetworkRuleConfig
+name: cluster-udp
+portSelector:
+  ports:
+  - 1-65535
+  protocol: udp
+---
+kind: NetworkRuleConfig
+name: console-tcp
+portSelector:
+  ports:
+  - 443
+  protocol: tcp
+---
+kind: NetworkRuleConfig
+name: console-udp
+portSelector:
+  ports:
+  - 443
+  protocol: udp
+---
+kind: NetworkRuleConfig
+name: operator-tcp
+portSelector:
+  ports:
+  - 50000
+  - 6443
+  protocol: tcp
+---
+kind: NetworkRuleConfig
+name: operator-udp
+portSelector:
+  ports:
+  - 53
+  protocol: udp
+---
+kind: NetworkRuleConfig
+name: operator-dhcp
+portSelector:
+  ports:
+  - 67
+  protocol: udp

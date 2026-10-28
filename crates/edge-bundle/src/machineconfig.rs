@@ -1,11 +1,16 @@
 //! A bundle carries the build's machine config without the unit's secrets and
 //! identity (a patch). The unit's next config is the patch with the unit's own
-//! material put back, so the unit's secrets never travel.
+//! material put back, so the unit's secrets never travel. Its ingress
+//! firewall is neither: it is derived from the config itself ([`with_firewall`]).
 
 use anyhow::{Context, bail, ensure};
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
+
+mod firewall;
+
+pub use firewall::management;
 
 /// In the v1alpha1 document. Secrets, then the unit's identity.
 const V1_HELD: &[&[&str]] = &[
@@ -63,8 +68,12 @@ const HELD_KINDS: &[&str] = &[
     "RoutingRuleConfig",
 ];
 
-/// Named documents the unit keeps: edge-dhcp's, with the unit's LAN address and domain.
-const HELD_NAMED: &[(&str, &str)] = &[("ExtensionServiceConfig", "operator-lan")];
+/// Named documents the unit keeps: edge-dhcp's, with the unit's LAN address
+/// and domain, and the firewall's rule for the networks it is managed from.
+const HELD_NAMED: &[(&str, &str)] = &[
+    ("ExtensionServiceConfig", "operator-lan"),
+    ("NetworkRuleConfig", firewall::MANAGEMENT),
+];
 
 /// Volumes a merge drops whole, keys and all, when the build stops rendering them.
 const DROPPED_WHOLE: &[&str] = &["UserVolumeConfig", "RawVolumeConfig", "SwapVolumeConfig"];
@@ -272,10 +281,11 @@ fn describe(k: &Key) -> String {
     }
 }
 
-/// What the unit keeps, for building a patch: the rest of `full`.
+/// What the unit keeps, for building a patch: the rest of `full`, without
+/// the firewall, which the unit derives.
 pub fn strip(full: &str) -> anyhow::Result<String> {
     let mut docs = parse(full)?;
-    docs.retain(|(k, _)| !held_kind(k));
+    docs.retain(|(k, _)| !held_kind(k) && !firewall::is(k));
     for (k, doc) in &mut docs {
         if *k == Key::V1alpha1 {
             for path in V1_HELD {
@@ -300,6 +310,11 @@ pub fn check_patch(patch: &str) -> anyhow::Result<()> {
         ensure!(
             !held_kind(k),
             "the patch carries {}, which the unit keeps",
+            describe(k)
+        );
+        ensure!(
+            !firewall::is(k),
+            "the patch carries {}, which the unit derives",
             describe(k)
         );
         if *k == Key::V1alpha1 {
@@ -419,7 +434,19 @@ pub fn merge(unit: &str, patch: &str) -> anyhow::Result<String> {
     if expected != held(&out) {
         bail!("merging would change what the unit keeps");
     }
+    out.retain(|(k, _)| !firewall::is(k));
+    out.extend(firewall::derive(&out)?);
     render(&out)
+}
+
+/// `config` with its ingress firewall derived from it (the `firewall` module): a
+/// config as provisioning renders it, and as every merge leaves it. Any
+/// firewall it held is replaced.
+pub fn with_firewall(config: &str) -> anyhow::Result<String> {
+    let mut docs = parse(config)?;
+    docs.retain(|(k, _)| !firewall::is(k));
+    docs.extend(firewall::derive(&docs)?);
+    render(&docs)
 }
 
 /// Patches as one; a document two of them carry is refused.
@@ -832,13 +859,134 @@ image: kubelet:new
             assert!(!patch.contains(secret), "{secret} survived strip:\n{patch}");
         }
         assert!(patch.contains("store:old") && patch.contains("apiserver:old"));
-        // Merging a unit's own stripped config gives it back unchanged.
+        // Merging a unit's own stripped config gives it back unchanged, with
+        // the firewall it derives.
         let back = parse(&merge(UNIT, &patch).unwrap()).unwrap();
-        let unit = parse(UNIT).unwrap();
+        let unit = parse(&with_firewall(UNIT).unwrap()).unwrap();
         assert_eq!(back.len(), unit.len());
         for kv in &unit {
             assert!(back.contains(kv), "{:?}", kv.0);
         }
+    }
+
+    /// A unit as provisioning renders it: managed from its island.
+    const ISLAND: &str = r#"version: v1alpha1
+machine:
+  network:
+    interfaces:
+      - deviceSelector: {busPath: "0000:02:00.0"}
+        dhcp: true
+      - deviceSelector: {busPath: "0000:01:00.0"}
+        addresses: [10.50.0.1/24, fe80::ed6e:1/64]
+        dhcp: false
+      - interface: dummy1
+        dummy: true
+        addresses: [10.70.0.1/32]
+---
+apiVersion: v1alpha1
+kind: KubeClusterConfig
+endpoint: https://10.50.0.1:6443
+---
+apiVersion: v1alpha1
+kind: KubeNetworkConfig
+podSubnets: [10.244.0.0/16]
+serviceSubnets: [10.96.0.0/12]
+"#;
+
+    fn rule(docs: &[(Key, Value)], name: &str) -> (Value, Vec<String>) {
+        let r = doc(docs, "NetworkRuleConfig", name).unwrap_or_else(|| panic!("no {name}"));
+        let from = r["ingress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["subnet"].as_str().unwrap().to_string())
+            .collect();
+        (r["portSelector"].clone(), from)
+    }
+
+    #[test]
+    fn the_firewall_denies_all_but_what_it_derives() {
+        let out = parse(&with_firewall(ISLAND).unwrap()).unwrap();
+        let block = doc(&out, "NetworkDefaultActionConfig", "").unwrap();
+        assert_eq!(block["ingress"], json!("block"));
+        let names: Vec<_> = out
+            .iter()
+            .filter_map(|(k, _)| match k {
+                Key::Typed(kind, name) if kind == "NetworkRuleConfig" => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cluster-tcp",
+                "cluster-udp",
+                "console-tcp",
+                "console-udp",
+                "operator-tcp",
+                "operator-udp",
+                "operator-dhcp"
+            ]
+        );
+        let pods = ["10.244.0.0/16", "10.96.0.0/12"].map(String::from).to_vec();
+        let all = json!(["1-65535"]);
+        assert_eq!(
+            rule(&out, "cluster-udp"),
+            (json!({"ports": all, "protocol": "udp"}), pods)
+        );
+        let anywhere = ["0.0.0.0/0", "::/0"].map(String::from).to_vec();
+        assert_eq!(
+            rule(&out, "console-udp"),
+            (json!({"ports": [443], "protocol": "udp"}), anywhere)
+        );
+        // The island's network, not its address; the management port's lease
+        // and the dummy links are none of it.
+        assert_eq!(
+            rule(&out, "operator-tcp"),
+            (
+                json!({"ports": [50000, 6443], "protocol": "tcp"}),
+                ["10.50.0.0/24", "fe80::/10"].map(String::from).to_vec()
+            )
+        );
+        assert_eq!(
+            rule(&out, "operator-dhcp").1,
+            ["0.0.0.0/32", "10.50.0.0/24"]
+        );
+    }
+
+    #[test]
+    fn the_firewall_is_the_units_own_never_a_patchs() {
+        // Derived again, not kept: a merge replaces what the unit held.
+        let mut unit = with_firewall(&format!(
+            "{UNIT}---\n{}",
+            ISLAND.split_once("---\n").unwrap().1
+        ))
+        .unwrap();
+        unit.push_str("---\napiVersion: v1alpha1\nkind: NetworkRuleConfig\nname: by-hand\nportSelector: {ports: [7600], protocol: udp}\ningress: [{subnet: 0.0.0.0/0}]\n");
+        let managed = management(&["192.168.122.71/24".into()], 6443).unwrap();
+        unit.push_str(&format!(
+            "---\n{}",
+            serde_saphyr::to_string(&managed).unwrap()
+        ));
+        let out = parse(&merge(&unit, PATCH).unwrap()).unwrap();
+        assert!(doc(&out, "NetworkRuleConfig", "by-hand").is_none());
+        assert_eq!(rule(&out, "operator-tcp").0["ports"], json!([50000, 6443]));
+        // The networks it is managed from are the unit's, kept as they are.
+        assert_eq!(rule(&out, "management").1, ["192.168.122.0/24"]);
+        let e = check_patch(&format!(
+            "{PATCH}---\n{}",
+            serde_saphyr::to_string(&managed).unwrap()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("which the unit keeps"), "{e}");
+        // A patch never carries one, and a stripped config holds none.
+        let carried = format!(
+            "{PATCH}---\napiVersion: v1alpha1\nkind: NetworkDefaultActionConfig\ningress: accept\n"
+        );
+        let e = check_patch(&carried).unwrap_err().to_string();
+        assert!(e.contains("which the unit derives"), "{e}");
+        assert!(!strip(&unit).unwrap().contains("NetworkRuleConfig"));
     }
 
     #[test]

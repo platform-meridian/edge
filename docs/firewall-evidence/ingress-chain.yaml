@@ -1,0 +1,195 @@
+node: 192.168.122.151
+metadata:
+    namespace: network
+    type: NfTablesChains.net.talos.dev
+    id: ingress
+    version: 1
+    owner: network.NfTablesChainConfigController
+    phase: running
+    created: 2026-10-28T02:15:38Z
+    updated: 2026-10-28T02:15:38Z
+spec:
+    type: filter
+    hook: input
+    priority: NfTablesChainPriority(-140)
+    policy: drop
+    rules:
+        - matchIIfName:
+            interfaceName:
+                - lo
+                - siderolink
+                - kubespan
+            operator: ==
+          anonymousCounter: true
+          verdict: accept
+        - matchConntrackState:
+            states:
+                - established
+                - related
+          anonymousCounter: true
+          verdict: accept
+        - matchConntrackState:
+            states:
+                - invalid
+          anonymousCounter: true
+          verdict: drop
+        - matchLayer4:
+            protocol: icmp
+            matchICMPType:
+                types:
+                    - 13
+                    - 14
+                    - 17
+                    - 18
+          anonymousCounter: true
+          verdict: drop
+        - matchLayer4:
+            protocol: icmp
+          matchLimit:
+            packetRatePerSecond: 5
+          anonymousCounter: true
+          verdict: accept
+        - matchLayer4:
+            protocol: icmpv6
+          matchLimit:
+            packetRatePerSecond: 5
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.244.0.0/16
+                - 10.96.0.0/12
+          matchDestinationAddress:
+            includeSubnets:
+                - 169.254.116.108/32
+          matchLayer4:
+            protocol: udp
+            matchDestinationPort:
+                ranges:
+                    - lo: 53
+                      hi: 53
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.244.0.0/16
+                - 10.96.0.0/12
+          matchDestinationAddress:
+            includeSubnets:
+                - 169.254.116.108/32
+          matchLayer4:
+            protocol: tcp
+            matchDestinationPort:
+                ranges:
+                    - lo: 53
+                      hi: 53
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.244.0.0/16
+                - 10.96.0.0/12
+          matchDestinationAddress:
+            includeSubnets:
+                - 10.244.0.0/16
+                - 10.96.0.0/12
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 192.168.122.0/24
+          matchLayer4:
+            protocol: tcp
+            matchDestinationPort:
+                ranges:
+                    - lo: 6443
+                      hi: 6443
+                    - lo: 50000
+                      hi: 50000
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.244.0.0/16
+                - 10.96.0.0/12
+          matchLayer4:
+            protocol: tcp
+            matchDestinationPort:
+                ranges:
+                    - lo: 1
+                      hi: 65535
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.244.0.0/16
+                - 10.96.0.0/12
+          matchLayer4:
+            protocol: udp
+            matchDestinationPort:
+                ranges:
+                    - lo: 1
+                      hi: 65535
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 0.0.0.0/0
+                - ::/0
+          matchLayer4:
+            protocol: tcp
+            matchDestinationPort:
+                ranges:
+                    - lo: 443
+                      hi: 443
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 0.0.0.0/0
+                - ::/0
+          matchLayer4:
+            protocol: udp
+            matchDestinationPort:
+                ranges:
+                    - lo: 443
+                      hi: 443
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.51.0.0/24
+                - fe80::/10
+          matchLayer4:
+            protocol: tcp
+            matchDestinationPort:
+                ranges:
+                    - lo: 6443
+                      hi: 6443
+                    - lo: 50000
+                      hi: 50000
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 10.51.0.0/24
+          matchLayer4:
+            protocol: udp
+            matchDestinationPort:
+                ranges:
+                    - lo: 53
+                      hi: 53
+          anonymousCounter: true
+          verdict: accept
+        - matchSourceAddress:
+            includeSubnets:
+                - 0.0.0.0/32
+                - 10.51.0.0/24
+          matchLayer4:
+            protocol: udp
+            matchDestinationPort:
+                ranges:
+                    - lo: 67
+                      hi: 67
+          anonymousCounter: true
+          verdict: accept
