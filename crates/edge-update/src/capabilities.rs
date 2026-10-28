@@ -1,11 +1,12 @@
 //! The node's capabilities (ADR-0015 §2): what the host offers that an app
 //! can need, each the node label `capability.platform.meridian/<name>`,
-//! which the app controller's requirement check matches. The names are
+//! which the platform controller's requirement check matches. The names are
 //! `meridian_app`'s closed set (core's `artifact::Capability`).
 //!
-//! On the appliance two are the appliance's by construction: the storage
-//! provisioner (`crate::volumes`) serves the default class, and the
-//! appliance runs its mission path host-networked. Two are the hardware's,
+//! On the appliance three are the appliance's by construction: the storage
+//! provisioner (`crate::volumes`) serves the default class, the appliance
+//! runs its mission path host-networked, and the edge application
+//! administers the host it is on (`host-admin`). Two are the hardware's,
 //! read from the host's sysfs: a serial port, and a GPU.
 //!
 //! Applied server-side under one field manager, so a capability the host no
@@ -26,6 +27,7 @@ const EVERY: Duration = Duration::from_secs(300);
 pub enum Capability {
     PersistentStorage,
     HostNetwork,
+    HostAdmin,
     SerialDevices,
     Gpu,
 }
@@ -35,6 +37,7 @@ impl Capability {
         match self {
             Capability::PersistentStorage => "persistent-storage",
             Capability::HostNetwork => "host-network",
+            Capability::HostAdmin => "host-admin",
             Capability::SerialDevices => "serial-devices",
             Capability::Gpu => "gpu",
         }
@@ -51,7 +54,11 @@ const GPU_VENDORS: &[&str] = &["0x10de", "0x1002", "0x8086"];
 
 /// What the host at `sys` (its `/sys`) offers.
 pub fn offered(sys: &Path) -> Vec<Capability> {
-    let mut out = vec![Capability::PersistentStorage, Capability::HostNetwork];
+    let mut out = vec![
+        Capability::PersistentStorage,
+        Capability::HostNetwork,
+        Capability::HostAdmin,
+    ];
     if serial(sys) {
         out.push(Capability::SerialDevices);
     }
@@ -147,16 +154,15 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_host_offers_storage_and_host_networking() {
+    fn a_bare_host_offers_storage_host_networking_and_its_administration() {
         let d = sys();
-        assert_eq!(
-            offered(d.path()),
-            [Capability::PersistentStorage, Capability::HostNetwork]
-        );
-        assert_eq!(
-            offered(&d.path().join("absent")),
-            [Capability::PersistentStorage, Capability::HostNetwork]
-        );
+        let bare = [
+            Capability::PersistentStorage,
+            Capability::HostNetwork,
+            Capability::HostAdmin,
+        ];
+        assert_eq!(offered(d.path()), bare);
+        assert_eq!(offered(&d.path().join("absent")), bare);
     }
 
     #[test]
@@ -194,6 +200,7 @@ mod tests {
         for (c, name) in [
             (Capability::PersistentStorage, "persistent-storage"),
             (Capability::HostNetwork, "host-network"),
+            (Capability::HostAdmin, "host-admin"),
             (Capability::SerialDevices, "serial-devices"),
             (Capability::Gpu, "gpu"),
         ] {

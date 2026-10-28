@@ -2,7 +2,7 @@
 
 Verifies signed bundles (`edge-bundle`), each the unit's base (its OS and
 stack), and applies them to the unit it runs on, through the node's Talos API
-and the cluster's Flux. Apps are `MeridianApp`s, which the app controller
+and the cluster's Flux. Apps are `MeridianApp`s, which the platform controller
 installs (ADR-0015); a bundle brings none. The API is
 `proto/edge/update/v1/update.proto`; a console reaches it through whatever
 fronts the unit.
@@ -169,9 +169,10 @@ wiped and dropped, then the PersistentVolume deleted. Under `Retain` it stays.
 ## Capabilities
 
 edge-update labels its node `capability.platform.meridian/<name>: "true"` for
-each capability the host offers, as the app controller's requirement check
-reads them (`meridian_app`'s closed set): `persistent-storage` and
-`host-network` always, `serial-devices` for a USB or ACM serial adapter or a
+each capability the host offers, as the platform controller's requirement check
+reads them (`meridian_app`'s closed set): `persistent-storage`,
+`host-network` and `host-admin` (the edge application administers the unit)
+always, `serial-devices` for a USB or ACM serial adapter or a
 UART that is there, `gpu` for an NVIDIA, AMD or Intel display controller. The
 labels are applied server-side under one field manager, so one the host stops
 offering goes.
