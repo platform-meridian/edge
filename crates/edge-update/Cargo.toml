@@ -25,7 +25,7 @@ k8s-openapi.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tonic-prost.workspace = true
 prost.workspace = true
-connectrpc = { version = "0.9", default-features = false, features = ["server", "client", "gzip"] }
+connectrpc = { version = "0.9", default-features = false, features = ["server", "client"] }
 connectrpc-health = { version = "0.9", default-features = false }
 buffa = "0.9"
 sha2 = "0.10"

@@ -163,7 +163,9 @@ async fn serve() -> anyhow::Result<()> {
     let (publish, status) = watch::channel(Snapshot::default());
     let service = Arc::new(api::Service::new(tx, status, engine.uploads()));
     let listen = env("EDGE_UPDATE_LISTEN", "127.0.0.1:7443");
+    // No codec: the API is on loopback, where compression only costs CPU.
     let rpc = connectrpc::ConnectRpcService::new(service.register(connectrpc::Router::new()))
+        .with_compression(connectrpc::CompressionRegistry::new())
         .with_limits(
             connectrpc::Limits::default()
                 .with_max_message_size(8 << 20)
@@ -200,7 +202,9 @@ async fn serve_health(listen: String, router: connectrpc::Router) {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(5));
     };
-    if let Err(e) = bound.serve(router).await {
+    let service = connectrpc::ConnectRpcService::new(router)
+        .with_compression(connectrpc::CompressionRegistry::new());
+    if let Err(e) = bound.serve_with_service(service).await {
         tracing::error!(error = %e, "the health service stopped");
     }
 }
