@@ -11,7 +11,7 @@ edge-common = { path = "../edge-common" }
 anyhow.workspace = true
 bytes.workspace = true
 form_urlencoded = "1"
-jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 pem = "3"
 futures.workspace = true
 http.workspace = true
