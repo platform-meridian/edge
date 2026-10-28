@@ -125,9 +125,6 @@ pub struct Release {
     /// The stack its set was composed on.
     #[serde(default)]
     pub composed_on: Option<String>,
-    /// Each ref of the installed set and what it belongs to: `base` or a module.
-    #[serde(default)]
-    pub owners: BTreeMap<String, String>,
 }
 
 /// A unit's installed set, and the stack composed for it.
@@ -148,7 +145,7 @@ impl Release {
         &self.id
     }
     pub fn components(&self) -> Vec<Component> {
-        diff::of_release(&self.manifest, &self.refs, &self.images, &self.owners)
+        diff::of_release(&self.manifest, &self.refs, &self.images)
     }
 }
 
@@ -280,8 +277,6 @@ pub struct Unit {
     pub components: Vec<Component>,
     /// The running release's MANIFEST, if this engine applied it.
     pub manifest: Manifest,
-    /// The modules installed: the running release's, else as the stack records them.
-    pub modules: BTreeSet<String>,
     pub judge: Judge,
 }
 
@@ -724,31 +719,20 @@ impl Engine {
         }
         match self.record.running(&self.unit.stack_tag) {
             Some(r) => {
-                let modules = words(r.manifest.get(components::MODULES_KEY));
                 let u = &mut self.unit;
-                (u.components, u.manifest, u.modules) =
-                    (r.components(), r.manifest.clone(), modules);
+                (u.components, u.manifest) = (r.components(), r.manifest.clone());
             }
-            None => {
-                match self.cluster.images_in_use().await {
-                    Ok(refs) => {
-                        let registry = &self.registry;
-                        self.unit.components = diff::of_refs(&refs, |r| registry.digest(r));
-                        self.unit.manifest.clear();
-                    }
-                    Err(e) => tracing::debug!(
-                        error = format!("{e:#}"),
-                        "could not read what the unit runs"
-                    ),
+            None => match self.cluster.images_in_use().await {
+                Ok(refs) => {
+                    let registry = &self.registry;
+                    self.unit.components = diff::of_refs(&refs, |r| registry.digest(r));
+                    self.unit.manifest.clear();
                 }
-                match self.recorded_modules().await {
-                    Ok(m) => self.unit.modules = words(m.as_ref()),
-                    Err(e) => tracing::debug!(
-                        error = format!("{e:#}"),
-                        "could not read the stack's record of its modules"
-                    ),
-                }
-            }
+                Err(e) => tracing::debug!(
+                    error = format!("{e:#}"),
+                    "could not read what the unit runs"
+                ),
+            },
         }
         self.unit != was
     }
@@ -1074,9 +1058,6 @@ impl Engine {
             r.strip_prefix(repo.as_str())
                 .is_some_and(|t| t.starts_with([':', '@']))
         };
-        rel.owners = owners(&next);
-        rel.owners.retain(|r, _| !base_stack(r));
-        rel.owners.insert(name.clone(), "base".into());
         rel.images.retain(|r, _| !base_stack(r));
         rel.images.insert(name.clone(), stack.clone());
         rel.refs = next.refs();
@@ -2338,20 +2319,6 @@ impl Engine {
     }
 }
 
-/// Each ref of `set` and what it belongs to: a module's own, else the base's.
-fn owners(set: &Installed) -> BTreeMap<String, String> {
-    let base = set
-        .base
-        .refs
-        .iter()
-        .map(|r| (r.clone(), "base".to_string()));
-    let modules = set
-        .modules
-        .iter()
-        .flat_map(|(name, m)| m.refs.iter().map(|r| (r.clone(), name.clone())));
-    base.chain(modules).collect()
-}
-
 /// The stack trial the unit follows that nothing ends by itself: unhealthy,
 /// with no good release for its judge, or this engine, to roll back to.
 pub fn stuck_trial(r: &Record, on: &str, j: &Judge) -> Option<String> {
@@ -2376,12 +2343,6 @@ pub fn stuck_trial(r: &Record, on: &str, j: &Judge) -> Option<String> {
 
 fn ended(trial: &str) -> String {
     format!("{trial} stayed unhealthy with no good release to roll back to; a new bundle took over")
-}
-
-fn words(s: Option<&String>) -> BTreeSet<String> {
-    s.map_or(BTreeSet::new(), |s| {
-        s.split_whitespace().map(String::from).collect()
-    })
 }
 
 fn from(by: &str) -> String {

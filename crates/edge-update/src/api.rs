@@ -188,7 +188,6 @@ fn component(c: &Component) -> pb::Component {
         digest: c.digest.clone(),
         dirty: c.dirty,
         carried: c.carried,
-        owner: c.owner.clone(),
         ..Default::default()
     }
 }
@@ -281,7 +280,6 @@ fn unit(u: &Unit) -> pb::Unit {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        modules: u.modules.iter().cloned().collect(),
         ..Default::default()
     }
 }
@@ -1213,7 +1211,6 @@ mod tests {
             digest: format!("sha256:{v}"),
             dirty: v == "2",
             carried: v == "2",
-            owner: "gw".into(),
         };
         let r = Release {
             id: "s2".into(),
@@ -1228,7 +1225,6 @@ mod tests {
             notes: Some("notes".into()),
             signer: "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v2".into(),
             images: [("r.io/app:2".to_string(), "sha256:2".to_string())].into(),
-            owners: [("r.io/app:2".to_string(), "gw".to_string())].into(),
             checks: vec![
                 Check::new("space", CheckState::Fail, "full"),
                 Check::new("reboot", CheckState::Note, "needed"),
@@ -1315,25 +1311,14 @@ mod tests {
             ),
             ("1", "2", "sha256:2", "r.io/app:2", true, false)
         );
-        assert_eq!(
-            (to.carried, from.carried, to.owner.as_str()),
-            (true, false, "gw")
-        );
+        assert_eq!((to.carried, from.carried), (true, false));
         assert_eq!(to.kind, pb::ComponentKind::COMPONENT_KIND_IMAGE);
         let comps: Vec<_> = p
             .components
             .iter()
-            .map(|c| {
-                (
-                    c.name.as_str(),
-                    c.version.as_str(),
-                    c.dirty,
-                    c.carried,
-                    c.owner.as_str(),
-                )
-            })
+            .map(|c| (c.name.as_str(), c.version.as_str(), c.dirty, c.carried))
             .collect();
-        assert_eq!(comps, [("app", "2", true, true, "gw")]);
+        assert_eq!(comps, [("app", "2", true, true)]);
         for (ch, want) in [
             (Change::Unchanged, pb::Change::CHANGE_UNCHANGED),
             (Change::Added, pb::Change::CHANGE_ADDED),
@@ -1362,10 +1347,8 @@ mod tests {
                 ..Component::default()
             }],
             manifest: [("GIT_REV".to_string(), "abc".to_string())].into(),
-            modules: ["esm".to_string(), "gw".into()].into(),
             ..Unit::default()
         });
-        assert_eq!(u.modules, ["esm", "gw"]);
         assert_eq!(
             (
                 u.installer.as_str(),

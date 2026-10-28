@@ -337,8 +337,6 @@ message Check {
 enum ComponentKind {
   COMPONENT_KIND_UNSPECIFIED = 0;
   COMPONENT_KIND_IMAGE = 1;
-  // An optional part a unit installs or removes on its own.
-  COMPONENT_KIND_MODULE = 2;
 }
 
 // A part of the system a person tracks by version.
@@ -354,8 +352,6 @@ message Component {
   bool dirty = 6;
   // The release's bundle carries it; else the unit holds it already.
   bool carried = 7;
-  // What it belongs to: "base", a module's name, or empty if unknown.
-  string owner = 8;
 }
 
 enum Change {
@@ -413,9 +409,6 @@ message Unit {
   repeated Component components = 10;
   // The MANIFEST of the release the unit runs, if this engine applied it.
   map<string, string> manifest = 11;
-  // The modules the stack runs until they are MeridianApps: the running
-  // release's, else as the stack records them. A base update carries them.
-  repeated string modules = 12;
 }
 
 message Release {

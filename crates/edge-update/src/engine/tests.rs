@@ -2646,8 +2646,6 @@ async fn a_rolled_back_base_leaves_the_set_it_was_composed_on() {
     let e = h.update(&next_base("update-b"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert_eq!(h.w().tag, "update-a");
-    h.e().refresh_unit().await;
-    assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
 
     h.w().verdict = Verdict::Good;
     let s = Spec {
@@ -2693,37 +2691,6 @@ async fn with_no_recorded_set_a_base_is_taken_only_by_a_unit_running_no_module()
         "this unit's installed modules are unknown",
     )
     .await;
-}
-
-#[tokio::test]
-async fn a_release_says_who_owns_each_image() {
-    let mut h = with_a().await;
-    assert!(h.verify(&next_base("update-b")).await.is_none());
-    let r = h.e().release().unwrap().clone();
-    let of = |name: &str| {
-        r.components()
-            .into_iter()
-            .find(|c| c.name == name)
-            .unwrap_or_else(|| panic!("no {name}"))
-    };
-    let (a, app) = (of("reg/a"), of("reg/app"));
-    assert_eq!((a.owner.as_str(), a.carried), ("a", false));
-    assert_eq!((app.owner.as_str(), app.carried), ("base", true));
-}
-
-#[tokio::test]
-async fn the_units_modules_are_its_releases_else_as_its_stack_records_them() {
-    let mut h = Harness::new();
-    h.w().modules = BTreeMap::from([("MODULES".into(), "x y".into())]);
-    h.e().refresh_unit().await;
-    assert_eq!(
-        h.e().unit.modules,
-        BTreeSet::from(["x".to_string(), "y".into()])
-    );
-    let mut h = with_a().await;
-    h.w().modules = BTreeMap::from([("MODULES".into(), "stale".into())]);
-    h.e().refresh_unit().await;
-    assert_eq!(h.e().unit.modules, BTreeSet::from(["a".to_string()]));
 }
 
 #[tokio::test]

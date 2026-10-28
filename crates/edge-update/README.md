@@ -83,10 +83,9 @@ components) are checked at verify and again at apply.
 ## What runs, and what a release changes
 
 `Unit.components` lists what runs: the images of the release the unit runs,
-if this engine applied it, else the images its workloads name. `Unit.modules`
-lists the modules installed: the running release's, else as `stack.modules`
-records them. On
-verification, `Release.diff` compares that with the release, image by image
+if this engine applied it, else the images its workloads name. A release
+says the base's version, never an app's: an app is a MeridianApp, its version
+its own release, which the platform-controller reports. On verification, `Release.diff` compares that with the release, image by image
 (an image is its repository without registry, tag or digest), and says
 whether the OS changes and so the unit reboots, whether the machine config
 changes, and the expected downtime: the unit's last reboot through an update.
