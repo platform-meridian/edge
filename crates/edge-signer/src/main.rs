@@ -169,7 +169,9 @@ async fn serve_access(listen: String, service: access::Service) {
         tokio::time::sleep(RETRY_INTERVAL).await;
     };
     tracing::info!(%listen, "access API: serving");
-    if let Err(e) = bound.serve(router).await {
+    let service = connectrpc::ConnectRpcService::new(router)
+        .with_compression(connectrpc::CompressionRegistry::new());
+    if let Err(e) = bound.serve_with_service(service).await {
         tracing::error!(error = %e, "the access API stopped");
     }
 }

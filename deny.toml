@@ -10,3 +10,10 @@ multiple-versions = "allow"
 
 [sources]
 allow-git = ["https://github.com/aya-rs/aya"]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 is compiled in only because connectrpc-health 0.9 turns on connectrpc's default features; nothing here asks for it. It never runs: edge-update's and edge-signer's Connect servers have no codec, so they neither offer nor accept compression, and edge calls no Connect service. Removed by connectrpc-health without connectrpc's default features (prepared upstream; connectrpc/connect-rust#338)." },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7, as RUSTSEC-2026-0391." },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7, as RUSTSEC-2026-0391." },
+]
