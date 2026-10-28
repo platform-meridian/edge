@@ -1,5 +1,5 @@
 //! The write side (ADR-0015, finding C): the instance registry takes what core
-//! uploads, and deletes what the app controller collects, from them alone.
+//! uploads, and deletes what the platform controller collects, from them alone.
 //!
 //! Pushed content lives in a store of its own, beside the base's: the base's
 //! store is collected by what the unit's releases keep, this one by the
@@ -34,7 +34,7 @@ pub const MAX_MANIFEST: usize = 4 << 20;
 pub enum Role {
     /// Upload blobs and put manifests: core.
     Push,
-    /// Delete manifests: the app controller.
+    /// Delete manifests: the platform controller.
     Delete,
 }
 
@@ -390,7 +390,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmo0ez7vm9PoyqQ8LPJzcI7NDt1C2
 -----END PUBLIC KEY-----
 ";
     const CORE: &str = "system:serviceaccount:meridian:platform-core";
-    const CONTROLLER: &str = "system:serviceaccount:meridian-system:meridian-controller";
+    const CONTROLLER: &str = "system:serviceaccount:meridian-system:platform-controller";
 
     fn token(sub: &str, aud: &str, exp_in: i64) -> String {
         let now = std::time::SystemTime::now()

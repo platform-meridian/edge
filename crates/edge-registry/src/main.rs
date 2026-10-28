@@ -38,7 +38,7 @@ struct Push {
 }
 
 const DEFAULT_PUSHER: &str = "system:serviceaccount:meridian:platform-core";
-const DEFAULT_DELETER: &str = "system:serviceaccount:meridian-system:meridian-controller";
+const DEFAULT_DELETER: &str = "system:serviceaccount:meridian-system:platform-controller";
 /// The pushed store, beside the base's in its root.
 const PUSHED: &str = "pushed";
 
