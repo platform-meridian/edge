@@ -32,7 +32,7 @@ notify = { version = "8", default-features = false }
 x509-parser = "0.18"
 sha2 = "0.11"
 percent-encoding = "2"
-base64 = "0.22"
+base64 = "0.23"
 tower-service = "0.3"
 webpki-roots = "1"
 
