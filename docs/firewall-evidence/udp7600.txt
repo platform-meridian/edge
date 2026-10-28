@@ -1,0 +1,6 @@
+# kubectl logs stand-in-core: every UDP datagram that reached the hostNetwork listener on 0.0.0.0:7600
+# sent: 3+1 from the pod 'component' (Service platform-core and the node address), 2+1+3 from the workstation (192.168.122.151 and 10.51.0.1)
+from-pod-to-node-10.51.0.1
+from-pod-via-service-10.105.202.193-try1
+from-pod-via-service-10.105.202.193-try2
+from-pod-via-service-10.105.202.193-try3

@@ -1,0 +1,28 @@
+## from the workstation to 192.168.122.151
+udp:7600: no answer (dropped)
+tcp:9999: no answer (dropped)
+tcp:443: connected: console-tcp-443
+udp:443: answered: console-udp-443
+tcp:50001: no answer (dropped)
+tcp:10250: no answer (dropped)
+tcp:50000: connected
+tcp:6443: connected
+## from the workstation to 10.51.0.1
+udp:7600: no answer (dropped)
+tcp:9999: no answer (dropped)
+tcp:443: connected: console-tcp-443
+udp:443: answered: console-udp-443
+tcp:50001: no answer (dropped)
+tcp:10250: no answer (dropped)
+tcp:50000: connected
+tcp:6443: connected
+## more, to 192.168.122.151
+tcp:2379: no answer (dropped)
+tcp:2380: no answer (dropped)
+tcp:10256: no answer (dropped)
+udp:4789: no answer (dropped)
+## more, to 10.51.0.1
+tcp:2379: no answer (dropped)
+tcp:2380: no answer (dropped)
+tcp:10256: no answer (dropped)
+udp:4789: no answer (dropped)

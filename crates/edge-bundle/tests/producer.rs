@@ -465,12 +465,19 @@ fn a_build_patch_merges_onto_a_unit() {
     }
     assert!(next.contains("registry.example/store:t2") && !next.contains(":t1"));
     assert_eq!(machineconfig::merge(&next, &patch).unwrap(), next);
-    // The unit's next config is the build's, but for the unit's own.
-    same_docs(&next.replace("unit-", "build-"), &build_config());
+    // The unit's next config is the build's, but for the unit's own, with the
+    // firewall a config derives.
+    same_docs(
+        &next.replace("unit-", "build-"),
+        &machineconfig::with_firewall(&build_config()).unwrap(),
+    );
 }
 
 #[test]
 fn a_units_own_patch_gives_it_back() {
     let patch = machineconfig::strip(UNIT).unwrap();
-    same_docs(&machineconfig::merge(UNIT, &patch).unwrap(), UNIT);
+    same_docs(
+        &machineconfig::merge(UNIT, &patch).unwrap(),
+        &machineconfig::with_firewall(UNIT).unwrap(),
+    );
 }
