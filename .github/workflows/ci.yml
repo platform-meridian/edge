@@ -18,17 +18,22 @@ jobs:
   check:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: kubectl kustomize deploy > /dev/null
       - run: sudo apt-get install -y dhcpcd-base uidmap
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/master' }}
-      - uses: actions-rust-lang/rustfmt@v1
-      - uses: taiki-e/install-action@v2
+      - uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143 # v1.1.2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: bpf-linker@0.11.1,cargo-nextest
+      # aws-lc-rs's FIPS module (edge_common::tls) is built with CMake and Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo nextest run --locked
       - run: cargo nextest run --locked --run-ignored only -E 'package(edge-cni)'
@@ -38,8 +43,14 @@ jobs:
   deny:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # Every dependency audited, by an imported set (Mozilla's, Google's, the
+      # Bytecode Alliance's) or our own, or exempted on the record.
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-vet
+      - run: cargo vet --locked
 
   conformance:
     runs-on: ubuntu-26.04
@@ -48,11 +59,11 @@ jobs:
       matrix:
         gate: [TestAPIServer, TestRobustness/edge-state, TestReplay]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/master' }}
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: conformance/go.mod
           cache-dependency-path: "**/go.sum"
@@ -75,15 +86,20 @@ jobs:
           - { dir: crates/edge-cni/crates/cni, target: nft_dump }
           - { dir: crates/edge-cni/crates/cni, target: rtnl_message }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           rust-src-dir: ${{ matrix.dir }}/fuzz
           cache-workspaces: ${{ matrix.dir }}/fuzz
           cache-save-if: ${{ github.ref == 'refs/heads/master' }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: bpf-linker@0.11.1,cargo-fuzz
+      # aws-lc-rs's FIPS module (edge_common::tls) is built with CMake and Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2048
         working-directory: ${{ matrix.dir }}/fuzz
 
@@ -95,30 +111,28 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
     strategy:
       matrix:
         name: [edge-cni, edge-dhcp, edge-dns, edge-gateway, edge-idle, edge-layers, edge-registry, edge-scope, edge-signer, edge-state, edge-update, edge-watch]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: sudo apt-get install -y musl-tools
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/master' }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: bpf-linker@0.11.1,cargo-auditable
+      # aws-lc-rs's FIPS module (edge_common::tls) is built with CMake and Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
       - run: cargo auditable build --release --locked --target x86_64-unknown-linux-musl --bin ${{ matrix.name }}
       - run: install -Dm755 -t dist/amd64 target/x86_64-unknown-linux-musl/release/${{ matrix.name }}
-      - uses: anchore/sbom-action@v0
-        with:
-          file: dist/amd64/${{ matrix.name }}
-          format: spdx-json
-          upload-artifact: false
-          output-file: ${{ matrix.name }}.spdx.json
-      - uses: redhat-actions/buildah-build@v3
+      - uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
         with:
           image: ${{ matrix.name }}
           tags: ${{ github.sha }} ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -129,25 +143,57 @@ jobs:
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
             VCS_REF=${{ github.sha }}
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
-      - uses: redhat-actions/podman-login@v2
+      - uses: redhat-actions/podman-login@50c2d9a331bb67c8fdab99b86455fad05e2e3252 # v2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: redhat-actions/push-to-registry@v3
+      - uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37 # v3.0.0
         id: push
         with:
           image: ${{ matrix.name }}
           tags: ${{ github.sha }} ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           registry: ghcr.io/${{ github.repository_owner }}
-      - uses: actions/attest-build-provenance@v4
+      # Supply chain (STUDY N9): a CycloneDX SBOM of the image as pushed, and
+      # SLSA v1 provenance of this run, each an in-toto attestation signed
+      # keyless by this workflow (Fulcio, Rekor) and attached to the image by
+      # digest as an OCI referrer. `cosign verify-attestation --type
+      # cyclonedx|slsaprovenance1` checks either.
+      # cosign and syft as release binaries, checked by install-action (the
+      # runners' image has no envsubst, which cosign-installer needs).
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-      - uses: actions/attest-sbom@v4
-        with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-          sbom-path: ${{ matrix.name }}.spdx.json
+          tool: cosign,syft
+      - name: The image's SBOM
+        env:
+          SYFT_REGISTRY_AUTH_AUTHORITY: ghcr.io
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: syft scan "registry:ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}" -o "cyclonedx-json=$RUNNER_TEMP/sbom.cdx.json"
+      - name: Attest the SBOM and the provenance
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | cosign login ghcr.io --username "$ACTOR" --password-stdin
+          workflow="${GITHUB_WORKFLOW_REF#*/*/}"
+          jq -n \
+            --arg repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF" \
+            --arg sha "$GITHUB_SHA" --arg path "${workflow%@*}" --arg event "$GITHUB_EVENT_NAME" \
+            --arg runner "$RUNNER_ENVIRONMENT" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            '{
+              buildDefinition: {
+                buildType: "https://actions.github.io/buildtypes/workflow/v1",
+                externalParameters: { workflow: { ref: $ref, repository: $repo, path: $path } },
+                internalParameters: { github: { event_name: $event, runner_environment: $runner } },
+                resolvedDependencies: [{ uri: ("git+" + $repo + "@" + $ref), digest: { gitCommit: $sha } }]
+              },
+              runDetails: {
+                builder: { id: ("https://github.com/actions/runner/" + $runner) },
+                metadata: { invocationId: $run }
+              }
+            }' > "$RUNNER_TEMP/provenance.json"
+          cosign attest --yes --type cyclonedx --predicate "$RUNNER_TEMP/sbom.cdx.json" "$IMAGE"
+          cosign attest --yes --type slsaprovenance1 --predicate "$RUNNER_TEMP/provenance.json" "$IMAGE"
