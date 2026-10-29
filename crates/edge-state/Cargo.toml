@@ -11,7 +11,7 @@ edge-common = { path = "../edge-common" }
 anyhow.workspace = true
 crc32fast.workspace = true
 libc = "0.2"
-tonic = { workspace = true, features = ["tls-ring"] }
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 tonic-prost.workspace = true
 prost.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }

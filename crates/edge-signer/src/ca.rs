@@ -164,6 +164,11 @@ impl Ca {
 
     fn parse(bytes: &[u8], now: i64) -> anyhow::Result<Self> {
         let key = PrivateKeyDer::from_pem_slice(bytes).context("no private key")?;
+        // PKCS#8 alone, by its label: aws-lc-rs would also take a SEC1 key.
+        ensure!(
+            matches!(key, PrivateKeyDer::Pkcs8(_)),
+            "the private key is not unencrypted PKCS#8"
+        );
         let key = KeyPair::try_from(&key).context("the private key is not unencrypted PKCS#8")?;
         ensure!(
             key.algorithm() == &PKCS_ECDSA_P256_SHA256,
@@ -435,7 +440,7 @@ pub fn requested_key(csr_der: &[u8]) -> Result<SubjectPublicKeyInfo, Refusal> {
         .and_then(element)
         .and_then(|(_, rest)| sequence(rest))
         .unwrap_or_default();
-    let verifies = rustls::crypto::ring::default_provider()
+    let verifies = rustls::crypto::aws_lc_rs::default_provider()
         .signature_verification_algorithms
         .all
         .iter()
@@ -710,12 +715,10 @@ pub(crate) mod tests {
         use rustls::client::danger::ServerCertVerifier;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ders(root).remove(0)).unwrap();
-        let verifier = WebPkiServerVerifier::builder_with_provider(
-            roots.into(),
-            rustls::crypto::ring::default_provider().into(),
-        )
-        .build()
-        .unwrap();
+        let verifier =
+            WebPkiServerVerifier::builder_with_provider(roots.into(), edge_common::tls::provider())
+                .build()
+                .unwrap();
         let chain = ders(chain);
         verifier
             .verify_server_cert(
@@ -1142,7 +1145,7 @@ pub(crate) mod tests {
         let r = root("unit CA", now - 60, now + 10 * YEAR);
         let i = intermediate(&r);
         let ca = Ca::parse(file(&i, &[&i, &r]).as_bytes(), now).unwrap();
-        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let provider = edge_common::tls::provider();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ders(ca.root()).remove(0)).unwrap();
         let roots = std::sync::Arc::new(roots);

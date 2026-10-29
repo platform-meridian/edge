@@ -22,7 +22,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs"] }
 kube.workspace = true
 k8s-openapi.workspace = true
-tonic = { workspace = true, features = ["tls-ring"] }
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 tonic-prost.workspace = true
 prost.workspace = true
 connectrpc = { version = "0.9", default-features = false, features = ["server", "client"] }
@@ -39,7 +39,7 @@ connectrpc-health = "0.9"
 edge-bundle = { path = "../edge-bundle", features = ["testkit"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [build-dependencies]

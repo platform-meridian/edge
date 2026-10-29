@@ -566,7 +566,7 @@ mod tests {
 
     /// A node whose talosconfig apid's PKI issued.
     async fn node(apid: Apid) -> (Node, tempfile::TempDir) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let pki = Pki::new();
         let addr = serve(&pki, &pki, apid).await;
         let d = tempfile::tempdir().unwrap();
@@ -598,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn another_pki_is_turned_away() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let (server, other) = (Pki::new(), Pki::new());
         let addr = serve(&server, &server, Apid::default()).await;
         let d = tempfile::tempdir().unwrap();

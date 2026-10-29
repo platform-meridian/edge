@@ -1,0 +1,6 @@
+# aws-lc-rs's FIPS module (meridian_tls) is built with CMake and Go. musl's
+# headers carry no kernel headers, which AWS-LC's entropy source includes, so
+# its build finds them after musl's own (Fedora's kernel-headers, Debian's
+# linux-libc-dev and its multiarch asm/).
+[env]
+AWS_LC_FIPS_SYS_CFLAGS_x86_64_unknown_linux_musl = "-idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu"

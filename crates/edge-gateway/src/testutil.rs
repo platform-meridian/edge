@@ -507,7 +507,7 @@ pub async fn tls_connect_as(
                 rustls::sign::CertifiedKey::from_der(
                     c.chain.clone(),
                     c.key.clone_key(),
-                    &rustls::crypto::ring::default_provider(),
+                    &rustls::crypto::aws_lc_rs::default_provider(),
                 )
                 .unwrap(),
             ))
@@ -517,7 +517,7 @@ pub async fn tls_connect_as(
         }
     }
     let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = edge_common::tls::provider();
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -561,7 +561,7 @@ pub async fn tls_connect(
     Vec<u8>,
     Option<Vec<u8>>,
 )> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = edge_common::tls::provider();
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -615,7 +615,7 @@ pub async fn tls_backend(server: &ClientCa, name: &str, clients: &ClientCa) -> T
     ) {
         roots.add(c.unwrap()).unwrap();
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = edge_common::tls::provider();
     let verifier =
         rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider.clone())
             .build()

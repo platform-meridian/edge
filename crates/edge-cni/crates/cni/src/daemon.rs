@@ -27,9 +27,7 @@ const NAT_TICK: Duration = Duration::from_secs(5);
 const POLICY_TICK: Duration = Duration::from_millis(250);
 
 pub async fn run(node: &str) -> std::convert::Infallible {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    edge_common::tls::install();
     let pod_cidr = &wait_for_pod_cidr(|| node_pod_cidr(node), Duration::from_secs(1)).await;
     tracing::info!(node, pod_cidr, "serving the Node's pod CIDR");
     // Before the dataplane: an ADD handed the floor's conflist reads this one.

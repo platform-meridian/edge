@@ -18,12 +18,12 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-rcgen = { version = "0.14", features = ["x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 nix = { workspace = true, features = ["net"] }
 time = "0.3"
 x509-parser = "0.18"
-tonic = { workspace = true, features = ["tls-ring"] }
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 tonic-prost.workspace = true
 prost.workspace = true
 prost-types = "0.14"

@@ -107,7 +107,7 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn serve() -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    edge_common::tls::install();
     let (health_router, health) =
         connectrpc_health::install_static(connectrpc::Router::new(), [UPDATE_SERVICE_SERVICE_NAME]);
     tokio::spawn(serve_health(

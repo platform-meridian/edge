@@ -13,6 +13,7 @@ pub mod mount;
 mod outage;
 pub mod sandbox;
 mod supervise;
+pub mod tls;
 pub mod watch_state;
 
 pub use durable::{TMP_SUFFIX, durable_write, durable_write_with, set_aside, sync_dir};

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    Arc::new(rustls::crypto::ring::default_provider())
+    edge_common::tls::install();
+    edge_common::tls::provider()
 }
 
 /// `metadata` follows symlinks, so the kubelet's `..data` swap changes it.
@@ -303,9 +303,7 @@ fn server_config(
     resolver: Arc<Reloading>,
     verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Arc<rustls::ServerConfig> {
-    let builder = rustls::ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions");
+    let builder = edge_common::tls::server(provider());
     let mut cfg = match verifier {
         Some(v) => builder.with_client_cert_verifier(v),
         None => builder.with_no_client_auth(),

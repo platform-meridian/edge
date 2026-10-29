@@ -27,12 +27,7 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn serve(bind: String) -> anyhow::Result<()> {
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        tracing::debug!("a CryptoProvider was already installed");
-    }
+    edge_common::tls::install();
 
     let domain = std::env::var("CLUSTER_DOMAIN").unwrap_or_else(|_| "cluster.local".into());
     let state = ZoneState::new(&domain);

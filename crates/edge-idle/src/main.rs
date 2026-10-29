@@ -212,7 +212,7 @@ async fn run(proc_dir: PathBuf, cgroup_root: PathBuf, health: String) -> anyhow:
         STALE_AFTER,
     ));
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    edge_common::tls::install();
 
     let idle_after = Duration::from_secs(secs_or_default(
         "EDGE_IDLE_AFTER",

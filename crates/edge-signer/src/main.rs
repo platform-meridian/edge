@@ -109,7 +109,7 @@ fn now() -> i64 {
 #[tokio::main]
 async fn run(paths: Paths, node: &str, unit: &Unit, reach: access::Reach) -> anyhow::Result<()> {
     let mut term = edge_common::Terminator::new();
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    edge_common::tls::install();
     let heartbeat = Heartbeat::default();
     tokio::spawn(edge_common::health::serve(
         paths.health,
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn answers_once_and_publishes_root() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let (key, der) = csr(&PKCS_ECDSA_P256_SHA256);
         let r = root("r", now() - 60, now() + 86_400 * 365);
         let (url, writes, _watch) = fake_apiserver(World {
@@ -1455,7 +1455,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_secret_is_created_and_an_operators_replaces_it() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let (url, writes, watch) = fake_apiserver(World {
             pcrs: vec![pcr_json(
                 "gw-1",
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn refused_secret_signs_ephemeral() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let (url, writes, _watch) = fake_apiserver(World {
             secrets_forbidden: true,
             ..World::default()
@@ -1503,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn approves_only_the_kubelets_own_request() {
         use crate::kubelet::tests::{kubelet_csr, node, own_csr, pem};
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let mut foreign = kubelet_csr(
             "foreign",
             pem(
@@ -1556,7 +1556,7 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_pod_dated_ahead_once() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let year = now() + 365 * 86_400;
         let pcr = |name: &str, pod: &str, uid: &str, status: serde_json::Value| {
             pcr_json(name, pod, uid, csr(&PKCS_ECDSA_P256_SHA256).1, status)
@@ -1621,7 +1621,7 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_pod_once_node_gains_address() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let pcr = |name: &str, pod: &str, uid: &str, status: serde_json::Value| {
             let mut p = pcr_json(name, pod, uid, csr(&PKCS_ECDSA_P256_SHA256).1, status);
@@ -1704,7 +1704,7 @@ mod tests {
 
     #[tokio::test]
     async fn address_the_ca_cannot_name_costs_no_restart() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let r = root("r", now() - 60, now() + 86_400 * 365);
         let i = intermediate(&r);
         let ca = Ca::from_secret(Some(&secret(&i, &[&i, &r])), now()).unwrap();
@@ -1751,7 +1751,7 @@ mod tests {
 
     #[tokio::test]
     async fn apiserver_down_keeps_beating() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1768,7 +1768,7 @@ mod tests {
 
     #[tokio::test]
     async fn hung_apiserver_keeps_beating() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let r = root("r", now() - 60, now() + 86_400 * 365);
         let (url, writes, _watch) = fake_apiserver(World {
             secret: Some(ca_secret(&r)),
@@ -1793,7 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_loop_stops_beating() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        edge_common::tls::install();
         let (url, _writes, _watch) = fake_apiserver(World::default()).await;
         let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
         let hb = Heartbeat::default();
