@@ -31,7 +31,7 @@ fn bearer(sub: &str) -> String {
 }
 
 const CORE: &str = "system:serviceaccount:meridian:platform-core";
-const CONTROLLER: &str = "system:serviceaccount:meridian-system:platform-controller";
+const CONTROLLER: &str = "system:serviceaccount:meridian-system:platform-operator";
 
 fn push_blob(r: &Registry, auth: &str, bytes: &[u8]) -> Digest {
     let d = Digest::of(bytes);

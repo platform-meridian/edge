@@ -1,6 +1,6 @@
 //! The node's capabilities (ADR-0015 §2): what the host offers that an app
 //! can need, each the node label `capability.platform.meridian/<name>`,
-//! which the platform controller's requirement check matches. The names are
+//! which the platform operator's requirement check matches. The names are
 //! `meridian_app`'s closed set (core's `artifact::Capability`).
 //!
 //! On the appliance three are the appliance's by construction: the storage

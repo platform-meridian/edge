@@ -5,7 +5,7 @@
 //! that allows it; its files are still checked against the sums.
 //!
 //! Every bundle is the unit's base: its OS and the stack. Apps are
-//! `MeridianApp`s, which the platform controller installs, never a bundle.
+//! `MeridianApp`s, which the platform operator installs, never a bundle.
 //!
 //! - `MANIFEST`: `KEY=value` lines. `FORMAT=5` ([`FORMAT`]), `STACK_DIGEST`,
 //!   `INSTALLER_REF` (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version

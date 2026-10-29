@@ -2,7 +2,7 @@
 
 Verifies signed bundles (`edge-bundle`), each the unit's base (its OS and
 stack), and applies them to the unit it runs on, through the node's Talos API
-and the cluster's Flux. Apps are `MeridianApp`s, which the platform controller
+and the cluster's Flux. Apps are `MeridianApp`s, which the platform operator
 installs (ADR-0015); a bundle brings none. The API is
 `proto/edge/update/v1/update.proto`; a console reaches it through whatever
 fronts the unit.
@@ -85,7 +85,7 @@ components) are checked at verify and again at apply.
 `Unit.components` lists what runs: the images of the release the unit runs,
 if this engine applied it, else the images its workloads name. A release
 says the base's version, never an app's: an app is a MeridianApp, its version
-its own release, which the platform-controller reports. On verification, `Release.diff` compares that with the release, image by image
+its own release, which the platform operator reports. On verification, `Release.diff` compares that with the release, image by image
 (an image is its repository without registry, tag or digest), and says
 whether the OS changes and so the unit reboots, whether the machine config
 changes, and the expected downtime: the unit's last reboot through an update.
@@ -168,7 +168,7 @@ wiped and dropped, then the PersistentVolume deleted. Under `Retain` it stays.
 ## Capabilities
 
 edge-update labels its node `capability.platform.meridian/<name>: "true"` for
-each capability the host offers, as the platform controller's requirement check
+each capability the host offers, as the platform operator's requirement check
 reads them (`meridian_app`'s closed set): `persistent-storage`,
 `host-network` and `host-admin` (the edge application administers the unit)
 always, `serial-devices` for a USB or ACM serial adapter or a

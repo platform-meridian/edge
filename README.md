@@ -22,7 +22,7 @@ recover without anyone on site.
 | [`edge-update`](crates/edge-update/) | Verifies and applies Sigstore-signed bundles of the unit's base: the OS on trial, then the stack, each committed or rolled back. Provisions each claim as a Talos user volume, and labels the node with the host's capabilities. |
 | [`edge-watch`](crates/edge-watch/) | Keeps the hardware watchdog armed and resets the device when its health checks fail. |
 | [`edge-scope`](crates/edge-scope/) | Records logs and hardware health so they survive resets and power loss. |
-| [`edge-registry`](crates/edge-registry/) | An image registry that containerd and Flux pull through, with a store that survives power loss; the instance registry core pushes apps into and the platform controller deletes them from. |
+| [`edge-registry`](crates/edge-registry/) | An image registry that containerd and Flux pull through, with a store that survives power loss; the instance registry core pushes apps into and the platform operator deletes them from. |
 | [`edge-layers`](crates/edge-layers/) | Repairs container image layers damaged by power loss before the kubelet starts. |
 | [`edge-idle`](crates/edge-idle/) | Throttles the scheduler and controller-manager while the cluster is idle. |
 | [`edge-kube`](crates/edge-kube/) | Library: the Service, EndpointSlice and NetworkPolicy view shared by edge-cni and edge-dns. |
