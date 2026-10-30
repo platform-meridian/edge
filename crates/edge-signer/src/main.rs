@@ -10,6 +10,7 @@ mod access;
 mod api;
 mod ca;
 mod kubelet;
+mod leaf;
 mod policy;
 
 use std::collections::BTreeMap;
@@ -95,7 +96,8 @@ fn main() -> anyhow::Result<()> {
         address,
         apiserver_port,
     };
-    run(paths, &node, &unit, reach)
+    let leaf = leaf::Config::from_env(|n| std::env::var(n).unwrap_or_default())?;
+    run(paths, &node, &unit, reach, leaf)
 }
 
 struct Paths {
@@ -111,7 +113,13 @@ fn now() -> i64 {
 }
 
 #[tokio::main]
-async fn run(paths: Paths, node: &str, unit: &Unit, reach: access::Reach) -> anyhow::Result<()> {
+async fn run(
+    paths: Paths,
+    node: &str,
+    unit: &Unit,
+    reach: access::Reach,
+    leaf: Option<leaf::Config>,
+) -> anyhow::Result<()> {
     let mut term = edge_common::Terminator::new();
     edge_common::tls::install();
     let heartbeat = Heartbeat::default();
@@ -152,7 +160,7 @@ async fn run(paths: Paths, node: &str, unit: &Unit, reach: access::Reach) -> any
     );
     tokio::spawn(serve_access(paths.access, service));
     tokio::select! {
-        r = serve(client, node, unit, &reach, host_addresses, &heartbeat) => r,
+        r = serve(client, node, unit, &reach, leaf, host_addresses, &heartbeat) => r,
         _ = term.wait() => Ok(()),
     }
 }
@@ -252,9 +260,12 @@ async fn serve(
     node: &str,
     unit: &Unit,
     reach: &access::Reach,
+    leaf: Option<leaf::Config>,
     host: impl Fn() -> nix::Result<Vec<IpAddr>>,
     heartbeat: &Heartbeat,
 ) -> anyhow::Result<()> {
+    let leaf = leaf.map(|c| (Api::<Secret>::namespaced(client.clone(), &c.namespace), c));
+    let mut leaf_outage = edge_common::Outage::default();
     let requests: Api<PodCertificateRequest> = Api::all(client.clone());
     let secrets: Api<Secret> = Api::default_namespaced(client.clone());
     let csrs: Api<CertificateSigningRequest> = Api::all(client.clone());
@@ -361,6 +372,21 @@ async fn serve(
             bundle_outage.observe("clustertrustbundle", &r);
             if r.is_ok() {
                 published = Some((root.to_string(), Instant::now()));
+            }
+        }
+
+        if let Some((api, c)) = &leaf {
+            let r = tokio::time::timeout(CALL_TIMEOUT, leaf::keep(api, c, &source.ca, &unit, now))
+                .await
+                .unwrap_or_else(|elapsed| Err(elapsed.into()));
+            heartbeat.beat();
+            leaf_outage.observe("leaf secret", &r);
+            if let Ok(Some(why)) = r {
+                tracing::info!(
+                    namespace = c.namespace,
+                    secret = c.name,
+                    "{why}: leaf issued"
+                );
             }
         }
 
@@ -1354,7 +1380,9 @@ mod tests {
         let beat = hb.clone();
         let host = move || Ok(held.lock().unwrap().clone());
         let task =
-            tokio::spawn(async move { serve(client, "n", &unit(), &reach(), host, &beat).await });
+            tokio::spawn(
+                async move { serve(client, "n", &unit(), &reach(), None, host, &beat).await },
+            );
         (task, hb)
     }
 
@@ -1803,7 +1831,8 @@ mod tests {
         let hb = Heartbeat::default();
         let unit = unit();
         let reach = reach();
-        let mut serving = std::pin::pin!(serve(client, "n", &unit, &reach, || Ok(vec![]), &hb));
+        let mut serving =
+            std::pin::pin!(serve(client, "n", &unit, &reach, None, || Ok(vec![]), &hb));
         let poll = Duration::from_millis(500);
 
         let beating = poll * 2;

@@ -110,6 +110,32 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edge-signer }
 subjects:
   - { kind: ServiceAccount, name: edge-signer, namespace: edge }
 ---
+# platform-core's leaf, Secret meridian/meridian-tls, which its portable
+# rendering reads as cert-manager would write it: kept by the signer
+# (EDGE_SIGNER_LEAF), its key made beside each issue.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: edge-signer-leaf
+  namespace: meridian
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["meridian-tls"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: edge-signer-leaf
+  namespace: meridian
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edge-signer-leaf }
+subjects:
+  - { kind: ServiceAccount, name: edge-signer, namespace: edge }
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -135,6 +161,13 @@ spec:
             - { name: EDGE_SIGNER_DOMAIN, value: "@OPERATOR_DOMAIN@" }
             - { name: EDGE_SIGNER_ADDRESS, value: "@OPERATOR_ADDR@" }
             - { name: EDGE_SIGNER_APISERVER_PORT, value: "@APISERVER_PORT@" }
+            # One leaf serves core's HTTPS and its WebTransport pin, which
+            # browsers refuse over two weeks' validity (P-256 only): 10 days
+            # leaves margin for RTC skew.
+            - { name: EDGE_SIGNER_LEAF, value: meridian/meridian-tls }
+            - { name: EDGE_SIGNER_LEAF_DNS, value: "@OPERATOR_DOMAIN@,localhost" }
+            - { name: EDGE_SIGNER_LEAF_IPS, value: "node,127.0.0.1,::1" }
+            - { name: EDGE_SIGNER_LEAF_LIFETIME, value: "864000" }
             - name: NODE_NAME
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
           ports:

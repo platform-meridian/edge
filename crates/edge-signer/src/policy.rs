@@ -14,8 +14,8 @@ use std::net::IpAddr;
 use crate::api::Spec;
 
 pub const SIGNER: &str = "edge.meridian/node";
-const DNS_NAMES: &str = "edge.meridian/dns-names";
-const IP_ADDRESSES: &str = "edge.meridian/ip-addresses";
+pub const DNS_NAMES: &str = "edge.meridian/dns-names";
+pub const IP_ADDRESSES: &str = "edge.meridian/ip-addresses";
 const NODE: &str = "node";
 /// kube-apiserver's default when the pod names none.
 const DEFAULT_LIFETIME: i64 = 86_400;
