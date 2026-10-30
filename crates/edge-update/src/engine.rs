@@ -238,6 +238,8 @@ pub struct Unit {
     pub components: Vec<Component>,
     /// The running release's MANIFEST, if this engine applied it.
     pub manifest: Manifest,
+    /// Its id.
+    pub release: String,
 }
 
 /// The work of the step running, as it goes.
@@ -578,13 +580,15 @@ impl Engine {
         match self.record.running() {
             Some(r) => {
                 let u = &mut self.unit;
-                (u.components, u.manifest) = (r.components(), r.manifest.clone());
+                (u.components, u.manifest, u.release) =
+                    (r.components(), r.manifest.clone(), r.tag().to_string());
             }
             None => match self.cluster.images_in_use().await {
                 Ok(refs) => {
                     let registry = &self.registry;
                     self.unit.components = diff::of_refs(&refs, |r| registry.digest(r));
                     self.unit.manifest.clear();
+                    self.unit.release.clear();
                 }
                 Err(e) => tracing::debug!(
                     error = format!("{e:#}"),

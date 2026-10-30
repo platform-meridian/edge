@@ -266,6 +266,7 @@ fn unit(u: &Unit) -> pb::Unit {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        release: u.release.clone(),
         ..Default::default()
     }
 }

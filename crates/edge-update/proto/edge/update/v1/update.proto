@@ -379,6 +379,8 @@ message Unit {
   repeated Component components = 10;
   // The MANIFEST of the release the unit runs, if this engine applied it.
   map<string, string> manifest = 11;
+  // That release's id; empty if this engine applied none.
+  string release = 12;
 }
 
 message Release {
