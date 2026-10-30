@@ -337,12 +337,13 @@ fn steps(s: &Snapshot, up: Option<&Upload>) -> Vec<Taken> {
 fn trial(s: &Snapshot) -> Option<pb::Trial> {
     let r = &s.record;
     let release = r.release.as_ref()?.tag().to_string();
+    // A release with no new OS has no trial: its settling is its commit's.
     let started = r
         .steps
         .iter()
         .rev()
-        .find(|t| t.step == Step::OsTrial)
-        .map_or(0, |t| t.started);
+        .find(|t| t.step == Step::OsTrial)?
+        .started;
     matches!(r.phase, Phase::Trial | Phase::Settling).then(|| pb::Trial {
         kind: pb::TrialKind::TRIAL_KIND_OS.into(),
         release,
