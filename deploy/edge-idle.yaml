@@ -61,7 +61,7 @@ spec:
             # Longer than a normal reconcile burst.
             - { name: EDGE_IDLE_AFTER, value: "120" }
           ports:
-            - { name: healthz, containerPort: 9751, protocol: TCP }
+            - { name: healthz, containerPort: 9752, protocol: TCP }
           # A wedged loop could leave the control plane throttled; a restart releases it.
           livenessProbe:
             httpGet: { path: /healthz, port: healthz }

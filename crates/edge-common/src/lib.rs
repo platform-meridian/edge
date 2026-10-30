@@ -11,6 +11,7 @@ pub mod health;
 mod logging;
 pub mod mount;
 mod outage;
+mod ports;
 pub mod sandbox;
 mod supervise;
 pub mod tls;
@@ -19,6 +20,7 @@ pub mod watch_state;
 pub use durable::{TMP_SUFFIX, durable_write, durable_write_with, set_aside, sync_dir};
 pub use logging::init_tracing;
 pub use outage::Outage;
+pub use ports::HostPort;
 pub use supervise::forever;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);

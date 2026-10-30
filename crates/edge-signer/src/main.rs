@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use edge_common::HostPort;
 use edge_common::health::Heartbeat;
 use futures::StreamExt;
 use k8s_openapi::api::certificates::v1::CertificateSigningRequest;
@@ -71,13 +72,16 @@ fn main() -> anyhow::Result<()> {
             .parse()
             .map_err(|e| anyhow::anyhow!("EDGE_SIGNER_APISERVER_PORT: {p:?}: {e}"))?,
     };
-    let or = |name, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let or = |name, default: String| std::env::var(name).unwrap_or(default);
     let paths = Paths {
-        health: or("EDGE_SIGNER_HEALTH_LISTEN", "0.0.0.0:9750"),
-        access: or("EDGE_SIGNER_ACCESS_LISTEN", "127.0.0.1:9751"),
+        health: or("EDGE_SIGNER_HEALTH_LISTEN", HostPort::SignerHealth.any()),
+        access: or(
+            "EDGE_SIGNER_ACCESS_LISTEN",
+            HostPort::SignerAccess.loopback(),
+        ),
         talosconfig: or(
             "EDGE_SIGNER_TALOSCONFIG",
-            "/var/run/secrets/talos.dev/config",
+            "/var/run/secrets/talos.dev/config".into(),
         )
         .into(),
     };

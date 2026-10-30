@@ -193,7 +193,8 @@ fn main() -> anyhow::Result<()> {
     let cgroup_root: PathBuf = std::env::var("EDGE_IDLE_CGROUP")
         .unwrap_or_else(|_| "/sys/fs/cgroup".into())
         .into();
-    let health = std::env::var("EDGE_IDLE_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:9751".into());
+    let health = std::env::var("EDGE_IDLE_HEALTH_LISTEN")
+        .unwrap_or_else(|_| edge_common::HostPort::IdleHealth.any());
     edge_common::sandbox::restrict(&edge_common::sandbox::idle(
         &proc_dir,
         &cgroup_root,

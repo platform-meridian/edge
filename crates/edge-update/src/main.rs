@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use edge_bundle as bundle;
+use edge_common::HostPort;
 use tokio::sync::{mpsc, watch};
 
 use api::{Command, Snapshot};
@@ -111,7 +112,7 @@ async fn serve() -> anyhow::Result<()> {
     let (health_router, health) =
         connectrpc_health::install_static(connectrpc::Router::new(), [UPDATE_SERVICE_SERVICE_NAME]);
     tokio::spawn(serve_health(
-        env("EDGE_UPDATE_HEALTH_LISTEN", "0.0.0.0:7444"),
+        env("EDGE_UPDATE_HEALTH_LISTEN", &HostPort::UpdateHealth.any()),
         health_router,
     ));
     let settings = settings(&env("EDGE_UPDATE_CONFIG", "/etc/edge-update/config.yaml"))?;
@@ -162,7 +163,7 @@ async fn serve() -> anyhow::Result<()> {
     tokio::spawn(capabilities::run(client, node, PathBuf::from("/sys")));
     let (publish, status) = watch::channel(Snapshot::default());
     let service = Arc::new(api::Service::new(tx, status, engine.uploads()));
-    let listen = env("EDGE_UPDATE_LISTEN", "127.0.0.1:7443");
+    let listen = env("EDGE_UPDATE_LISTEN", &HostPort::UpdateApi.loopback());
     // No codec: the API is on loopback, where compression only costs CPU.
     let rpc = connectrpc::ConnectRpcService::new(service.register(connectrpc::Router::new()))
         .with_compression(connectrpc::CompressionRegistry::new())
