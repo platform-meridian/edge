@@ -65,6 +65,8 @@ pub trait Cluster: Send + Sync {
     /// Deployments and DaemonSets anywhere with fewer ready than wanted, as
     /// [`crate::cluster::workload`] names them.
     async fn not_ready(&self) -> anyhow::Result<Vec<String>>;
+    /// Every Deployment and DaemonSet, named as `not_ready` names them.
+    async fn workloads(&self) -> anyhow::Result<BTreeSet<String>>;
     /// Every image a pod, Deployment or DaemonSet names.
     async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>>;
 }

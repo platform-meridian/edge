@@ -63,6 +63,24 @@ impl crate::unit::Cluster for Kube {
         Ok(waiting)
     }
 
+    async fn workloads(&self) -> anyhow::Result<BTreeSet<String>> {
+        let lp = ListParams::default();
+        let deploys: Api<Deployment> = Api::all(self.client.clone());
+        let sets: Api<DaemonSet> = Api::all(self.client.clone());
+        let mut out: BTreeSet<String> = timed(deploys.list(&lp))
+            .await?
+            .iter()
+            .map(|d| named("Deployment", &d.metadata))
+            .collect();
+        out.extend(
+            timed(sets.list(&lp))
+                .await?
+                .iter()
+                .map(|d| named("DaemonSet", &d.metadata)),
+        );
+        Ok(out)
+    }
+
     async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>> {
         let lp = ListParams::default();
         let mut specs = Vec::new();

@@ -375,6 +375,9 @@ impl Cluster for FakeCluster {
             false => Vec::new(),
         })
     }
+    async fn workloads(&self) -> anyhow::Result<BTreeSet<String>> {
+        Ok(["deployment app/web".to_string()].into())
+    }
     async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;

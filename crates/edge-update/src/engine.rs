@@ -132,6 +132,10 @@ pub struct Before {
     /// An operator rolled the new OS back on its trial.
     #[serde(default)]
     pub backed_out: bool,
+    /// The workloads the unit ran when the update began: what settles on the
+    /// new OS. One made since (an app the platform operator installs, its
+    /// claim waiting on this engine's provisioner) is not waited on.
+    pub workloads: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1107,6 +1111,11 @@ impl Engine {
             installer: installer_of(&running),
             rollback_by: String::new(),
             backed_out: false,
+            workloads: self
+                .cluster
+                .workloads()
+                .await
+                .context("read the workloads the unit runs")?,
         });
         Ok(Go(Phase::Importing))
     }
@@ -1500,7 +1509,14 @@ impl Engine {
 
     /// The new OS is blessed: the cluster's workloads come back on it.
     async fn settling(&mut self) -> anyhow::Result<Next> {
-        let waiting = self.cluster.not_ready().await?;
+        let before = &self.before()?.workloads;
+        let waiting: Vec<String> = self
+            .cluster
+            .not_ready()
+            .await?
+            .into_iter()
+            .filter(|w| before.contains(w))
+            .collect();
         if waiting.is_empty() {
             return Ok(Go(Phase::Collecting));
         }
