@@ -163,6 +163,20 @@ pub fn set_healthy(
     Ok(())
 }
 
+/// Records that this boot fed the watchdog with every check passing.
+pub fn set_fed(store: &Store, st: &mut State, boot_id: &str) -> anyhow::Result<()> {
+    if st.fed.as_deref() == Some(boot_id) {
+        return Ok(());
+    }
+    let next = State {
+        fed: Some(boot_id.into()),
+        ..st.clone()
+    };
+    store.save(&next)?;
+    *st = next;
+    Ok(())
+}
+
 /// Repairs between rungs: one fresh bootstrap. A second from the same image
 /// cache and config would fail the same way.
 pub const MAX_REPAIRS: u32 = 1;
@@ -199,6 +213,7 @@ pub fn begin_repair(
         last_repair_at: Some(at),
         exhausted: false,
         healthy_since: None,
+        fed: st.fed.clone(),
     };
     store.save(&next)?;
     *st = next;
@@ -459,6 +474,23 @@ mod tests {
             (2, 1),
             "a ladder we could not clear is kept"
         );
+    }
+
+    #[test]
+    fn fed_written_once_per_boot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path());
+        let mut st = State::default();
+        set_fed(&store, &mut st, "b1").unwrap();
+        assert_eq!(store.load().fed.as_deref(), Some("b1"));
+        std::fs::remove_file(tmp.path().join("state.json")).unwrap();
+        set_fed(&store, &mut st, "b1").unwrap();
+        assert!(
+            !tmp.path().join("state.json").exists(),
+            "unchanged: not written"
+        );
+        set_fed(&store, &mut st, "b2").unwrap();
+        assert_eq!(store.load().fed.as_deref(), Some("b2"));
     }
 
     #[test]

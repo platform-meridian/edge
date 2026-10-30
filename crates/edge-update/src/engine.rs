@@ -40,10 +40,6 @@ const SAVED_CONFIG: &str = "config-before.yaml";
 const COMPOSED: &str = "composed";
 const INSTALLED: &str = "installed.json";
 
-const INSTALL: i64 = 30 * 60;
-const SETTLE: i64 = 20 * 60;
-const ROLLOUT: i64 = 10 * 60;
-const GOOD: i64 = 20 * 60;
 const HISTORY: usize = 50;
 const SNAPSHOTS: usize = 2;
 const LOG: usize = 200;
@@ -1743,13 +1739,13 @@ impl Engine {
         };
         self.detail = "installing the new OS beside the running one".into();
         if let Err(e) = self.talos.install(&image).await {
-            if (self.now)() - self.record.since <= INSTALL {
+            // Until the installer runs, the install waits on what serves it.
+            if e.downcast_ref::<crate::unit::InstallerFailed>().is_none() {
                 return Err(e);
             }
             return Ok(Fail(format!(
-                "{installer} did not install in {} minutes: {e:#}. The OS is unchanged; {}. \
+                "{installer} did not install: {e:#}. The OS is unchanged; {}. \
                  The stack did not move; applying again retries",
-                INSTALL / 60,
                 self.restore().await?
             )));
         }
@@ -1829,7 +1825,7 @@ impl Engine {
             return poll(
                 30,
                 format!(
-                    "{} is on trial; the unit blesses it once it has stayed healthy",
+                    "{} is on trial; the unit blesses it once its watchdog is fed with every check passing",
                     b.selected
                 ),
             );
@@ -1841,7 +1837,7 @@ impl Engine {
         {
             let (why, reason) = if before.backed_out {
                 (
-                    "an operator rolled the new OS back on its trial",
+                    "an operator rolled the update back on its trial",
                     asked(&before.rollback_by),
                 )
             } else {
@@ -1890,13 +1886,6 @@ impl Engine {
         if waiting.is_empty() {
             return Ok(Go(Phase::Seeding));
         }
-        if (self.now)() - self.record.since > SETTLE {
-            return Ok(Fail(format!(
-                "the new OS is committed but these are not ready: {}. NOT moving the stack; \
-                 once they are ready, applying again carries on without reinstalling the OS",
-                waiting.join(", ")
-            )));
-        }
         poll(15, format!("waiting for {}", waiting.join(", ")))
     }
 
@@ -1912,12 +1901,6 @@ impl Engine {
         let waiting = self.cluster.not_rolled_out(&seed).await?;
         if waiting.is_empty() {
             return Ok(Go(Phase::AwaitingGood));
-        }
-        if (self.now)() - self.record.since > ROLLOUT {
-            return Ok(Fail(format!(
-                "{} did not roll out. NOT moving the stack",
-                waiting.join(", ")
-            )));
         }
         poll(10, format!("rolling out {}", waiting.join(", ")))
     }
@@ -1947,11 +1930,6 @@ impl Engine {
         let ended = good.is_empty() && self.record.took_over == prev;
         if good == prev || ended {
             return Ok(Go(Phase::Repointing { rolled_back }));
-        }
-        if (self.now)() - self.record.since > GOOD {
-            return Ok(Fail(format!(
-                "the unit's judge never recorded {prev} as good, so there is nothing to roll back to. NOT moving the stack"
-            )));
         }
         poll(
             15,
@@ -2034,11 +2012,24 @@ impl Engine {
                     asked(&asked_by),
                 ));
             }
+            let failed = self
+                .judge_now()
+                .await?
+                .checks
+                .into_iter()
+                .filter(|c| c.state == CheckState::Fail)
+                .map(|c| format!("{}: {}", c.name, c.detail))
+                .collect::<Vec<_>>()
+                .join("; ");
             return Ok(Back(
                 format!(
-                    "the unit found {tag} unhealthy and rolled the stack back to {good} ({rolled_back})"
+                    "the unit found {tag} failing and rolled the stack back to {good} ({rolled_back})"
                 ),
-                format!("{tag} stayed unhealthy"),
+                if failed.is_empty() {
+                    format!("{tag} failed its checks")
+                } else {
+                    format!("{tag} failed: {failed}")
+                },
             ));
         }
         if good == tag {
@@ -2061,7 +2052,7 @@ impl Engine {
         }
         poll(
             30,
-            format!("{tag} is on trial; the unit's judge commits it once it has stayed healthy"),
+            format!("{tag} is on trial; the unit's judge commits it once its checks pass"),
         )
     }
 
@@ -2142,6 +2133,30 @@ impl Engine {
                 Ok(format!(
                     "rolling the new OS, {}, back: the unit boots {} again",
                     b.selected,
+                    self.before()?.default_entry
+                ))
+            }
+            // The OS is blessed and the stack not yet moved: the previous OS,
+            // which the unit keeps until the next install, boots again.
+            Phase::Settling | Phase::Seeding | Phase::AwaitingGood => {
+                let rel = self.release()?.tag().to_string();
+                anyhow::ensure!(rel == tag, "{rel} is on trial, not {tag}");
+                let rebooted = self.release()?.diff.as_ref().is_none_or(|d| d.reboot);
+                if let Some(b) = self.record.before.as_mut() {
+                    b.rollback_by = by.into();
+                    b.backed_out = true;
+                }
+                self.note(format!("{} asked to roll the update back", who(by)));
+                if !rebooted {
+                    self.record.phase = Phase::Trial;
+                    self.save()?;
+                    return Ok(format!("ending {tag}: the stack does not move"));
+                }
+                self.record.phase = Phase::Trial;
+                self.save()?;
+                self.talos.rollback().await?;
+                Ok(format!(
+                    "rolling {tag} back: the unit boots {} again",
                     self.before()?.default_entry
                 ))
             }
@@ -2337,12 +2352,14 @@ pub fn stuck_trial(r: &Record, on: &str, j: &Judge) -> Option<String> {
         }
         _ => return None,
     }
-    let unhealthy = j.healthy_since == 0 && j.checks.iter().any(|c| c.state == CheckState::Fail);
-    unhealthy.then(|| trial.to_string())
+    let failing = j.checks.iter().any(|c| c.state == CheckState::Fail);
+    failing.then(|| trial.to_string())
 }
 
 fn ended(trial: &str) -> String {
-    format!("{trial} stayed unhealthy with no good release to roll back to; a new bundle took over")
+    format!(
+        "{trial} failed its checks with no good release to roll back to; a new bundle took over"
+    )
 }
 
 fn from(by: &str) -> String {

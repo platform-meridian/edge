@@ -172,6 +172,7 @@ fn check(c: &Check) -> pb::Check {
             CheckState::Pass => pb::CheckState::CHECK_STATE_PASS,
             CheckState::Fail => pb::CheckState::CHECK_STATE_FAIL,
             CheckState::Note => pb::CheckState::CHECK_STATE_NOTE,
+            CheckState::Wait => pb::CheckState::CHECK_STATE_WAIT,
         }
         .into(),
         detail: c.detail.clone(),
@@ -369,21 +370,17 @@ fn trial(s: &Snapshot) -> Option<pb::Trial> {
         kind: pb::TrialKind::TRIAL_KIND_STACK.into(),
         stack_tag: tag,
         started_unix: started,
-        window_secs: j.window_secs,
-        healthy_since_unix: j.healthy_since,
-        fail_after_secs: j.fail_after_secs,
-        unhealthy_secs: j.unhealthy_secs,
         checks: j.checks.iter().map(check).collect(),
         can_commit: j.takes("commit"),
         can_roll_back: true,
         ..Default::default()
     };
     Some(match r.phase {
-        Phase::Trial | Phase::Settling => pb::Trial {
+        Phase::Trial | Phase::Settling | Phase::Seeding | Phase::AwaitingGood => pb::Trial {
             kind: pb::TrialKind::TRIAL_KIND_OS.into(),
             stack_tag: tag,
             started_unix: started(Step::OsTrial),
-            can_roll_back: r.phase == Phase::Trial,
+            can_roll_back: true,
             ..Default::default()
         },
         Phase::Judging { .. } => stack(tag, started(Step::Trial)),
@@ -1040,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trial_says_its_window_streak_and_checks() {
+    fn a_trial_says_its_checks() {
         let mut s = Snapshot::default();
         s.record.phase = Phase::Judging {
             rolled_back: String::new(),
@@ -1052,12 +1049,8 @@ mod tests {
         steps::enter(&mut s.record.steps, Step::Trial, 500);
         s.unit.judge = crate::judge::Judge::read(
             &[
-                ("commit_after_secs", "300"),
-                ("healthy_since", "1970-01-01T00:10:00Z"),
                 ("checks", "pass applied\nfail ready: no"),
                 ("requests", "rollback"),
-                ("fail_after_secs", "900"),
-                ("unhealthy_secs", "45"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1068,17 +1061,8 @@ mod tests {
             t.kind,
             buffa::EnumValue::from(pb::TrialKind::TRIAL_KIND_STACK)
         );
-        assert_eq!(
-            (
-                t.stack_tag.as_str(),
-                t.started_unix,
-                t.window_secs,
-                t.healthy_since_unix
-            ),
-            ("s2", 500, 300, 600)
-        );
+        assert_eq!((t.stack_tag.as_str(), t.started_unix), ("s2", 500));
         assert_eq!(t.checks.len(), 2);
-        assert_eq!((t.fail_after_secs, t.unhealthy_secs), (900, 45));
         assert!(!t.can_commit && t.can_roll_back);
         s.unit.judge.requests.insert("commit".into());
         assert!(trial(&s).unwrap().can_commit);
@@ -1090,7 +1074,10 @@ mod tests {
         assert_eq!((t.stack_tag.as_str(), t.started_unix), ("s2", 700));
         assert!(t.can_roll_back && !t.can_commit);
         s.record.phase = Phase::Settling;
-        assert!(!trial(&s).unwrap().can_roll_back, "the OS is committed");
+        assert!(
+            trial(&s).unwrap().can_roll_back,
+            "the previous OS boots again until the stack moves"
+        );
 
         s.record.phase = Phase::Idle;
         assert!(trial(&s).is_none());
@@ -1371,7 +1358,7 @@ mod tests {
             steps,
             log: Vec::new(),
             by: "ann".into(),
-            rollback_reason: "s2 stayed unhealthy".into(),
+            rollback_reason: "s2 failed its checks".into(),
         });
         assert_eq!(e.outcome, pb::Outcome::OUTCOME_ROLLED_BACK);
         assert_eq!(
@@ -1383,7 +1370,7 @@ mod tests {
                 e.by.as_str(),
                 e.rollback_reason.as_str()
             ),
-            ("d", 5, 9, "ff", "ann", "s2 stayed unhealthy")
+            ("d", 5, 9, "ff", "ann", "s2 failed its checks")
         );
         let s = &e.steps[0];
         assert_eq!(

@@ -39,9 +39,9 @@ a release whose OS the unit already runs has no install, reboot or OS trial.
 | stage | images imported, the state store copied off, the machine config staged |
 | install | the new OS written beside the running one |
 | reboot | into the new OS, on trial |
-| os trial | until the unit commits the OS |
+| os trial | until the unit blesses the OS: booted, its watchdog fed with every check passing |
 | stack | the judge updated, then the stack pointed at the new release |
-| trial | until the judge commits or rolls the stack back |
+| trial | until the judge's checks pass, and it commits, or one fails, and it rolls the stack back |
 | commit | images no kept release names collected |
 
 The bundle's signed head (`SHA256SUMS`, its Sigstore bundle, `MANIFEST` and
@@ -100,7 +100,7 @@ ConfigMap `stack.judge` names, and knows nothing else of it. Required:
 
 | Key | |
 |---|---|
-| `good` | the last release that stayed healthy |
+| `good` | the last release whose checks passed |
 | `previous` | the good release before it |
 | `trial` | the release being judged, when it is not `good` |
 | `rolled_back` | `<tag> <RFC 3339 time>` of the last rollback |
@@ -109,11 +109,7 @@ Optional, for a person following a trial:
 
 | Key | |
 |---|---|
-| `commit_after_secs` | continuous health wanted before a commit |
-| `fail_after_secs` | unhealthy time allowed before a rollback |
-| `unhealthy_secs` | unhealthy time so far |
-| `healthy_since` | RFC 3339 UTC start of the current healthy streak; empty while unhealthy |
-| `checks` | a line per check: `pass <name>` or `fail <name>: <detail>` |
+| `checks` | a line per check: `pass <name>`, `wait <name>: <detail>` or `fail <name>: <detail>` |
 | `requests` | the requests it honours: `commit`, `rollback`, space-separated |
 
 Requests: edge-update merges `request: commit <tag>` or `request: rollback
@@ -127,8 +123,8 @@ With nothing on trial, `RollBack` points the stack at the judge's `previous`
 release, which the judge then takes on trial like any other. The OS stays.
 
 A stack trial with no `good` release has nothing to roll back to, so one that
-never comes up healthy would hold the unit until someone commits it. While
-the judge's checks fail on such a trial, an upload and `Install` are taken
+fails would hold the unit until someone commits it. While the judge's checks
+fail on such a trial, an upload and `Install` are taken
 anyway: the trial is ended as failed, with the reason in the history, and
 `Apply` moves the stack off it without waiting for a good release. A healthy
 trial, or one with a release to roll back to, is never taken over.

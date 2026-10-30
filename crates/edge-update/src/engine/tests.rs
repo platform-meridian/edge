@@ -396,7 +396,9 @@ impl Talos for FakeTalos {
             image.ends_with(&format!("@{DIGEST}")) != derived && !image.contains(":update-new@"),
             "{image}"
         );
-        anyhow::ensure!(!w.install_fails, "pulling {image}: not found");
+        if w.install_fails {
+            return Err(crate::unit::InstallerFailed("it exited 1".into()).into());
+        }
         let entry = format!("Talos-v1.14.1~{}.efi", w.entries.len());
         w.entries
             .insert(entry.to_lowercase(), ("v1.14.1".into(), Some(3)));
@@ -1787,39 +1789,43 @@ fn trial_is_read_as_boot_commit_reads_it() {
     assert_eq!(decode_efivar(&utf16("Talos-v1.efi")), "Talos-v1.efi");
 }
 
-/// Fails in `phase`, strictly after `limit` and within a poll or so of it.
-async fn times_out(set: impl FnOnce(&mut World), phase: Phase, limit: i64, why: &str) -> Harness {
+/// Waits in `phase` however long, saying `why`, until a person rolls it back:
+/// then the unit runs what it ran before, the stack unmoved.
+async fn waits_until_rolled_back(set: impl FnOnce(&mut World), phase: Phase, why: &str) {
     let mut h = Harness::new();
     set(&mut h.w());
-    let mut began = None;
-    let e = h
-        .update(&Spec::new("update-new"), |h, _| {
-            if h.e().record.phase == phase {
-                began = Some(h.e().record.since);
+    applied(&mut h, &Spec::new("update-new")).await;
+    step_until(&mut h, |p| *p == phase).await;
+    for _ in 0..100 {
+        match h.e().step().await.unwrap() {
+            Tick::Wait(d) => {
+                h.clock.fetch_add(d.as_secs() as i64 * 10, Ordering::SeqCst);
             }
-        })
-        .await;
-    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
-    assert!(e.detail.contains(why), "{}", e.detail);
-    let waited = e.finished - began.expect("never reached the phase");
-    assert!(
-        waited > limit && waited <= limit + 60,
-        "failed after {waited}s"
-    );
+            t => panic!("{t:?} in {phase:?}"),
+        }
+    }
+    assert_eq!(h.e().record.phase, phase, "a wait ended by itself");
+    assert!(h.e().detail.contains(why), "{}", h.e().detail);
+    h.e().request_rollback("update-new", "ann").await.unwrap();
+    h.run(|_, _| {}).await;
+    let e = h.e().record.history[0].clone();
+    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert_eq!(h.w().tag, OLD_TAG, "the stack moved");
-    assert!(h.e().record.error.contains(why), "{}", h.e().record.error);
-    h
+    assert_eq!(
+        h.w().default.to_lowercase(),
+        "talos-v1.14.1.efi",
+        "the new OS stayed the default"
+    );
 }
 
 #[tokio::test]
-async fn an_install_that_never_succeeds_stops_it() {
-    let mut h = times_out(
-        |w| w.install_fails = true,
-        Phase::Installing,
-        30 * 60,
-        "did not install",
-    )
-    .await;
+async fn an_installer_that_fails_stops_it() {
+    let mut h = Harness::new();
+    h.w().install_fails = true;
+    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
+    assert!(e.detail.contains("did not install"), "{}", e.detail);
+    assert_eq!(h.w().tag, OLD_TAG, "the stack moved");
     {
         let w = h.w();
         assert_eq!(w.staged.as_deref().unwrap_or(&w.active), w.active);
@@ -1861,39 +1867,29 @@ async fn an_operator_moving_the_stack_ends_the_judging() {
 }
 
 #[tokio::test]
-async fn workloads_that_never_settle_stop_it_before_the_stack() {
-    let mut h = times_out(
+async fn workloads_that_never_settle_wait_until_rolled_back() {
+    waits_until_rolled_back(
         |w| w.never_ready = true,
         Phase::Settling,
-        20 * 60,
-        "not ready: deployment app/web. NOT moving the stack",
-    )
-    .await;
-    let error = &h.e().record.error;
-    assert!(error.contains("applying again carries on"), "{error}");
-}
-
-#[tokio::test]
-async fn a_judge_that_never_rolls_out_stops_it() {
-    times_out(
-        |w| w.seed_stuck = true,
-        Phase::Seeding,
-        10 * 60,
-        "did not roll out",
+        "waiting for deployment app/web",
     )
     .await;
 }
 
 #[tokio::test]
-async fn a_judge_with_nothing_to_roll_back_to_stops_it() {
-    times_out(
+async fn a_judge_that_never_rolls_out_waits_until_rolled_back() {
+    waits_until_rolled_back(|w| w.seed_stuck = true, Phase::Seeding, "rolling out").await;
+}
+
+#[tokio::test]
+async fn a_judge_with_nothing_to_roll_back_to_waits_until_rolled_back() {
+    waits_until_rolled_back(
         |w| {
             w.judge_idle = true;
             w.judge.insert("good".into(), "update-older".into());
         },
         Phase::AwaitingGood,
-        20 * 60,
-        "never recorded",
+        "to record",
     )
     .await;
 }
@@ -2773,7 +2769,7 @@ async fn a_first_trial_that_cannot_pass_is_taken_over_by_a_new_bundle() {
     assert_eq!(e.detail, ended("update-new"));
     assert!(
         e.detail
-            .starts_with("update-new stayed unhealthy with no good release to roll back to"),
+            .starts_with("update-new failed its checks with no good release to roll back to"),
         "{}",
         e.detail
     );
@@ -2845,11 +2841,24 @@ async fn an_apply_onto_a_trial_that_can_pass_waits_for_it() {
     assert!(h.verify(&Spec::new("update-new")).await.is_none());
     h.e().request_apply("update-new", "ann").await.unwrap();
     assert!(h.e().record.history.is_empty());
+    step_until(&mut h, |p| *p == Phase::AwaitingGood).await;
+    for _ in 0..50 {
+        let Tick::Wait(d) = h.e().step().await.unwrap() else {
+            panic!("the wait ended by itself")
+        };
+        h.clock.fetch_add(d.as_secs() as i64 * 10, Ordering::SeqCst);
+    }
+    assert_eq!(h.w().tag, "update-first");
+    {
+        let mut w = h.w();
+        w.judge_idle = false;
+        w.judge.insert("good".into(), "update-first".into());
+        w.judge.insert("trial".into(), String::new());
+    }
     h.run(|_, _| {}).await;
     let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
-    assert!(e.detail.contains("never recorded"), "{}", e.detail);
-    assert_eq!(h.w().tag, "update-first");
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    h.committed("update-new");
 }
 
 #[tokio::test]

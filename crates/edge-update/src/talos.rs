@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::unit::InstallerFailed;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -306,11 +307,13 @@ impl crate::unit::Talos for Node {
             match r?.progress.and_then(|p| p.response) {
                 Some(Progress::Message(m)) => tracing::info!(%m, "install"),
                 Some(Progress::ExitCode(0)) => return Ok(()),
-                Some(Progress::ExitCode(c)) => bail!("the installer exited {c}"),
+                Some(Progress::ExitCode(c)) => {
+                    return Err(InstallerFailed(format!("it exited {c}")).into());
+                }
                 None => {}
             }
         }
-        bail!("the install ended without an exit code")
+        Err(InstallerFailed("it ended without an exit code".into()).into())
     }
 
     async fn reboot(&self) -> anyhow::Result<()> {

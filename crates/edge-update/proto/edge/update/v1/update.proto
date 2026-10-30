@@ -289,24 +289,21 @@ message Progress {
 
 enum TrialKind {
   TRIAL_KIND_UNSPECIFIED = 0;
-  // The unit commits the OS once it has stayed up.
+  // The unit blesses the OS once its watchdog is fed with every check passing.
   TRIAL_KIND_OS = 1;
-  // The stack's judge commits the release once it has stayed healthy.
+  // The stack's judge commits the release once its checks pass, and rolls it
+  // back on a failure.
   TRIAL_KIND_STACK = 2;
 }
 
 message Trial {
+  reserved 4, 5, 6, 7;
+  reserved "window_secs", "healthy_since_unix", "fail_after_secs", "unhealthy_secs";
+
   TrialKind kind = 1;
   // The release on trial.
   string stack_tag = 2;
   int64 started_unix = 3;
-  // Continuous health the judge wants before it commits; 0 if it does not say.
-  int64 window_secs = 4;
-  // When the current healthy streak began; 0 while unhealthy or unknown.
-  int64 healthy_since_unix = 5;
-  // Unhealthy time the judge allows before it rolls back, and the time spent so far.
-  int64 fail_after_secs = 6;
-  int64 unhealthy_secs = 7;
   // What the judge checks, as it last found them.
   repeated Check checks = 8;
   bool can_commit = 9;
@@ -326,6 +323,8 @@ enum CheckState {
   CHECK_STATE_FAIL = 2;
   // Neither: what applying will do, for a person to weigh.
   CHECK_STATE_NOTE = 3;
+  // Not yet passed, and not failed.
+  CHECK_STATE_WAIT = 4;
 }
 
 message Check {

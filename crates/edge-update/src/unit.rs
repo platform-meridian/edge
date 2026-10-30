@@ -26,7 +26,9 @@ pub trait Talos: Send + Sync {
     async fn stage_config(&self, config: &str, dry_run: bool) -> anyhow::Result<()>;
     /// Applies a config now and for every boot after, without a reboot.
     async fn apply_config(&self, config: &str) -> anyhow::Result<()>;
-    /// Pulls the installer and writes the new OS beside the running one.
+    /// Pulls the installer and writes the new OS beside the running one. The
+    /// installer's own failure is [`InstallerFailed`]; any other error is
+    /// what it waits on.
     async fn install(&self, image: &str) -> anyhow::Result<()>;
     /// A power cycle: sd-boot counts the new OS's boots, and a kexec would bypass it.
     async fn reboot(&self) -> anyhow::Result<()>;
@@ -185,3 +187,15 @@ pub struct Stack {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modules: Option<Ref>,
 }
+
+/// The installer ran and failed.
+#[derive(Debug)]
+pub struct InstallerFailed(pub String);
+
+impl std::fmt::Display for InstallerFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the installer failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for InstallerFailed {}

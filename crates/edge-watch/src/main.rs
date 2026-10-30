@@ -185,7 +185,9 @@ async fn run(paths: Paths, sys: Option<PathBuf>, boot_id: Option<String>) -> any
                     tracing::info!("mission path healthy again");
                     was_degraded = false;
                 }
-                pet(&mut wd, &mut pet_failed);
+                if pet(&mut wd, &mut pet_failed) {
+                    health.fed(&store, &mut st);
+                }
             }
             Verdict::Degraded(names) => {
                 gate.clear();
@@ -374,20 +376,38 @@ impl Health {
     }
 }
 
+impl Health {
+    fn fed(&mut self, store: &state::Store, st: &mut state::State) {
+        let Some(id) = &self.boot_id else { return };
+        if let Err(e) = state::set_fed(store, st, id)
+            && !self.write_failed
+        {
+            tracing::warn!(error = %format!("{e:#}"), "could not record the fed watchdog; retrying");
+            self.write_failed = true;
+        }
+    }
+}
+
 fn boottime_secs() -> u64 {
     nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME)
         .map(|t| t.tv_sec().max(0) as u64)
         .unwrap_or(0)
 }
 
-fn pet(wd: &mut watchdog::Watchdog, failed: &mut bool) {
+/// Whether the keepalive was written.
+fn pet(wd: &mut watchdog::Watchdog, failed: &mut bool) -> bool {
     match wd.pet() {
-        Ok(()) => *failed = false,
-        Err(e) if !*failed => {
-            tracing::error!(error = %format!("{e:#}"), "could not pet the watchdog; retrying");
-            *failed = true;
+        Ok(()) => {
+            *failed = false;
+            true
         }
-        Err(_) => {}
+        Err(e) => {
+            if !*failed {
+                tracing::error!(error = %format!("{e:#}"), "could not pet the watchdog; retrying");
+            }
+            *failed = true;
+            false
+        }
     }
 }
 

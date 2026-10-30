@@ -23,6 +23,10 @@ pub struct State {
     pub exhausted: bool,
     #[serde(default)]
     pub healthy_since: Option<HealthySince>,
+    /// The boot, by its id, in which the armed hardware watchdog was fed
+    /// while every check passed.
+    #[serde(default)]
+    pub fed: Option<String>,
 }
 
 /// CLOCK_BOOTTIME, which no clock step moves.
