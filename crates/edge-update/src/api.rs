@@ -44,6 +44,8 @@ pub struct Service {
     commands: mpsc::Sender<Command>,
     status: watch::Receiver<Snapshot>,
     uploads: Arc<Mutex<Uploads>>,
+    /// Marked on each change of the upload, which moves no engine status.
+    uploaded: watch::Sender<()>,
 }
 
 impl Service {
@@ -56,6 +58,7 @@ impl Service {
             commands,
             status,
             uploads: Arc::new(Mutex::new(uploads)),
+            uploaded: watch::Sender::new(()),
         }
     }
 
@@ -79,13 +82,15 @@ impl Service {
     ) -> Result<T, ConnectError> {
         self.idle()?;
         let uploads = self.uploads.clone();
-        tokio::task::spawn_blocking(move || {
+        let got = tokio::task::spawn_blocking(move || {
             let u = uploads.lock().unwrap_or_else(|e| e.into_inner());
             f(&u)
         })
         .await
         .map_err(|e| ConnectError::internal(e.to_string()))?
-        .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))
+        .map_err(|e| ConnectError::failed_precondition(format!("{e:#}")))?;
+        self.uploaded.send_replace(());
+        Ok(got)
     }
 
     async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> Result<T, ConnectError> {
@@ -522,11 +527,16 @@ impl pb::UpdateService for Service {
     ) -> ServiceResult<ServiceStream<pb::WatchStatusResponse>> {
         let mut rx = self.status.clone();
         rx.mark_changed();
+        let uploaded = self.uploaded.subscribe();
         let uploads = self.uploads.clone();
-        let stream = futures::stream::unfold(rx, move |mut rx| {
+        let stream = futures::stream::unfold((rx, uploaded), move |(mut rx, mut uploaded)| {
             let uploads = uploads.clone();
             async move {
-                rx.changed().await.ok()?;
+                tokio::select! {
+                    r = rx.changed() => r.ok()?,
+                    r = uploaded.changed() => r.ok()?,
+                }
+                uploaded.mark_unchanged();
                 let s = rx.borrow_and_update().clone();
                 let up = uploads.lock().ok().and_then(|u| u.current());
                 let status = status(&s, up.as_ref(), engine::unix_now()).into();
@@ -535,7 +545,7 @@ impl pb::UpdateService for Service {
                         status,
                         ..Default::default()
                     }),
-                    rx,
+                    (rx, uploaded),
                 ))
             }
         });
@@ -723,6 +733,27 @@ mod tests {
             ..begin()
         };
         assert!(c.begin_upload(short).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_watcher_sees_an_upload_move() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, _publish, _rx) = serve(d.path()).await;
+        let mut watch = c
+            .watch_status(pb::WatchStatusRequest::default())
+            .await
+            .unwrap();
+        let first = watch.message().await.unwrap().unwrap().to_owned_message();
+        assert!(first.status.upload.is_unset());
+        c.begin_upload(pb::BeginUploadRequest {
+            size: 10,
+            sha256: vec![1; 32],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let next = watch.message().await.unwrap().unwrap().to_owned_message();
+        assert_eq!(next.status.upload.size, 10);
     }
 
     #[tokio::test]
