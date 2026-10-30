@@ -18,8 +18,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::{self, Manifest, Trust, machineconfig};
-use crate::diff::{self, Component, Diff};
 use crate::checks::{Check, CheckState};
+use crate::diff::{self, Component, Diff};
 use crate::steps::{self, State, Step, Taken};
 use crate::unit::{Cluster, Registry, Settings, Talos};
 use crate::upload::Uploads;
@@ -402,7 +402,7 @@ impl Engine {
             Ok(b) => match serde_json::from_slice(&b) {
                 Ok(r) => r,
                 Err(e) => {
-                    // Not trusted: the unit's boot and stack judges finish what was started.
+                    // Not trusted: the unit's boot finishes what was started.
                     tracing::error!(error = %e, "the update record is unreadable; starting afresh");
                     edge_common::set_aside(&path);
                     Record::default()
@@ -623,6 +623,11 @@ impl Engine {
     fn go(&mut self, p: Phase) -> anyhow::Result<()> {
         let now = (self.now)();
         if let Some(s) = steps::of(&p) {
+            // With no new OS there is no OS trial: the system settling is the commit's.
+            let s = match s {
+                Step::OsTrial if steps::skipped(&self.record.steps, Step::Install) => Step::Commit,
+                s => s,
+            };
             steps::enter(&mut self.record.steps, s, now);
         }
         if p != Phase::Idle {
@@ -911,7 +916,10 @@ impl Engine {
             components: diff::components(&u.components, &rel.components(), before.is_some()),
             talos: (u.talos_version.clone(), rel.get("TALOS_VERSION").into()),
             installer: (u.installer.clone(), rel.get("INSTALLER_REF").into()),
-            release: (before.map(|r| r.tag().to_string()).unwrap_or_default(), rel.tag().into()),
+            release: (
+                before.map(|r| r.tag().to_string()).unwrap_or_default(),
+                rel.tag().into(),
+            ),
             reboot,
             config_changes,
             downtime_secs: downtime,
@@ -1012,7 +1020,8 @@ impl Engine {
 
     async fn merged(&self, rel: &Release) -> anyhow::Result<String> {
         let at = self.release_dir(&rel.id).join(bundle::PATCH);
-        let patch = std::fs::read_to_string(&at).with_context(|| format!("reading {}", at.display()))?;
+        let patch =
+            std::fs::read_to_string(&at).with_context(|| format!("reading {}", at.display()))?;
         let unit = self
             .talos
             .machine_config()
@@ -1125,8 +1134,6 @@ impl Engine {
             .collect())
     }
 
-
-
     async fn importing(&mut self) -> anyhow::Result<Next> {
         self.detail = "importing the images".into();
         // A partial bundle's release runs on images an older release brought.
@@ -1214,10 +1221,10 @@ impl Engine {
                 Ok(Go(Phase::Snapshotting))
             }
             Ok(signed) => Ok(Fail(format!(
-                "the unit signed {signed}, not {installer}. The OS and stack are unchanged"
+                "the unit signed {signed}, not {installer}. The OS is unchanged"
             ))),
             Err(e) => Ok(Fail(format!(
-                "the unit did not sign {installer}'s boot files: {e:#}. The OS and stack are unchanged"
+                "the unit did not sign {installer}'s boot files: {e:#}. The OS is unchanged"
             ))),
         }
     }
@@ -1262,7 +1269,7 @@ impl Engine {
     }
 
     /// The config the OS step applies: serving rotation stays as the unit runs
-    /// it until the stack that approves its requests is committed.
+    /// it until the release whose edge-signer approves its requests is committed.
     async fn os_config(&mut self) -> anyhow::Result<String> {
         let rel = self.release()?.clone();
         let running = self
@@ -1351,7 +1358,7 @@ impl Engine {
             Err(e) => {
                 return Ok(Fail(format!(
                     "the unit could not sign {installer}'s boot files: {e:#}. The OS is unchanged; {}. \
-                     The stack did not move",
+                     Nothing else changed",
                     self.restore().await?
                 )));
             }
@@ -1364,7 +1371,7 @@ impl Engine {
             }
             return Ok(Fail(format!(
                 "{installer} did not install: {e:#}. The OS is unchanged; {}. \
-                 The stack did not move; applying again retries",
+                 Nothing else changed; applying again retries",
                 self.restore().await?
             )));
         }
@@ -1414,7 +1421,7 @@ impl Engine {
         Ok(Back(
             format!(
                 "the unit rebooted on its previous OS, as the install did not take or the new OS did not stay up; \
-                 {}. The stack did not move; applying again repeats the upgrade",
+                 {}. Nothing else changed; applying again repeats the upgrade",
                 self.restore().await?
             ),
             "the new OS did not boot".into(),
@@ -1513,8 +1520,8 @@ impl Engine {
         Ok(Done)
     }
 
-    /// Rolls back: the OS on trial through Talos, the stack on trial through its
-    /// judge, or with nothing on trial, the stack to the judge's previous good.
+    /// Rolls the release on trial back: the OS on trial through Talos, or, with
+    /// it blessed and the system settling, by booting the previous OS again.
     pub async fn request_rollback(&mut self, tag: &str, by: &str) -> anyhow::Result<String> {
         match self.record.phase.clone() {
             Phase::Trial => {

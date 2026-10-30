@@ -9,9 +9,9 @@ use connectrpc::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::checks::{Check, CheckState};
 use crate::diff::{Change, Component, Diff};
 use crate::engine::{self, Entry, Outcome, Phase, Power, Record, Release, Storage, Unit};
-use crate::checks::{Check, CheckState};
 use crate::pb::edge::update::v1 as pb;
 use crate::steps::{self, State, Step, Taken};
 use crate::upload::{Upload, Uploads};
@@ -1328,10 +1328,7 @@ mod tests {
         );
         assert_eq!(st.upload.as_option().map(|u| u.by.as_str()), Some("ann"));
         assert_eq!(st.steps.len(), 7, "the trial running, the rest planned");
-        assert_eq!(
-            st.trial.as_option().map(|t| t.release.as_str()),
-            Some("s2")
-        );
+        assert_eq!(st.trial.as_option().map(|t| t.release.as_str()), Some("s2"));
         assert_eq!(st.lock.as_option().map(|l| l.by.as_str()), Some("ann"));
 
         let e = entry(&Entry {

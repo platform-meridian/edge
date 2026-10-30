@@ -1,4 +1,4 @@
-# The registry containerd and Flux pull through, up before the kubelet; misses
+# The registry containerd and the platform operator pull through, up before the kubelet; misses
 # pass through to Talos's registryd. Core pushes apps into it and the app
 # controller deletes them, each with a projected ServiceAccount token for the
 # audience edge-registry, checked against the apiserver's ServiceAccount keys,

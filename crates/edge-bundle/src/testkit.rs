@@ -69,7 +69,6 @@ pub fn tree(dir: &Path, manifest: &str) {
     std::fs::create_dir_all(dir.join("images/blobs/sha256")).unwrap();
     std::fs::write(dir.join("MANIFEST"), manifest).unwrap();
     std::fs::write(dir.join("config-patch.yaml"), "version: v1alpha1\n").unwrap();
-    std::fs::write(dir.join("seed.yaml"), "").unwrap();
     std::fs::write(dir.join(crate::components::COMPONENTS), COMPONENTS).unwrap();
     std::fs::write(
         dir.join("images/oci-layout"),

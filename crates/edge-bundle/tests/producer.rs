@@ -90,9 +90,7 @@ impl Build {
             ],
         );
         oci::from_flat_cache(&dir.path().join("flat"), &dir.path().join("images"), &refs).unwrap();
-        let manifest =
-            edge_bundle::parse_manifest("FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=2000\n")
-                .unwrap();
+        let manifest = edge_bundle::parse_manifest("FORMAT=6\nBUILT_EPOCH=2000\n").unwrap();
         Self {
             manifest,
             patch: machineconfig::strip(&build_config()).unwrap(),
@@ -113,10 +111,9 @@ impl Build {
         Contents {
             manifest: &self.manifest,
             patch: &self.patch,
-            seed: "kind: ConfigMap\n",
             images: &self.images,
+            apps: None,
             notes: None,
-            instance: None,
             components: &self.components,
         }
     }
@@ -165,10 +162,6 @@ fn a_written_bundle_unpacks_as_a_unit_reads_it() {
     assert_eq!(
         std::fs::read_to_string(dest.join(edge_bundle::PATCH)).unwrap(),
         b.patch
-    );
-    assert_eq!(
-        std::fs::read_to_string(dest.join(edge_bundle::SEED)).unwrap(),
-        "kind: ConfigMap\n"
     );
 
     let store = edge_registry::Store::open(b.path("store")).unwrap();
@@ -276,7 +269,7 @@ fn a_build_refuses_what_a_unit_would() {
 
     let bad = Manifest::from([
         ("lower".into(), "x".into()),
-        ("STACK_DIGEST".into(), "sha256:00".into()),
+        ("BUILT_EPOCH".into(), "2".into()),
     ]);
     let mut c = b.contents();
     c.manifest = &bad;
@@ -325,13 +318,13 @@ fn full_and_partial_bundles_round_trip_in_the_one_format() {
 fn a_build_writes_no_other_format() {
     let b = Build::new();
     let out = b.path("b.tar");
-    for f in ["3", "4", ""] {
+    for f in ["4", "5", ""] {
         let mut m = b.manifest.clone();
         m.insert("FORMAT".into(), f.into());
         let mut c = b.contents();
         c.manifest = &m;
         assert!(
-            err(write(&c, signed_as(SIGNER), 0, &out)).contains("this writes 5"),
+            err(write(&c, signed_as(SIGNER), 0, &out)).contains("this writes 6"),
             "{f}"
         );
     }

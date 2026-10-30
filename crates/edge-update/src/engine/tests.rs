@@ -215,7 +215,6 @@ impl World {
         }
         self.blessed_boot = Some(self.boot_id);
     }
-
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -481,7 +480,11 @@ pub(crate) struct Spec {
 impl Spec {
     /// An OS running its own image and a shared one.
     pub(crate) fn new(tag: &str) -> Self {
-        let carried = vec![format!("reg/app:{tag}"), format!("reg/cni:{tag}"), BASE.into()];
+        let carried = vec![
+            format!("reg/app:{tag}"),
+            format!("reg/cni:{tag}"),
+            BASE.into(),
+        ];
         let runs: BTreeSet<String> = carried.iter().cloned().collect();
         Self {
             tag: tag.into(),
@@ -496,23 +499,6 @@ impl Spec {
             apps: Vec::new(),
             components: Components { base: runs },
             raw_components: None,
-        }
-    }
-
-    /// The OS, naming its installer.
-    fn base(tag: &str) -> Self {
-        let c = Components {
-            base: [format!("reg/app:{tag}"), format!("reg/cni:{tag}")].into(),
-        };
-        Self {
-            carried: c.refs().into_iter().collect(),
-            components: c,
-            // The unit installs the installer the base names, and runs it after.
-            patch: format!(
-                "{}---\napiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n  image: reg/installer:{tag}@{DIGEST}\n",
-                patch(tag)
-            ),
-            ..Self::new(tag)
         }
     }
 
@@ -646,7 +632,11 @@ impl Harness {
                 .iter()
                 .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}}))
                 .collect();
-            std::fs::write(apps.join("index.json"), serde_json::json!({ "manifests": named }).to_string()).unwrap();
+            std::fs::write(
+                apps.join("index.json"),
+                serde_json::json!({ "manifests": named }).to_string(),
+            )
+            .unwrap();
         }
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
         manifests.extend(
@@ -791,15 +781,7 @@ async fn a_new_os_is_signed_at_a_reboot_then_installed_with_the_signed_files() {
     h.committed("update-new");
     assert_eq!(
         h.w().log,
-        [
-            "import",
-            "reboot",
-            "stage",
-            "import",
-            "install",
-            "reboot",
-            "collect"
-        ]
+        ["import", "reboot", "stage", "import", "install", "reboot",]
     );
 }
 
@@ -830,14 +812,7 @@ async fn the_os_the_unit_runs_is_not_installed_again() {
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
     h.committed("update-new");
     let w = h.w();
-    assert_eq!(
-        w.log,
-        [
-            "import",
-            "stage",
-            "apply"
-        ]
-    );
+    assert_eq!(w.log, ["import", "stage", "apply"]);
     assert_eq!(w.boot_id, 1, "rebooted");
 }
 
@@ -880,12 +855,7 @@ async fn the_os_is_installed_unless_the_unit_runs_it_already() {
         h.committed("update-new");
         assert_eq!(
             h.w().log,
-            [
-                "import",
-                "stage",
-                "install",
-                "reboot"
-            ],
+            ["import", "stage", "install", "reboot"],
             "{installer} {version}"
         );
     }
@@ -905,15 +875,7 @@ async fn happy() -> (Harness, usize, usize) {
 async fn an_update_commits_in_order() {
     let (h, _, _) = happy().await;
     let w = h.w();
-    assert_eq!(
-        w.log,
-        [
-            "import",
-            "stage",
-            "install",
-            "reboot"
-        ]
-    );
+    assert_eq!(w.log, ["import", "stage", "install", "reboot"]);
     let e = &h.engine.as_ref().unwrap().record.history[0];
     assert!(e.snapshot.is_some());
     let snaps = std::fs::read_dir(h.state().join("snapshots"))
@@ -1257,7 +1219,11 @@ async fn a_bundles_apps_are_imported_under_the_registrys_name() {
     let w = h.w();
     assert_eq!(w.apps.len(), 1);
     assert_eq!(w.apps[0].1, "127.0.0.1:5000");
-    assert!(w.apps[0].0.contains("127.0.0.1:5999/platform-meridian/platform-core/app:v1"));
+    assert!(
+        w.apps[0]
+            .0
+            .contains("127.0.0.1:5999/platform-meridian/platform-core/app:v1")
+    );
 }
 
 #[tokio::test]
@@ -1832,7 +1798,7 @@ async fn verification_says_what_applying_changes() {
     );
     assert_eq!(
         h.e().unit.components.len(),
-        4,
+        3,
         "the running release names what runs"
     );
 }

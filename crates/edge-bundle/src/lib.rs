@@ -697,7 +697,7 @@ mod tests {
     use super::testkit::*;
     use super::*;
 
-    const MF: &str = "FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=2\n";
+    const MF: &str = "FORMAT=6\nBUILT_EPOCH=2\n";
 
     struct Case {
         dir: tempfile::TempDir,
@@ -793,7 +793,7 @@ mod tests {
             (UNSIGNED, "2")
         );
 
-        std::fs::write(c.src().join("seed.yaml"), "kind: Evil\n").unwrap();
+        std::fs::write(c.src().join(PATCH), "kind: Evil\n").unwrap();
         refused(
             &c,
             c.open_with(HEAD, &dev),
@@ -817,11 +817,7 @@ mod tests {
     #[test]
     fn resealed_sums_are_refused() {
         let c = Case::new();
-        std::fs::write(
-            c.src().join(MANIFEST),
-            "FORMAT=5\nSTACK_DIGEST=sha256:00\nBUILT_EPOCH=9\n",
-        )
-        .unwrap();
+        std::fs::write(c.src().join(MANIFEST), "FORMAT=6\nBUILT_EPOCH=9\n").unwrap();
         sign_tree(&c.src(), "an attacker");
         refused(&c, c.open(HEAD), "not a signer this unit trusts");
     }
@@ -915,38 +911,18 @@ mod tests {
         f(&Contents {
             manifest,
             patch: "version: v1alpha1\n",
-            seed: "",
             images: &src.join(IMAGES),
+            apps: None,
             notes: Some("# v1.2.0\n"),
-            instance: None,
             components: &c,
         })
-    }
-
-    #[test]
-    fn a_bundle_is_a_base() {
-        let c = Case::new();
-        let d = c.dir.path();
-        let out = d.join("b.tar");
-        let signer = |s: &[u8]| Ok(sign(SIGNER, s));
-        let app = Manifest::from([("MODULE_APP".into(), "r/app:1".into())]);
-        with_contents(&c.src(), &app, |contents| {
-            let e = write(contents, signer, 1, &out).unwrap_err();
-            assert!(
-                format!("{e:#}").contains("an app is a MeridianApp"),
-                "{e:#}"
-            );
-        });
-        std::fs::write(c.src().join(MANIFEST), "FORMAT=5\nBUILT_EPOCH=2\n").unwrap();
-        sign_tree(&c.src(), SIGNER);
-        refused(&c, c.open(HEAD), "an app is a MeridianApp");
     }
 
     #[test]
     fn a_staged_bundle_seals_into_what_write_writes() {
         let c = Case::new();
         let d = c.dir.path();
-        let m = parse_manifest("STACK_DIGEST=sha256:00\nBUILT_EPOCH=2\n").unwrap();
+        let m = parse_manifest("BUILT_EPOCH=2\n").unwrap();
         with_contents(&c.src(), &m, |contents| {
             let staged = d.join("staged");
             stage(contents, &staged).unwrap();
@@ -977,15 +953,10 @@ mod tests {
     fn another_format_is_refused_by_name() {
         for (mf, why) in [
             (
-                "FORMAT=4\nSTACK_DIGEST=sha256:00\n",
-                "the bundle is format 4, and only format 5 is read",
+                "FORMAT=5\nSTACK_DIGEST=sha256:00\n",
+                "the bundle is format 5, and only format 6 is read",
             ),
-            ("STACK_DIGEST=sha256:00\n", "names no FORMAT"),
-            (
-                "FORMAT=5\nSTACK_TAG=t2\nSTACK_DIGEST=sha256:00\n",
-                "the unit names its releases",
-            ),
-            ("FORMAT=5\nLOCK_PROFILE=edge\n", "names no STACK_DIGEST"),
+            ("BUILT_EPOCH=2\n", "names no FORMAT"),
         ] {
             let c = Case::new();
             std::fs::write(c.src().join(MANIFEST), mf).unwrap();
@@ -1029,8 +1000,7 @@ mod tests {
         let m = parse_manifest(
             "COMPONENT_EDGE_CNI=reg/edge-cni:t2 sha256:aa v1.2-3-gabc dirty=false\n\
              COMPONENT_APP= sha256:bb  dirty=\n\
-             COMPONENT_SHORT=reg/x:1 sha256:cc\n\
-             STACK_TAG=t2\n",
+             COMPONENT_SHORT=reg/x:1 sha256:cc\n",
         )
         .unwrap();
         assert_eq!(

@@ -387,7 +387,7 @@ mod tests {
         assert!(e.to_string().contains("free"), "{e}");
     }
 
-    const MF: &str = "FORMAT=5\nSTACK_DIGEST=sha256:11\nINSTALLER_REF=r/i:1@sha256:22\n\
+    const MF: &str = "FORMAT=6\nINSTALLER_REF=r/i:1@sha256:22\n\
                       TALOS_VERSION=v1.14.1\nBUILT_EPOCH=2000\nSECUREBOOT=1\n";
 
     /// A bundle three chunks long, its head in the first.
@@ -449,8 +449,8 @@ mod tests {
             ("a stranger", MF, "not a signer this unit trusts"),
             (
                 SIGNER,
-                &MF.replace("FORMAT=5", "FORMAT=4")[..],
-                "the bundle is format 4, and only format 5 is read",
+                &MF.replace("FORMAT=6", "FORMAT=5")[..],
+                "the bundle is format 5, and only format 6 is read",
             ),
         ] {
             let data = signed(d.path(), signer, manifest);

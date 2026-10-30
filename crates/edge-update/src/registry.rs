@@ -176,7 +176,9 @@ mod tests {
             .collect();
         // Its empty config the store holds already.
         assert_eq!(r.missing(&fresh).unwrap(), blobs.iter().sum::<u64>() - 2);
-        let drop = ["127.0.0.1:5999/app:t1", "not a ref!"].map(String::from).into();
+        let drop = ["127.0.0.1:5999/app:t1", "not a ref!"]
+            .map(String::from)
+            .into();
         let would = r.forgettable(&drop).unwrap();
         assert!(would > 0);
         assert_eq!(r.forget(&drop).unwrap(), would);

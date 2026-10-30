@@ -2,8 +2,8 @@
 //! by anyone on the host, written by the identities its [`push::Authority`]
 //! names.
 
-mod digest;
 mod apps;
+mod digest;
 mod import;
 mod manifest;
 pub mod push;

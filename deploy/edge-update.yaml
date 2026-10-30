@@ -22,33 +22,13 @@ kind: ClusterRole
 metadata:
   name: edge-update
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps", "serviceaccounts"]
-    verbs: ["get", "create", "update", "patch"]
+  # Whether the workloads have settled on a new OS, and the images they run.
   - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "create", "patch"]
-  - apiGroups: ["apps"]
-    resources: ["daemonsets"]
-    verbs: ["get", "list"]
-  - apiGroups: ["apps"]
-    resources: ["statefulsets"]
-    verbs: ["get"]
+    resources: ["deployments", "daemonsets"]
+    verbs: ["list"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
-    verbs: ["get", "create", "patch"]
-  - apiGroups: ["fluxcd.controlplane.io"]
-    resources: ["fluxinstances"]
-    verbs: ["get", "patch"]
-  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
-    resources: ["kustomizations"]
-    verbs: ["get"]
-  - apiGroups: ["source.toolkit.fluxcd.io"]
-    resources: ["ocirepositories"]
-    verbs: ["get", "patch"]
   # The storage provisioner: a claim of a class it serves becomes a user
   # volume and the PersistentVolume that binds it; a released one goes.
   - apiGroups: [""]

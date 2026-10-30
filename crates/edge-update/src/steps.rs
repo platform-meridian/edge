@@ -69,6 +69,15 @@ pub fn plan(os_changes: bool) -> Vec<Step> {
         .collect()
 }
 
+/// Whether `step` was taken and skipped.
+pub fn skipped(taken: &[Taken], step: Step) -> bool {
+    taken
+        .iter()
+        .rev()
+        .find(|t| t.step == step)
+        .is_some_and(|t| t.state == State::Skipped)
+}
+
 /// Starts `step`, ending the one running; nothing if it runs already.
 pub fn enter(taken: &mut Vec<Taken>, step: Step, now: i64) {
     if taken
@@ -123,12 +132,7 @@ mod tests {
     fn a_release_without_a_new_os_needs_no_os_steps() {
         assert_eq!(
             plan(false),
-            [
-                Step::Upload,
-                Step::Verify,
-                Step::Stage,
-                Step::Commit
-            ]
+            [Step::Upload, Step::Verify, Step::Stage, Step::Commit]
         );
         assert_eq!(plan(true).len(), 7);
     }

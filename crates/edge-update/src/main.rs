@@ -10,10 +10,10 @@
 mod api;
 mod boot;
 mod capabilities;
+mod checks;
 mod cluster;
 mod diff;
 mod engine;
-mod checks;
 mod registry;
 mod steps;
 mod talos;

@@ -42,7 +42,11 @@ impl Store {
         let mut referrers: BTreeMap<(String, Digest), Vec<Value>> = BTreeMap::new();
         let mut tagged = Vec::new();
         let _lock = self.lock()?;
-        for d in index["manifests"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        for d in index["manifests"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
             let digest: Digest = d["digest"]
                 .as_str()
                 .context("an index entry names no digest")?
@@ -121,7 +125,11 @@ mod tests {
     #[test]
     fn a_reference_is_relocated_under_the_registry() {
         assert_eq!(
-            relocated("127.0.0.1:5999/platform-meridian/platform-core/app:v1", "127.0.0.1:5000").unwrap(),
+            relocated(
+                "127.0.0.1:5999/platform-meridian/platform-core/app:v1",
+                "127.0.0.1:5000"
+            )
+            .unwrap(),
             "127.0.0.1:5000/platform-meridian/platform-core/app:v1"
         );
         assert!(relocated("nohost", "h").is_err());

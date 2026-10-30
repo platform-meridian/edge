@@ -30,7 +30,7 @@ Then provide:
   PersistentVolume of at least 16Gi for claim `edge/edge-update-state` (class
   `""`, e.g. a local PV on a user volume), and ConfigMap `edge-update` in
   `edge` holding Sigstore's `trusted_root.json` and a `config.yaml` naming
-  who may sign, the node's store and the stack:
+  who may sign, the node's store and its registry:
 
   ```yaml
   trustedRoot: /etc/edge-update/trusted_root.json
@@ -42,14 +42,7 @@ Then provide:
     allowUnsigned: false              # true for development only
   store: /var/lib/etcd/state.log      # copied off before each update
   bless: /var/mnt/my-volume/blessed   # boot-commit's record of the boot it blessed
-  stack:
-    url: oci://127.0.0.1:5000/my-stack  # the stack artifact's repository on the unit
-    fluxInstance: flux-system/flux
-    kustomization: flux-system/my-stack
-    source: flux-system/my-stack        # the OCIRepository
-    lock: flux-system/my-stack-lock     # built_epoch, and what LOCK_* lines check
-    judge: flux-system/my-stack-commit  # good, previous, trial, rolled_back
-    modules: flux-system/my-modules     # optional: the installed modules, written into each stack
+  registry: 127.0.0.1:5000           # the node store's name, which a first bundle's apps are imported under
   bootSigning:                        # optional: the unit signs each new OS's boot files
     dir: /var/mnt/boot-signing        # mounted at the same path; the host's boot signs what is staged here
     uki: /usr/install/amd64/vmlinuz.efi       # in the installer image
