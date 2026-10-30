@@ -87,7 +87,7 @@ metadata:
     k8s-app: kube-dns
     kubernetes.io/name: KubeDNS
 spec:
-  clusterIP: "@CLUSTER_DNS@"
+  clusterIP: "${CLUSTER_DNS}"
   selector:
     k8s-app: kube-dns
   ports:

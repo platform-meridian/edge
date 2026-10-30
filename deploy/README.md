@@ -1,14 +1,14 @@
 # deploy
 
-A kustomize base whose deployment values are placeholders. Before applying it,
-substitute:
+A kustomize base whose deployment values are `${FACT}`s, the instance's facts
+as the platform operator substitutes them into a rendering (ADR-0015):
 
 | Placeholder | Value |
 |---|---|
-| `@OPERATOR_DOMAIN@` | the domain operators reach the device on |
-| `@OPERATOR_ADDR@` | the address operators reach the device at |
-| `@APISERVER_HOST@`, `@APISERVER_PORT@` | the node's kube-apiserver |
-| `@CLUSTER_DNS@` | the kubelet's `clusterDNS` address |
+| `${OPERATOR_DOMAIN}` | the domain operators reach the device on |
+| `${OPERATOR_ADDR}` | the address operators reach the device at |
+| `${APISERVER_HOST}`, `${APISERVER_PORT}` | the node's kube-apiserver |
+| `${CLUSTER_DNS}` | the kubelet's `clusterDNS` address |
 | `@BUILD_EPOCH@` | the build time, the earliest the clock may read (edge-scope) |
 
 The images are the published `ghcr.io/platform-meridian/edge-<name>`, tagged in
@@ -74,7 +74,7 @@ metadata:
 data:
   routes.yaml: |
     routes:
-      - { hostname: "mine.@OPERATOR_DOMAIN@", prefix: "/", authz: skip, backend: { host: "127.0.0.1", port: 3000 } }
+      - { hostname: "mine.${OPERATOR_DOMAIN}", prefix: "/", authz: skip, backend: { host: "127.0.0.1", port: 3000 } }
 ```
 
 `talos/` holds the Talos extension services: edge-scope, edge-layers,
