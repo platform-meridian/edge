@@ -44,6 +44,35 @@ impl Store {
         Ok(swept)
     }
 
+    /// Deletes the tags `refs` name (a tag, or every tag of a digest in its
+    /// repository), then whatever no remaining tag reaches. What others put
+    /// here (apps, their signatures) is tagged, so it stays.
+    pub fn forget(&self, refs: &[ImageRef]) -> anyhow::Result<Swept> {
+        self.retain(&self.remaining(refs)?)
+    }
+
+    /// What [`Store::forget`] would delete, deleting nothing.
+    pub fn forgettable(&self, refs: &[ImageRef]) -> anyhow::Result<Swept> {
+        self.reclaimable(&self.remaining(refs)?)
+    }
+
+    /// Every tag but those `refs` name, by tag alone.
+    fn remaining(&self, refs: &[ImageRef]) -> anyhow::Result<Vec<ImageRef>> {
+        let named = |t: &ImageRef| {
+            refs.iter().any(|r| {
+                r.repo == t.repo
+                    && ((r.tag.is_some() && r.tag == t.tag)
+                        || (r.tag.is_none() && r.digest.is_some() && r.digest == t.digest))
+            })
+        };
+        Ok(self
+            .tags()?
+            .into_iter()
+            .filter(|t| !named(t))
+            .map(|t| ImageRef { digest: None, ..t })
+            .collect())
+    }
+
     /// Removes the tags in `repo` that name `digest`. The caller holds the lock.
     pub(crate) fn untag(&self, repo: &str, digest: &Digest) -> std::io::Result<()> {
         let mut any = false;

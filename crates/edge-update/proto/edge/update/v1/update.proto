@@ -1,5 +1,5 @@
-// Updates the unit's OS and base from signed bundles. Apps are MeridianApps,
-// which the app controller installs.
+// Updates the unit's OS from signed bundles. Apps, the base's among them, are
+// MeridianApps, which the platform operator installs.
 // Every call is safe to repeat; an update in progress survives a reboot or
 // power cut.
 syntax = "proto3";
@@ -12,10 +12,7 @@ service UpdateService {
   // Stores one chunk. A chunk already held is accepted again.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
   // Checks an uploaded bundle against the trust policy and this unit, changing
-  // nothing. Refused while an update runs,
-  // except on a stack trial that is unhealthy with no good release to roll
-  // back to: that trial is ended as failed, and Apply then moves the stack off
-  // it. Uploads are taken then too.
+  // nothing. Refused while an update runs.
   rpc Install(InstallRequest) returns (InstallResponse);
   // Applies the verified release. Refused while the OS the unit booted is on
   // trial, since the update's own trial falls back to a blessed one.
@@ -30,10 +27,8 @@ service UpdateService {
   rpc Reboot(RebootRequest) returns (RebootResponse);
   // Powers the unit off, on the same terms as Reboot.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
-  // Asks the stack's judge to commit the release on trial now.
-  rpc CommitTrial(CommitTrialRequest) returns (CommitTrialResponse);
-  // Rolls back: the release on trial now, or, with none, the stack to the
-  // judge's previous good release.
+  // Rolls the release on trial back: the unit boots the OS it ran before
+  // again, which it keeps until the next install.
   rpc RollBack(RollBackRequest) returns (RollBackResponse);
   // One update's log: the current or last one, or one from the history.
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
@@ -152,19 +147,9 @@ message ShutdownResponse {
   string detail = 1;
 }
 
-message CommitTrialRequest {
-  // The release on trial, so a client commits what it saw.
-  string stack_tag = 1;
-  string by = 2;
-}
-
-message CommitTrialResponse {
-  Status status = 1;
-}
-
 message RollBackRequest {
-  // The release on trial, or with none on trial, the previous good one to go back to.
-  string stack_tag = 1;
+  // The release on trial, so a client rolls back what it saw.
+  string release = 1;
   string by = 2;
 }
 
@@ -218,10 +203,8 @@ enum Phase {
   PHASE_INSTALLING = 7;
   PHASE_REBOOTING = 8;
   PHASE_TRIAL = 9;
-  PHASE_SEEDING = 10;
-  PHASE_AWAITING_GOOD = 11;
-  PHASE_REPOINTING = 12;
-  PHASE_JUDGING = 13;
+  reserved 10, 11, 12, 13;
+  reserved "PHASE_SEEDING", "PHASE_AWAITING_GOOD", "PHASE_REPOINTING", "PHASE_JUDGING";
   PHASE_COLLECTING = 14;
 }
 
@@ -257,10 +240,8 @@ enum StepKind {
   STEP_KIND_REBOOT = 5;
   // The new OS on trial until the unit commits it.
   STEP_KIND_OS_TRIAL = 6;
-  // Update the judge and move the stack.
-  STEP_KIND_STACK = 7;
-  // The new stack on trial until its judge commits or rolls it back.
-  STEP_KIND_TRIAL = 8;
+  reserved 7, 8;
+  reserved "STEP_KIND_STACK", "STEP_KIND_TRIAL";
   STEP_KIND_COMMIT = 9;
 }
 
@@ -291,22 +272,18 @@ enum TrialKind {
   TRIAL_KIND_UNSPECIFIED = 0;
   // The unit blesses the OS once its watchdog is fed with every check passing.
   TRIAL_KIND_OS = 1;
-  // The stack's judge commits the release once its checks pass, and rolls it
-  // back on a failure.
-  TRIAL_KIND_STACK = 2;
+  reserved 2;
+  reserved "TRIAL_KIND_STACK";
 }
 
 message Trial {
-  reserved 4, 5, 6, 7;
-  reserved "window_secs", "healthy_since_unix", "fail_after_secs", "unhealthy_secs";
+  reserved 4, 5, 6, 7, 8, 9;
+  reserved "window_secs", "healthy_since_unix", "fail_after_secs", "unhealthy_secs", "checks", "can_commit";
 
   TrialKind kind = 1;
   // The release on trial.
-  string stack_tag = 2;
+  string release = 2;
   int64 started_unix = 3;
-  // What the judge checks, as it last found them.
-  repeated Check checks = 8;
-  bool can_commit = 9;
   bool can_roll_back = 10;
 }
 
@@ -375,8 +352,9 @@ message Diff {
   string talos_to = 3;
   string installer_from = 4;
   string installer_to = 5;
-  string stack_from = 6;
-  string stack_to = 7;
+  // The release the unit ran, as this engine minted it, and the new one.
+  string release_from = 6;
+  string release_to = 7;
   // A new OS is installed, so the unit reboots.
   bool reboot = 8;
   // The unit's machine config changes.
@@ -389,21 +367,14 @@ message Diff {
 
 // The unit as it runs, reread every half-minute; an unreadable part keeps its last value.
 message Unit {
+  reserved 2, 3, 4, 5, 6, 9;
+  reserved "stack_tag", "good", "previous", "trial", "rolled_back", "flux_version";
+
   string talos_version = 1;
-  // The stack tag the unit follows.
-  string stack_tag = 2;
-  // The stack judge's record.
-  string good = 3;
-  string previous = 4;
-  // The stack being judged, when it is not the good one.
-  string trial = 5;
-  // "<tag> <time>" of the last rollback.
-  string rolled_back = 6;
   // The running OS is on trial: a boot-counted UKI not yet blessed.
   bool os_trial = 7;
   // The installer the unit's config names.
   string installer = 8;
-  string flux_version = 9;
   // What runs, from the release the unit runs, else from its workloads.
   repeated Component components = 10;
   // The MANIFEST of the release the unit runs, if this engine applied it.
@@ -411,10 +382,10 @@ message Unit {
 }
 
 message Release {
-  // Minted by the unit; it tags the release's stack.
+  // Minted by the unit.
   string id = 1;
   string talos_version = 2;
-  // The installed set's MANIFEST.
+  // The bundle's MANIFEST.
   map<string, string> manifest = 3;
   bytes sha256 = 4;
   string notes = 5;

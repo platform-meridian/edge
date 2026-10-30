@@ -1,7 +1,7 @@
 //! What the engine drives: the node's Talos API, its cluster and the image
 //! registry. Real clients and test fakes both implement these.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -62,32 +62,6 @@ pub enum VolumePhase {
 
 #[async_trait]
 pub trait Cluster: Send + Sync {
-    async fn config_map(&self, at: &Ref) -> anyhow::Result<Option<BTreeMap<String, String>>>;
-    /// Merges one key into a ConfigMap's data.
-    async fn set_key(&self, at: &Ref, key: &str, value: &str) -> anyhow::Result<()>;
-    /// The Flux version the FluxInstance runs.
-    async fn flux_version(&self, instance: &Ref) -> anyhow::Result<String>;
-    /// The FluxInstance's `spec.components`.
-    async fn flux_components(&self, instance: &Ref) -> anyhow::Result<BTreeSet<String>>;
-    /// The apiserver's version: `vX.Y.Z`.
-    async fn kubernetes_version(&self) -> anyhow::Result<String>;
-    /// The FluxInstance's `spec.sync` url and ref.
-    async fn sync(&self, instance: &Ref) -> anyhow::Result<(String, String)>;
-    async fn repoint(
-        &self,
-        instance: &Ref,
-        url: &str,
-        tag: &str,
-        path: Option<&str>,
-    ) -> anyhow::Result<()>;
-    /// Asks Flux to fetch the source now.
-    async fn reconcile(&self, source: &Ref) -> anyhow::Result<()>;
-    /// The Kustomization's last applied revision.
-    async fn applied(&self, kustomization: &Ref) -> anyhow::Result<Option<String>>;
-    /// Server-side applies every object in a manifest stream.
-    async fn apply(&self, manifests: &str) -> anyhow::Result<()>;
-    /// Names of the stream's Deployments not yet rolled out.
-    async fn not_rolled_out(&self, manifests: &str) -> anyhow::Result<Vec<String>>;
     /// Deployments and DaemonSets anywhere with fewer ready than wanted, as
     /// [`crate::cluster::workload`] names them.
     async fn not_ready(&self) -> anyhow::Result<Vec<String>>;
@@ -95,15 +69,20 @@ pub trait Cluster: Send + Sync {
     async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>>;
 }
 
-/// The unit's image store: content-addressed, collected by what is kept.
+/// The unit's image store, content-addressed and shared: this engine's
+/// releases are one of its writers, core's uploads another, so it collects only
+/// what its own releases named.
 pub trait Registry: Send + Sync {
     /// Imports every image an OCI image layout holds, under the names its index gives.
     fn import(&self, layout: &Path) -> anyhow::Result<()>;
-    /// Drops every image `keep` does not name, and whatever only they held;
-    /// returns the bytes freed.
-    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64>;
-    /// The bytes [`Registry::retain`] would free.
-    fn reclaimable(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64>;
+    /// Imports an apps layout (`meridian-app export`), relocated under
+    /// `host`, the store's own name, as core's uploads are.
+    fn import_apps(&self, layout: &Path, host: &str) -> anyhow::Result<()>;
+    /// Drops the images `drop` names, and whatever only they held; returns
+    /// the bytes freed.
+    fn forget(&self, drop: &BTreeSet<String>) -> anyhow::Result<u64>;
+    /// The bytes [`Registry::forget`] would free.
+    fn forgettable(&self, drop: &BTreeSet<String>) -> anyhow::Result<u64>;
     /// Bytes held, and free on its volume.
     fn usage(&self) -> anyhow::Result<(u64, u64)>;
     /// Bytes of a layout's blobs the store does not hold yet.
@@ -153,7 +132,7 @@ impl std::fmt::Display for Ref {
     }
 }
 
-/// What the consumer supplies: who may sign, the node's paths and the stack's names.
+/// What the consumer supplies: who may sign, the node's paths and the store's name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
@@ -164,28 +143,12 @@ pub struct Settings {
     pub store: String,
     /// The node path of boot-commit's record of the boot it blessed.
     pub bless: String,
-    pub stack: Stack,
+    /// The image store's own name, `host:port`: what an apps layout is
+    /// relocated under.
+    pub registry: String,
     /// The unit's own boot keys sign each new OS's boot files, at a boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_signing: Option<crate::boot::Settings>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Stack {
-    /// The OCI repository, on the unit, that serves stack artifacts.
-    pub url: String,
-    pub flux_instance: Ref,
-    pub kustomization: Ref,
-    pub source: Ref,
-    /// The stack's own record: `built_epoch`, and what `LOCK_*` lines check.
-    pub lock: Ref,
-    /// The judge's record: `good`, `previous`, `trial`, `rolled_back`, and
-    /// what it says of a trial (README).
-    pub judge: Ref,
-    /// The ConfigMap the stack's `modules/` writes the installed modules to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub modules: Option<Ref>,
 }
 
 /// The installer ran and failed.

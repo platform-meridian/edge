@@ -3,6 +3,7 @@
 //! names.
 
 mod digest;
+mod apps;
 mod import;
 mod manifest;
 pub mod push;

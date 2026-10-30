@@ -4,24 +4,25 @@
 //! unit's [`Trust`]. A bundle without the signature is taken only by a trust
 //! that allows it; its files are still checked against the sums.
 //!
-//! Every bundle is the unit's base: its OS and the stack. Apps are
-//! `MeridianApp`s, which the platform operator installs, never a bundle.
+//! Every bundle is the unit's OS: Talos, its machine config and the images
+//! that config names. Apps, the base's among them, are `MeridianApp`s, which
+//! the platform operator installs (ADR-0015), never a bundle.
 //!
-//! - `MANIFEST`: `KEY=value` lines. `FORMAT=5` ([`FORMAT`]), `STACK_DIGEST`,
-//!   `INSTALLER_REF` (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version
-//!   the base's anti-rollback compares), `SECUREBOOT`, optionally
-//!   `STACK_PATH`, and `LOCK_<KEY>=v`, which the unit's stack lock must match.
-//! - `components.json`: the base's refs ([`components`]).
+//! - `MANIFEST`: `KEY=value` lines. `FORMAT=6` ([`FORMAT`]), `INSTALLER_REF`
+//!   (by digest), `TALOS_VERSION`, `BUILT_EPOCH` (the version the OS's
+//!   anti-rollback compares), `SECUREBOOT`, and `LOCK_<KEY>=v`, which the
+//!   release the unit runs must match.
+//! - `components.json`: the OS's refs ([`components`]).
 //! - `config-patch.yaml`: the machine config without what the unit keeps
 //!   (`machineconfig`).
-//! - `seed.yaml`: objects applied server-side before the stack moves.
-//! - `images/`: an OCI image layout holding images the components run, the
-//!   installer and the stack artifact, each named in its index by
-//!   `io.containerd.image.name` (`oci`). The unit must already hold any ref
-//!   it leaves out.
+//! - `images/`: an OCI image layout holding images the components run and
+//!   the installer, each named in its index by `io.containerd.image.name`
+//!   (`oci`). The unit must already hold any ref it leaves out.
+//! - `apps/`, optional: the apps its machine config's bootstrap names, an
+//!   OCI layout as `meridian-app export` writes it, imported into the unit's
+//!   registry as core's uploads are. A unit's first bundle, which its
+//!   provisioning uploads, carries it.
 //! - `NOTES.md`, optional: release notes for a person, at most 64 KiB.
-//! - `fluxinstance.yaml`, optional: the FluxInstance the release runs on,
-//!   applied once the stack has brought the operator that knows it.
 //!
 //! `MANIFEST` may also name the images a person cares about, one
 //! `COMPONENT_<NAME>=<ref> <digest> <version> dirty=<bool>` line each
@@ -55,13 +56,12 @@ pub const SUMS: &str = "SHA256SUMS";
 pub const SIGNATURE: &str = "SHA256SUMS.sigstore.json";
 pub const MANIFEST: &str = "MANIFEST";
 pub const PATCH: &str = "config-patch.yaml";
-pub const SEED: &str = "seed.yaml";
 pub const IMAGES: &str = "images";
+pub const APPS: &str = "apps";
 pub const NOTES: &str = "NOTES.md";
-pub const INSTANCE: &str = "fluxinstance.yaml";
 
 /// The one layout read and written: any other `FORMAT` is refused.
-pub const FORMAT: &str = "5";
+pub const FORMAT: &str = "6";
 
 const MAX_SUMS: u64 = 64 << 20;
 const MAX_SIGNATURE: u64 = 64 << 10;
@@ -316,15 +316,7 @@ fn format_check(m: &Manifest) -> anyhow::Result<&'static [&'static str]> {
         Some(f) => bail!("the bundle is format {f}, and only format {FORMAT} is read: rebuild it"),
         None => bail!("the bundle names no FORMAT, and only format {FORMAT} is read: rebuild it"),
     }
-    ensure!(
-        !m.contains_key("STACK_TAG"),
-        "the MANIFEST names a STACK_TAG: the unit names its releases"
-    );
-    ensure!(
-        m.contains_key("STACK_DIGEST"),
-        "the MANIFEST names no STACK_DIGEST: a bundle is a base, and an app is a MeridianApp"
-    );
-    Ok(&[components::COMPONENTS, PATCH, SEED])
+    Ok(&[components::COMPONENTS, PATCH])
 }
 
 /// A bundle of another format is refused as that, before what it lacks for this one.
@@ -416,11 +408,6 @@ fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result
     })
 }
 
-/// An unpacked bundle's FluxInstance, if it carries one.
-pub fn instance(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(dir.join(INSTANCE)).ok()
-}
-
 /// An unpacked bundle's notes, if it carries any.
 pub fn notes(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join(NOTES)).ok()
@@ -500,14 +487,13 @@ pub struct Contents<'a> {
     pub manifest: &'a Manifest,
     /// From [`machineconfig::strip`].
     pub patch: &'a str,
-    pub seed: &'a str,
     /// An OCI image layout ([`oci::from_flat_cache`]).
     pub images: &'a Path,
+    /// The apps the bootstrap names: [`APPS`].
+    pub apps: Option<&'a Path>,
     /// Release notes for a person: [`NOTES`].
     pub notes: Option<&'a str>,
-    /// The FluxInstance the release runs on: [`INSTANCE`].
-    pub instance: Option<&'a str>,
-    /// The base's refs: [`components::COMPONENTS`].
+    /// The OS's refs: [`components::COMPONENTS`].
     pub components: &'a components::Components,
 }
 
@@ -620,21 +606,21 @@ fn sources(contents: &Contents) -> anyhow::Result<BTreeMap<String, Source>> {
         PATCH.into(),
         Source::Bytes(contents.patch.as_bytes().into()),
     );
-    files.insert(SEED.into(), Source::Bytes(contents.seed.as_bytes().into()));
     files.insert(
         components::COMPONENTS.into(),
         Source::Bytes(serde_json::to_vec_pretty(c)?),
     );
-    if let Some(i) = contents.instance {
-        files.insert(INSTANCE.into(), Source::Bytes(i.as_bytes().into()));
-    }
     if let Some(n) = contents.notes {
         files.insert(NOTES.into(), Source::Bytes(n.as_bytes().into()));
     }
-    for p in walk(contents.images)? {
-        let name = Path::new(IMAGES).join(p.strip_prefix(contents.images)?);
-        let name = name.to_str().context("an image layout path is not UTF-8")?;
-        files.insert(name.into(), Source::File(p));
+    let layouts = [(IMAGES, Some(contents.images)), (APPS, contents.apps)];
+    for (under, layout) in layouts {
+        let Some(layout) = layout else { continue };
+        for p in walk(layout)? {
+            let name = Path::new(under).join(p.strip_prefix(layout)?);
+            let name = name.to_str().context("a layout path is not UTF-8")?;
+            files.insert(name.into(), Source::File(p));
+        }
     }
 
     Ok(files)

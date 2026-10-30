@@ -3,10 +3,10 @@
 //! reboot or a power cut at any point resumes from what the unit shows.
 //!
 //! Order: verify, import the images, copy the store off, stage the config,
-//! install the OS on trial and reboot, wait for the unit to commit it, update
-//! the judge, then move the stack and wait for the judge's verdict. The stack
-//! never moves before the OS is committed, so a cut leaves the old system or
-//! the new OS under the old stack.
+//! install the OS on trial and reboot, wait for the unit to bless it, then for
+//! the cluster's workloads to settle on it. A bundle is the OS alone; apps,
+//! the base's among them, are MeridianApps the platform operator installs
+//! (ADR-0015), so nothing here moves software in the cluster.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -17,10 +17,9 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::bundle::components::{self, Components, Installed};
 use crate::bundle::{self, Manifest, Trust, machineconfig};
 use crate::diff::{self, Component, Diff};
-use crate::judge::{self, Check, CheckState, Judge};
+use crate::checks::{Check, CheckState};
 use crate::steps::{self, State, Step, Taken};
 use crate::unit::{Cluster, Registry, Settings, Talos};
 use crate::upload::Uploads;
@@ -36,10 +35,6 @@ const SECURE_BOOT: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 const SAVED_CONFIG: &str = "config-before.yaml";
-/// In a release's directory: its composed stack, and the set.
-const COMPOSED: &str = "composed";
-const INSTALLED: &str = "installed.json";
-
 const HISTORY: usize = 50;
 const SNAPSHOTS: usize = 2;
 const LOG: usize = 200;
@@ -71,14 +66,6 @@ pub enum Phase {
     },
     Trial,
     Settling,
-    Seeding,
-    AwaitingGood,
-    Repointing {
-        rolled_back: String,
-    },
-    Judging {
-        rolled_back: String,
-    },
     Collecting,
 }
 
@@ -92,7 +79,7 @@ pub enum VolumeEdit {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Release {
-    /// Minted by the unit: it tags the release's stack.
+    /// Minted by the unit.
     pub id: String,
     /// The bundle's.
     pub sha256: String,
@@ -104,12 +91,10 @@ pub struct Release {
     pub notes: Option<String>,
     #[serde(default)]
     pub signer: String,
-    /// The OS step left the kubelet's serving rotation off: its approver comes with the stack.
+    /// The OS step left the kubelet's serving rotation as the unit ran it:
+    /// its approver, edge-signer, is an app's, which settles after.
     #[serde(default)]
     pub rotation_held: bool,
-    /// The bundle's FluxInstance is applied.
-    #[serde(default)]
-    pub instance_applied: bool,
     /// Each layout ref and the digest it names.
     #[serde(default)]
     pub images: BTreeMap<String, String>,
@@ -118,19 +103,6 @@ pub struct Release {
     pub checks: Vec<Check>,
     #[serde(default)]
     pub diff: Option<Diff>,
-    /// The stack its set was composed on.
-    #[serde(default)]
-    pub composed_on: Option<String>,
-}
-
-/// A unit's installed set, and the stack composed for it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct Composed {
-    stack: String,
-    /// The repository the stack is tagged in.
-    #[serde(default)]
-    repo: String,
-    installed: Installed,
 }
 
 impl Release {
@@ -148,8 +120,6 @@ impl Release {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Before {
     pub talos: String,
-    pub url: String,
-    pub tag: String,
     pub default_entry: String,
     pub started: i64,
     pub snapshot: Option<String>,
@@ -215,9 +185,6 @@ pub struct Record {
     /// Who started the update.
     #[serde(default)]
     pub by: String,
-    /// The stack trial this update ended, with nothing to roll back to.
-    #[serde(default)]
-    pub took_over: String,
 }
 
 impl Record {
@@ -235,13 +202,17 @@ impl Record {
 }
 
 impl Record {
-    /// The release the unit runs, if this engine committed it.
-    pub fn running(&self, tag: &str) -> Option<&Release> {
+    /// The release the unit runs: the last this engine committed, if any.
+    pub fn running(&self) -> Option<&Release> {
+        self.committed().next()
+    }
+
+    /// Each release this engine committed, the newest first.
+    fn committed(&self) -> impl Iterator<Item = &Release> {
         self.history
             .iter()
             .filter(|e| e.outcome == Outcome::Committed)
             .filter_map(|e| e.release.as_ref())
-            .find(|r| !tag.is_empty() && r.tag() == tag)
     }
 }
 
@@ -262,18 +233,11 @@ pub enum Power {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Unit {
     pub talos_version: String,
-    pub stack_tag: String,
-    pub good: String,
-    pub previous: String,
-    pub trial: String,
-    pub rolled_back: String,
     pub os_trial: bool,
     pub installer: String,
-    pub flux_version: String,
     pub components: Vec<Component>,
     /// The running release's MANIFEST, if this engine applied it.
     pub manifest: Manifest,
-    pub judge: Judge,
 }
 
 /// The work of the step running, as it goes.
@@ -375,28 +339,14 @@ pub fn manifest_check(m: &Manifest) -> anyhow::Result<()> {
     get("BUILT_EPOCH")
         .parse::<i64>()
         .context("BUILT_EPOCH is not a number")?;
-    for k in [
-        "STACK_DIGEST",
-        "INSTALLER_REF",
-        "TALOS_VERSION",
-        "SECUREBOOT",
-    ] {
+    for k in ["INSTALLER_REF", "TALOS_VERSION", "SECUREBOOT"] {
         ensure!(!get(k).is_empty(), "the MANIFEST lacks {k}");
     }
     ensure!(
         get("INSTALLER_REF").contains("@sha256:"),
         "the MANIFEST names the installer by tag, not digest"
     );
-    ensure!(
-        get("STACK_DIGEST").starts_with("sha256:"),
-        "the MANIFEST's STACK_DIGEST is not a sha256"
-    );
     Ok(())
-}
-
-/// `oci://host/repo` as a ref's repository.
-fn stack_repo(url: &str) -> &str {
-    url.strip_prefix("oci://").unwrap_or(url)
 }
 
 /// The bundle installs an OS other than the one the unit runs.
@@ -544,18 +494,9 @@ impl Engine {
         Ok(())
     }
 
-    /// While idle, or on a stack trial that cannot end by itself, which it ends.
+    /// While idle.
     pub async fn request_verify(&mut self, sha256: &str) -> anyhow::Result<()> {
-        let stuck = match self.idle() {
-            true => None,
-            false => Some(
-                self.stuck()
-                    .await
-                    .ok()
-                    .flatten()
-                    .context("an update is in progress")?,
-            ),
-        };
+        anyhow::ensure!(self.idle(), "an update is in progress");
         let up = self
             .uploads()
             .current()
@@ -566,9 +507,6 @@ impl Engine {
             "the bundle is refused: {}",
             up.refused
         );
-        if let Some(trial) = stuck {
-            self.finish(Outcome::Failed, ended(&trial))?;
-        }
         self.record.steps = vec![Taken {
             step: Step::Upload,
             state: State::Done,
@@ -606,7 +544,6 @@ impl Engine {
             "the unit is on trial of {}: wait for it to be blessed or to fall back",
             boot.selected
         );
-        let stuck = self.stuck().await?;
         self.record.error.clear();
         self.record.by = by.into();
         self.record.steps.retain(|t| t.step <= Step::Verify);
@@ -616,60 +553,7 @@ impl Engine {
             format!(" by {by}")
         };
         self.note(format!("applying {tag}{who}"));
-        if let Some(trial) = &stuck {
-            self.end_stuck(trial, by);
-            self.note(ended(trial));
-        }
-        self.record.took_over = stuck.unwrap_or_default();
         self.go(Phase::Starting)
-    }
-
-    /// The stack trial a new bundle may end, read afresh.
-    async fn stuck(&self) -> anyhow::Result<Option<String>> {
-        let (_, on) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        Ok(stuck_trial(&self.record, &on, &self.judge_now().await?))
-    }
-
-    /// Records the stuck trial ended, unless its last entry already does.
-    fn end_stuck(&mut self, trial: &str, by: &str) {
-        let detail = ended(trial);
-        let last = self
-            .record
-            .history
-            .iter()
-            .find(|e| e.release.as_ref().is_some_and(|r| r.tag() == trial));
-        if last.is_some_and(|e| e.outcome == Outcome::Failed && e.detail == detail) {
-            return;
-        }
-        let release = last
-            .and_then(|e| e.release.clone())
-            .unwrap_or_else(|| Release {
-                id: trial.into(),
-                ..Release::default()
-            });
-        let now = (self.now)();
-        self.record.history.insert(
-            0,
-            Entry {
-                release: Some(release),
-                outcome: Outcome::Failed,
-                detail: detail.clone(),
-                started: now,
-                finished: now,
-                snapshot: None,
-                steps: Vec::new(),
-                log: vec![LogLine {
-                    unix: now,
-                    text: detail,
-                }],
-                by: by.into(),
-                rollback_reason: String::new(),
-            },
-        );
-        self.record.history.truncate(HISTORY);
     }
 
     /// Rereads the unit, a part that cannot be read keeping its last reading;
@@ -691,29 +575,7 @@ impl Engine {
             }
             Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's OS"),
         }
-        let st = &self.settings.stack;
-        match async {
-            let (_, tag) = self.cluster.sync(&st.flux_instance).await?;
-            let flux = self.cluster.flux_version(&st.flux_instance).await?;
-            anyhow::Ok((tag, flux, self.cluster.config_map(&st.judge).await?))
-        }
-        .await
-        {
-            Ok((tag, flux, judge)) => {
-                let j = Judge::read(&judge.unwrap_or_default());
-                let u = &mut self.unit;
-                (u.stack_tag, u.flux_version) = (tag, flux);
-                (u.good, u.previous, u.trial, u.rolled_back) = (
-                    j.good.clone(),
-                    j.previous.clone(),
-                    j.trial.clone(),
-                    j.rolled_back.clone(),
-                );
-                u.judge = j;
-            }
-            Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's stack"),
-        }
-        match self.record.running(&self.unit.stack_tag) {
+        match self.record.running() {
             Some(r) => {
                 let u = &mut self.unit;
                 (u.components, u.manifest) = (r.components(), r.manifest.clone());
@@ -795,10 +657,6 @@ impl Engine {
             Phase::Rebooting { boot_id, asked } => self.rebooting(boot_id, asked).await?,
             Phase::Trial => self.trial().await?,
             Phase::Settling => self.settling().await?,
-            Phase::Seeding => self.seeding().await?,
-            Phase::AwaitingGood => self.awaiting_good().await?,
-            Phase::Repointing { rolled_back } => self.repointing(rolled_back).await?,
-            Phase::Judging { rolled_back } => self.judging(&rolled_back).await?,
             Phase::Collecting => self.collecting().await?,
         };
         match next {
@@ -868,7 +726,6 @@ impl Engine {
         );
         self.note(detail.clone());
         self.progress.stop();
-        self.record.took_over.clear();
         let b = self.record.before.take();
         let first = self.record.steps.iter().find(|t| t.step > Step::Verify);
         self.record.history.insert(
@@ -917,182 +774,6 @@ impl Engine {
                 }
             }
         }
-        // An installed set goes with the last release that names its stack.
-        let u = &self.unit;
-        let tags: BTreeSet<String> = self
-            .record
-            .history
-            .iter()
-            .filter_map(|e| e.release.as_ref())
-            .chain(self.record.release.as_ref())
-            .map(|r| r.tag().to_string())
-            .chain([&u.stack_tag, &u.good, &u.previous].map(String::clone))
-            .collect();
-        if let Ok(files) = std::fs::read_dir(self.dir.join("installed")) {
-            for f in files.flatten() {
-                let name = f.file_name().to_string_lossy().into_owned();
-                let tag = name.strip_suffix(".json").unwrap_or(&name);
-                if !tags.contains(tag) {
-                    let _ = std::fs::remove_file(f.path());
-                }
-            }
-        }
-    }
-
-    /// The installed set the unit composed for the stack `tag`, if it did.
-    fn installed(&self, tag: &str) -> anyhow::Result<Option<Composed>> {
-        let file_name = |t: &str| {
-            t.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        };
-        if tag.is_empty() || tag.starts_with('.') || !file_name(tag) {
-            return Ok(None);
-        }
-        let p = self.dir.join("installed").join(format!("{tag}.json"));
-        match std::fs::read(&p) {
-            Ok(b) => Ok(Some(serde_json::from_slice(&b).with_context(|| {
-                format!("{} is not an installed set", p.display())
-            })?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
-        }
-    }
-
-    /// With no recorded set, the base becomes the whole of it: the unit must
-    /// run no module, as the release it runs or its stack's record says,
-    /// since a bundle brings none to carry.
-    async fn runs_no_module(&self, on: &str) -> anyhow::Result<()> {
-        let said = match self.record.running(on) {
-            Some(r) => r.manifest.get(components::MODULES_KEY).cloned(),
-            None => self.recorded_modules().await?,
-        };
-        let runs = said
-            .as_deref()
-            .context("this unit's installed modules are unknown, so a base cannot carry them")?
-            .trim();
-        anyhow::ensure!(
-            runs.is_empty(),
-            "this unit runs modules ({runs}) its installed set does not record, so a base cannot carry them"
-        );
-        Ok(())
-    }
-
-    /// The stack's record of its installed modules, if it keeps one.
-    async fn recorded_modules(&self) -> anyhow::Result<Option<String>> {
-        let Some(at) = &self.settings.stack.modules else {
-            return Ok(None);
-        };
-        Ok(self
-            .cluster
-            .config_map(at)
-            .await?
-            .and_then(|m| m.get(components::MODULES_KEY).cloned()))
-    }
-
-    /// Installs the bundle's base into the unit's set and composes its stack,
-    /// the modules it runs carried as they are.
-    async fn compose(&self, rel: &mut Release) -> anyhow::Result<()> {
-        let dir = self.release_dir(&rel.id);
-        let c = Components::read(&dir)?;
-        let (_, on) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        let current = self.installed(&on)?;
-        if current.is_none() {
-            self.runs_no_module(&on).await?;
-        }
-        let patch = std::fs::read_to_string(dir.join(bundle::PATCH))?;
-        let next = Installed::after(
-            current.as_ref().map(|c| &c.installed),
-            &rel.manifest,
-            &patch,
-            &c,
-        )?;
-        let digest = rel.get("STACK_DIGEST").to_string();
-        let repo = bundle::layout_images(&dir.join(bundle::IMAGES))?
-            .into_iter()
-            .find(|(_, d)| *d == digest)
-            .and_then(|(r, _)| r.rsplit_once(':').map(|(repo, _)| repo.to_string()));
-        rel.manifest = next.manifest();
-        rel.composed_on = Some(on);
-        self.compose_set(rel, next, &digest, repo)
-    }
-
-    /// `next` composed on the stack artifact `base`, tagged in `repo`, else
-    /// in the stack's repository.
-    fn compose_set(
-        &self,
-        rel: &mut Release,
-        next: Installed,
-        base: &str,
-        repo: Option<String>,
-    ) -> anyhow::Result<()> {
-        let st = &self.settings.stack;
-        let dir = self.release_dir(&rel.id);
-        let repo = repo
-            .filter(|r| !r.is_empty())
-            .unwrap_or_else(|| stack_repo(&st.url).to_string());
-        let name = format!("{repo}:{}", rel.id);
-        let record = st
-            .modules
-            .as_ref()
-            .map(|r| (r.namespace.as_str(), r.name.as_str()));
-        let files = components::modules_dir(&next.modules, record)?;
-        let (images, registry) = (dir.join(bundle::IMAGES), self.registry.clone());
-        let out = dir.join(COMPOSED);
-        let _ = std::fs::remove_dir_all(&out);
-        let stack = components::compose(
-            |d| components::layout_blob(&images, d).or_else(|_| registry.read(d)),
-            base,
-            &files,
-            &out,
-            &name,
-        )?;
-        rel.manifest.insert("STACK_DIGEST".into(), stack.clone());
-        let base_stack = |r: &str| {
-            r.strip_prefix(repo.as_str())
-                .is_some_and(|t| t.starts_with([':', '@']))
-        };
-        rel.images.retain(|r, _| !base_stack(r));
-        rel.images.insert(name.clone(), stack.clone());
-        rel.refs = next.refs();
-        rel.refs.retain(|r| !base_stack(r));
-        rel.refs.insert(name);
-        std::fs::write(
-            dir.join(INSTALLED),
-            serde_json::to_vec(&Composed {
-                stack,
-                repo,
-                installed: next,
-            })?,
-        )?;
-        Ok(())
-    }
-
-    /// Without a known installed set, the stack lock's `built_epoch` is the floor.
-    async fn newer_than_the_lock(&self, m: &Manifest) -> anyhow::Result<()> {
-        let st = &self.settings.stack;
-        let lock = self
-            .cluster
-            .config_map(&st.lock)
-            .await?
-            .with_context(|| format!("the unit has no stack lock at {}", st.lock))?;
-        let unit: i64 = lock
-            .get("built_epoch")
-            .and_then(|e| e.parse().ok())
-            .with_context(|| {
-                format!(
-                    "{} has no built_epoch to compare the bundle's with",
-                    st.lock
-                )
-            })?;
-        let epoch: i64 = m.get("BUILT_EPOCH").map_or(Ok(0), |e| e.parse())?;
-        anyhow::ensure!(
-            epoch > unit,
-            "REFUSING A DOWNGRADE: the unit's stack is version {unit} and the bundle is {epoch}"
-        );
-        Ok(())
     }
 
     async fn verifying(&mut self, sha: &str) -> anyhow::Result<Tick> {
@@ -1110,12 +791,13 @@ impl Engine {
         .await?;
         self.progress.stop();
         let release = match unpacked.and_then(|u| {
-            bundle::check(&dir)?;
+            let (components, _) = bundle::check(&dir)?;
             let images = bundle::layout_images(&dir.join(bundle::IMAGES))?;
             Ok(Release {
                 id: id.clone(),
                 sha256: sha.into(),
                 manifest: u.manifest,
+                refs: components.refs(),
                 notes: bundle::notes(&dir),
                 signer: u.signer,
                 images,
@@ -1131,13 +813,6 @@ impl Engine {
             }
         };
         self.refresh_unit().await;
-        let mut release = release;
-        if let Err(e) = self.compose(&mut release).await {
-            let _ = std::fs::remove_dir_all(&dir);
-            self.record.release = None;
-            self.finish(Outcome::Refused, format!("{e:#}"))?;
-            return Ok(Tick::Moved);
-        }
         self.verified(release).await?;
         if self.record.release.is_some() {
             self.uploads().discard();
@@ -1145,7 +820,7 @@ impl Engine {
         Ok(Tick::Moved)
     }
 
-    /// A composed release checked against the unit: kept for `Apply`, or refused.
+    /// A release checked against the unit: kept for `Apply`, or refused.
     async fn verified(&mut self, mut release: Release) -> anyhow::Result<()> {
         let refusal = self.refusal(&release).await;
         let (checks, diff, short) = self.assess(&release, refusal.as_deref()).await;
@@ -1231,12 +906,12 @@ impl Engine {
             CheckState::Note,
             format!("{downtime}"),
         ));
-        let before = self.record.running(&u.stack_tag);
+        let before = self.record.running();
         let diff = Diff {
             components: diff::components(&u.components, &rel.components(), before.is_some()),
             talos: (u.talos_version.clone(), rel.get("TALOS_VERSION").into()),
             installer: (u.installer.clone(), rel.get("INSTALLER_REF").into()),
-            stack: (u.stack_tag.clone(), rel.tag().into()),
+            release: (before.map(|r| r.tag().to_string()).unwrap_or_default(), rel.tag().into()),
             reboot,
             config_changes,
             downtime_secs: downtime,
@@ -1264,10 +939,10 @@ impl Engine {
         use anyhow::ensure;
         manifest_check(&rel.manifest)?;
         let dir = self.release_dir(&rel.id);
-        let mut carried = bundle::layout_refs(&dir.join(COMPOSED))?;
-        if dir.join(bundle::IMAGES).exists() {
-            carried.extend(bundle::layout_refs(&dir.join(bundle::IMAGES))?);
-        }
+        let carried = match dir.join(bundle::IMAGES).exists() {
+            true => bundle::layout_refs(&dir.join(bundle::IMAGES))?,
+            false => BTreeSet::new(),
+        };
         let lacking: Vec<&str> = rel
             .refs
             .iter()
@@ -1300,34 +975,28 @@ impl Engine {
                 "the unit enforces Secure Boot and the bundle was built without it"
             );
         }
-        let st = &self.settings.stack;
-        let lock = self
-            .cluster
-            .config_map(&st.lock)
-            .await?
-            .with_context(|| format!("the unit has no stack lock at {}", st.lock))?;
-        for (k, v) in rel
-            .manifest
-            .iter()
-            .filter_map(|(k, v)| Some((k.strip_prefix("LOCK_")?, v)))
-        {
-            let theirs = lock.get(k).map(String::as_str).unwrap_or_default();
+        // The release the unit runs is the lock: the same profile, and no
+        // older base. A unit that has run none takes the bundle it is
+        // provisioned with.
+        if let Some(running) = self.record.running() {
+            for (k, v) in rel.manifest.iter().filter(|(k, _)| k.starts_with("LOCK_")) {
+                let theirs = running.get(k);
+                ensure!(
+                    theirs == v,
+                    "the bundle is for {}={v:?} and the unit runs {}={theirs:?}",
+                    &k[5..],
+                    &k[5..]
+                );
+            }
+            let (unit, epoch): (i64, i64) = (
+                running.get("BUILT_EPOCH").parse().unwrap_or(0),
+                rel.get("BUILT_EPOCH").parse().unwrap_or(0),
+            );
             ensure!(
-                theirs == v,
-                "the bundle is for {k}={v:?} and the unit has {k}={theirs:?}"
+                epoch >= unit,
+                "REFUSING A DOWNGRADE: the unit runs a base built at {unit} and the bundle's is {epoch}"
             );
         }
-        let (_, tag) = self.cluster.sync(&st.flux_instance).await?;
-        if let Some(on) = &rel.composed_on {
-            ensure!(
-                tag == *on || tag == rel.tag(),
-                "the unit's stack moved from {on} to {tag} since the bundle was verified: verify it again"
-            );
-        }
-        if self.installed(&tag)?.is_none() {
-            self.newer_than_the_lock(&rel.manifest).await?;
-        }
-        self.requires(rel).await?;
         ensure!(
             self.talos.size(&self.settings.store).await?.is_some(),
             "there is no store at {} to copy before the update",
@@ -1341,54 +1010,9 @@ impl Engine {
         Ok(())
     }
 
-    fn set(&self, rel: &Release) -> anyhow::Result<Installed> {
-        let p = self.release_dir(&rel.id).join(INSTALLED);
-        let b = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-        Ok(serde_json::from_slice::<Composed>(&b)?.installed)
-    }
-
-    /// Checks each module's `requires` against the unit.
-    async fn requires(&self, rel: &Release) -> anyhow::Result<()> {
-        use anyhow::ensure;
-        let talos = rel.get("TALOS_VERSION");
-        let (mut kubernetes, mut flux) = (None, None);
-        for (name, m) in &self.set(rel)?.modules {
-            let r = &m.requires;
-            ensure!(
-                r.talos.is_empty() || version_ge(talos, &r.talos),
-                "{name} requires Talos {} and the unit would run {talos}",
-                r.talos
-            );
-            if !r.kubernetes.is_empty() {
-                if kubernetes.is_none() {
-                    kubernetes = Some(self.cluster.kubernetes_version().await?);
-                }
-                let k = kubernetes.as_deref().unwrap_or_default();
-                ensure!(
-                    version_ge(k, &r.kubernetes),
-                    "{name} requires Kubernetes {} and the unit runs {k}",
-                    r.kubernetes
-                );
-            }
-            if !r.flux.is_empty() {
-                if flux.is_none() {
-                    let at = &self.settings.stack.flux_instance;
-                    flux = Some(self.cluster.flux_components(at).await?);
-                }
-                let has = flux.as_ref().map(|f| r.flux.difference(f));
-                let lacks: Vec<&str> = has.into_iter().flatten().map(String::as_str).collect();
-                ensure!(
-                    lacks.is_empty(),
-                    "{name} requires Flux's {} and the unit's FluxInstance runs none",
-                    lacks.join(", ")
-                );
-            }
-        }
-        Ok(())
-    }
-
     async fn merged(&self, rel: &Release) -> anyhow::Result<String> {
-        let patch = self.set(rel)?.patch()?;
+        let at = self.release_dir(&rel.id).join(bundle::PATCH);
+        let patch = std::fs::read_to_string(&at).with_context(|| format!("reading {}", at.display()))?;
         let unit = self
             .talos
             .machine_config()
@@ -1449,10 +1073,6 @@ impl Engine {
         if let Some(why) = self.refusal(&rel).await {
             return Ok(Refuse(why));
         }
-        let (url, tag) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
         // Saved before anything stages: a cut after staging boots the old OS on the new config.
         let running = self
             .talos
@@ -1468,8 +1088,6 @@ impl Engine {
         .context("save the unit's machine config")?;
         self.record.before = Some(Before {
             talos: self.talos.version().await?,
-            url,
-            tag,
             default_entry: self.boot().await?.default,
             started: (self.now)(),
             snapshot: None,
@@ -1480,52 +1098,53 @@ impl Engine {
         Ok(Go(Phase::Importing))
     }
 
-    fn committed_refs(&self, n: usize) -> BTreeSet<String> {
-        self.record
+    /// What this engine's releases named that the newest `n` committed, and
+    /// the one under way, do not, nor the cluster runs: what it may collect.
+    /// Nothing else in the store is its to collect.
+    async fn beyond(&self, n: usize) -> anyhow::Result<BTreeSet<String>> {
+        let kept: BTreeSet<&String> = self
+            .record
+            .committed()
+            .take(n)
+            .chain(self.record.release.as_ref())
+            .flat_map(|r| &r.refs)
+            .collect();
+        let running = self
+            .cluster
+            .images_in_use()
+            .await
+            .context("read the images the cluster runs")?;
+        Ok(self
+            .record
             .history
             .iter()
-            .filter(|e| e.outcome == Outcome::Committed)
             .filter_map(|e| e.release.as_ref())
-            .take(n)
-            .flat_map(|r| r.refs.iter().cloned())
-            .collect()
+            .flat_map(|r| &r.refs)
+            .filter(|r| !kept.contains(r) && !running.contains(*r))
+            .cloned()
+            .collect())
     }
 
-    /// Also what the cluster runs: a failed update leaves its judge seeded.
-    async fn keep(&self, mut refs: BTreeSet<String>) -> anyhow::Result<BTreeSet<String>> {
-        refs.extend(
-            self.cluster
-                .images_in_use()
-                .await
-                .context("read the images the cluster runs")?,
-        );
-        Ok(refs)
-    }
+
 
     async fn importing(&mut self) -> anyhow::Result<Next> {
         self.detail = "importing the images".into();
-        let mut keep = self.committed_refs(2);
         // A partial bundle's release runs on images an older release brought.
-        keep.extend(self.release()?.refs.iter().cloned());
-        let keep = self.keep(keep).await?;
+        let drop = self.beyond(2).await?;
         let dir = self.release_dir(&self.release()?.id);
-        let (layout, composed) = (dir.join(bundle::IMAGES), dir.join(COMPOSED));
-        let registry = self.registry.clone();
+        let (layout, apps) = (dir.join(bundle::IMAGES), dir.join(bundle::APPS));
+        let (registry, host) = (self.registry.clone(), self.settings.registry.clone());
         tokio::task::spawn_blocking(move || {
-            registry.retain(&keep)?;
+            registry.forget(&drop)?;
             if layout.exists() {
                 registry.import(&layout)?;
             }
-            registry.import(&composed)
+            if apps.exists() {
+                registry.import_apps(&apps, &host)?;
+            }
+            anyhow::Ok(())
         })
         .await??;
-        if let Ok(set) = std::fs::read(dir.join(INSTALLED)) {
-            let d = self.dir.join("installed");
-            std::fs::create_dir_all(&d)?;
-            let tag = self.release()?.tag().to_string();
-            edge_common::durable_write(&d.join(format!("{tag}.json")), &set)
-                .context("record the installed set")?;
-        }
         Ok(Go(Phase::Signing {
             boot_id: String::new(),
             asked: None,
@@ -1624,8 +1243,8 @@ impl Engine {
         let sha = crate::upload::hash_file(&dir.join("state.log"))?;
         let b = self.before()?;
         let pre = serde_json::json!({
-            "taken": (self.now)(), "talos_before": b.talos, "stack_before": b.tag,
-            "stack_url_before": b.url, "update": tag, "bytes": got, "sha256": sha,
+            "taken": (self.now)(), "talos_before": b.talos,
+            "release_before": self.record.running().map(|r| r.tag().to_string()), "update": tag, "bytes": got, "sha256": sha,
         });
         edge_common::durable_write(&dir.join("PRE-UPDATE.json"), pre.to_string().as_bytes())?;
         let mut all: Vec<_> = std::fs::read_dir(&root)?
@@ -1686,7 +1305,7 @@ impl Engine {
     async fn installing(&mut self) -> anyhow::Result<Next> {
         if self.release()?.os_done {
             self.skip_step();
-            return Ok(Go(Phase::Seeding));
+            return Ok(Go(Phase::Settling));
         }
         let b = self.boot().await?;
         if b.trial() {
@@ -1712,7 +1331,7 @@ impl Engine {
                         r.os_done = true;
                     }
                     self.skip_step();
-                    return Ok(Go(Phase::Seeding));
+                    return Ok(Go(Phase::Settling));
                 }
                 Err(e) => {
                     let signed = self.release()?.get("INSTALLER_REF").to_string();
@@ -1848,7 +1467,7 @@ impl Engine {
             };
             return Ok(Back(
                 format!(
-                    "{why}; {}. The stack did not move; applying again repeats the upgrade",
+                    "{why}; {}. Applying again repeats the upgrade",
                     self.restore().await?
                 ),
                 reason,
@@ -1868,192 +1487,13 @@ impl Engine {
         Ok(Go(Phase::Settling))
     }
 
-    /// A bundle without a base has none.
-    fn seed(&self) -> anyhow::Result<String> {
-        let dir = self.release_dir(&self.release()?.id);
-        match std::fs::read_to_string(dir.join(bundle::SEED)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            r => Ok(r?),
-        }
-    }
-
-    /// The seed's own workloads are not waited for: seeding replaces them, and
-    /// a broken judge must not block the update that brings its fix.
+    /// The new OS is blessed: the cluster's workloads come back on it.
     async fn settling(&mut self) -> anyhow::Result<Next> {
-        let replaced = crate::cluster::declared(&self.seed()?)?;
-        let mut waiting = self.cluster.not_ready().await?;
-        waiting.retain(|w| !replaced.contains(w));
+        let waiting = self.cluster.not_ready().await?;
         if waiting.is_empty() {
-            return Ok(Go(Phase::Seeding));
-        }
-        poll(15, format!("waiting for {}", waiting.join(", ")))
-    }
-
-    async fn seeding(&mut self) -> anyhow::Result<Next> {
-        let seed = self.seed()?;
-        if seed.trim().is_empty() {
-            return Ok(Go(Phase::AwaitingGood));
-        }
-        self.cluster
-            .apply(&seed)
-            .await
-            .context("apply the bundle's seed")?;
-        let waiting = self.cluster.not_rolled_out(&seed).await?;
-        if waiting.is_empty() {
-            return Ok(Go(Phase::AwaitingGood));
-        }
-        poll(10, format!("rolling out {}", waiting.join(", ")))
-    }
-
-    async fn judge(&self) -> anyhow::Result<(String, String)> {
-        let r = self
-            .cluster
-            .config_map(&self.settings.stack.judge)
-            .await?
-            .unwrap_or_default();
-        let get = |k: &str| r.get(k).cloned().unwrap_or_default();
-        Ok((get("good"), get("rolled_back")))
-    }
-
-    async fn awaiting_good(&mut self) -> anyhow::Result<Next> {
-        let tag = self.release()?.tag().to_string();
-        let (_, now) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        let (good, rolled_back) = self.judge().await?;
-        if now == tag {
-            return Ok(Go(Phase::Judging { rolled_back }));
-        }
-        let prev = self.before()?.tag.clone();
-        // A trial taken over had nothing to roll back to, and never will.
-        let ended = good.is_empty() && self.record.took_over == prev;
-        if good == prev || ended {
-            return Ok(Go(Phase::Repointing { rolled_back }));
-        }
-        poll(
-            15,
-            format!("waiting for the judge to record {prev} as good"),
-        )
-    }
-
-    async fn repointing(&mut self, rolled_back: String) -> anyhow::Result<Next> {
-        let rel = self.release()?;
-        let st = &self.settings.stack;
-        let path = rel.manifest.get("STACK_PATH").map(String::as_str);
-        self.cluster
-            .repoint(&st.flux_instance, &st.url, rel.tag(), path)
-            .await?;
-        if let Err(e) = self.cluster.reconcile(&st.source).await {
-            tracing::warn!(error = %e, "could not ask Flux to fetch now; it will on its interval");
-        }
-        Ok(Go(Phase::Judging { rolled_back }))
-    }
-
-    /// The bundle's FluxInstance, once Flux has applied the stack that brings
-    /// the operator knowing its version, and while the stack is still this release's.
-    async fn instance(&mut self, applied: Option<&str>) -> anyhow::Result<()> {
-        let rel = self.release()?;
-        let signed = format!("{}@{}", rel.tag(), rel.get("STACK_DIGEST"));
-        if rel.instance_applied || applied != Some(signed.as_str()) {
-            return Ok(());
-        }
-        let Some(instance) = bundle::instance(&self.release_dir(&rel.id)) else {
-            return Ok(());
-        };
-        let tag = rel.tag().to_string();
-        let (_, now) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        if now != tag {
-            return Ok(());
-        }
-        self.cluster
-            .apply(&instance)
-            .await
-            .context("apply the release's FluxInstance")?;
-        if let Some(r) = self.record.release.as_mut() {
-            r.instance_applied = true;
-        }
-        self.note("applied the release's FluxInstance");
-        self.save()
-    }
-
-    async fn judging(&mut self, rolled_back_before: &str) -> anyhow::Result<Next> {
-        let applied = self
-            .cluster
-            .applied(&self.settings.stack.kustomization)
-            .await?;
-        self.instance(applied.as_deref()).await?;
-        let rel = self.release()?;
-        let tag = rel.tag().to_string();
-        let signed = format!("{tag}@{}", rel.get("STACK_DIGEST"));
-        if let Some(r) = applied
-            && r.starts_with(&format!("{tag}@"))
-            && r != signed
-        {
-            let b = self.before()?.clone();
-            let st = &self.settings.stack;
-            self.cluster
-                .repoint(&st.flux_instance, &b.url, &b.tag, None)
-                .await?;
-            return Ok(Fail(format!(
-                "the unit applied {r}, not the signed {signed}; the stack is back on {}",
-                b.tag
-            )));
-        }
-        let (good, rolled_back) = self.judge().await?;
-        let asked_by = self.before()?.rollback_by.clone();
-        if rolled_back != rolled_back_before && rolled_back.starts_with(&format!("{tag} ")) {
-            if !asked_by.is_empty() {
-                return Ok(Back(
-                    format!("{tag} was rolled back to {good} as {asked_by} asked ({rolled_back})"),
-                    asked(&asked_by),
-                ));
-            }
-            let failed = self
-                .judge_now()
-                .await?
-                .checks
-                .into_iter()
-                .filter(|c| c.state == CheckState::Fail)
-                .map(|c| format!("{}: {}", c.name, c.detail))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Ok(Back(
-                format!(
-                    "the unit found {tag} failing and rolled the stack back to {good} ({rolled_back})"
-                ),
-                if failed.is_empty() {
-                    format!("{tag} failed its checks")
-                } else {
-                    format!("{tag} failed: {failed}")
-                },
-            ));
-        }
-        if good == tag {
             return Ok(Go(Phase::Collecting));
         }
-        let (_, now) = self
-            .cluster
-            .sync(&self.settings.stack.flux_instance)
-            .await?;
-        if now != tag {
-            if !asked_by.is_empty() {
-                return Ok(Back(
-                    format!("{tag} was rolled back to {now} as {asked_by} asked"),
-                    asked(&asked_by),
-                ));
-            }
-            return Ok(Fail(format!(
-                "an operator moved the stack to {now} while {tag} was on trial; the update ends here"
-            )));
-        }
-        poll(
-            30,
-            format!("{tag} is on trial; the unit's judge commits it once its checks pass"),
-        )
+        poll(15, format!("waiting for {}", waiting.join(", ")))
     }
 
     async fn collecting(&mut self) -> anyhow::Result<Next> {
@@ -2066,46 +1506,11 @@ impl Engine {
             if let Some(r) = self.record.release.as_mut() {
                 r.rotation_held = false;
             }
-            self.note("the kubelet's serving certificate rotation is on: the stack approves it");
+            self.note("the kubelet's serving certificate rotation is on: edge-signer approves it");
             self.save()?;
         }
-        let mut keep = self.release()?.refs.clone();
-        keep.extend(self.committed_refs(1));
-        self.registry.retain(&self.keep(keep).await?)?;
+        self.registry.forget(&self.beyond(1).await?)?;
         Ok(Done)
-    }
-
-    /// The trial running, if any: the stack's, which the judge holds.
-    fn stack_trial(&self) -> Option<String> {
-        match &self.record.phase {
-            Phase::Judging { .. } => self.record.release.as_ref().map(|r| r.tag().to_string()),
-            Phase::Idle
-                if !self.unit.trial.is_empty() && self.unit.trial == self.unit.stack_tag =>
-            {
-                Some(self.unit.trial.clone())
-            }
-            _ => None,
-        }
-    }
-
-    /// Asks the judge to commit the stack on trial now.
-    pub async fn request_commit(&mut self, tag: &str, by: &str) -> anyhow::Result<()> {
-        let trial = self.stack_trial().context("no stack is on trial")?;
-        anyhow::ensure!(trial == tag, "{trial} is on trial, not {tag}");
-        let j = self.judge_now().await?;
-        anyhow::ensure!(
-            j.takes("commit"),
-            "the unit's judge takes no commit requests"
-        );
-        self.cluster
-            .set_key(
-                &self.settings.stack.judge,
-                judge::REQUEST,
-                &judge::request("commit", tag),
-            )
-            .await?;
-        self.note(format!("{} asked to commit {tag}", who(by)));
-        Ok(())
     }
 
     /// Rolls back: the OS on trial through Talos, the stack on trial through its
@@ -2136,9 +1541,9 @@ impl Engine {
                     self.before()?.default_entry
                 ))
             }
-            // The OS is blessed and the stack not yet moved: the previous OS,
-            // which the unit keeps until the next install, boots again.
-            Phase::Settling | Phase::Seeding | Phase::AwaitingGood => {
+            // The OS is blessed and the workloads settling on it: the previous
+            // OS, which the unit keeps until the next install, boots again.
+            Phase::Settling => {
                 let rel = self.release()?.tag().to_string();
                 anyhow::ensure!(rel == tag, "{rel} is on trial, not {tag}");
                 let rebooted = self.release()?.diff.as_ref().is_none_or(|d| d.reboot);
@@ -2150,7 +1555,7 @@ impl Engine {
                 if !rebooted {
                     self.record.phase = Phase::Trial;
                     self.save()?;
-                    return Ok(format!("ending {tag}: the stack does not move"));
+                    return Ok(format!("ending {tag}: it changed no OS"));
                 }
                 self.record.phase = Phase::Trial;
                 self.save()?;
@@ -2160,161 +1565,24 @@ impl Engine {
                     self.before()?.default_entry
                 ))
             }
-            Phase::Judging { .. } => {
-                let rel = self.release()?.tag().to_string();
-                anyhow::ensure!(rel == tag, "{rel} is on trial, not {tag}");
-                if let Some(b) = self.record.before.as_mut() {
-                    b.rollback_by = by.into();
-                }
-                self.note(format!("{} asked to roll {tag} back", who(by)));
-                self.save()?;
-                let st = self.settings.stack.clone();
-                if self.judge_now().await?.takes("rollback") {
-                    self.cluster
-                        .set_key(&st.judge, judge::REQUEST, &judge::request("rollback", tag))
-                        .await?;
-                } else {
-                    let b = self.before()?.clone();
-                    self.cluster
-                        .repoint(&st.flux_instance, &b.url, &b.tag, None)
-                        .await?;
-                }
-                Ok(format!("rolling {tag} back"))
-            }
-            Phase::Idle if self.stack_trial().as_deref() == Some(tag) => {
-                anyhow::ensure!(
-                    self.judge_now().await?.takes("rollback"),
-                    "the unit's judge takes no rollback requests"
-                );
-                self.cluster
-                    .set_key(
-                        &self.settings.stack.judge,
-                        judge::REQUEST,
-                        &judge::request("rollback", tag),
-                    )
-                    .await?;
-                Ok(format!("rolling {tag} back"))
-            }
-            Phase::Idle => self.revert(tag, by).await,
+            Phase::Idle => anyhow::bail!("nothing is on trial to roll back"),
             _ => anyhow::bail!("the update is under way: nothing is on trial to roll back"),
         }
     }
 
-    /// Points the stack at the judge's previous good release, which the judge
-    /// then takes on trial like any other.
-    async fn revert(&mut self, tag: &str, by: &str) -> anyhow::Result<String> {
-        let j = self.judge_now().await?;
-        let st = self.settings.stack.clone();
-        let (_, running) = self.cluster.sync(&st.flux_instance).await?;
-        anyhow::ensure!(
-            !j.previous.is_empty(),
-            "the unit has no previous good release"
-        );
-        anyhow::ensure!(
-            j.previous == tag,
-            "the previous good release is {}, not {tag}",
-            j.previous
-        );
-        anyhow::ensure!(
-            j.trial.is_empty() && running == j.good,
-            "the unit runs {running}, not its good release {}",
-            j.good
-        );
-        let release = self
-            .record
-            .history
-            .iter()
-            .filter_map(|e| e.release.as_ref())
-            .find(|r| r.tag() == tag)
-            .cloned();
-        if let Some(r) = &release {
-            anyhow::ensure!(
-                r.refs.iter().all(|i| self.registry.digest(i).is_some()),
-                "{tag}'s images were collected: it can only be uploaded again"
-            );
-        }
-        let path = release
-            .as_ref()
-            .and_then(|r| r.manifest.get("STACK_PATH"))
-            .cloned();
-        self.cluster
-            .repoint(&st.flux_instance, &st.url, tag, path.as_deref())
-            .await?;
-        if let Err(e) = self.cluster.reconcile(&st.source).await {
-            tracing::warn!(error = %e, "could not ask Flux to fetch now; it will on its interval");
-        }
-        let now = (self.now)();
-        let detail = format!("{running} rolled back to {tag}");
-        self.record.history.insert(
-            0,
-            Entry {
-                release,
-                outcome: Outcome::RolledBack,
-                detail: detail.clone(),
-                started: now,
-                finished: now,
-                snapshot: None,
-                steps: Vec::new(),
-                log: vec![LogLine {
-                    unix: now,
-                    text: format!("{} asked to roll {running} back to {tag}", who(by)),
-                }],
-                by: by.into(),
-                rollback_reason: asked(by),
-            },
-        );
-        self.record.history.truncate(HISTORY);
-        self.save()?;
-        Ok(detail)
-    }
-
-    async fn judge_now(&self) -> anyhow::Result<Judge> {
-        Ok(Judge::read(
-            &self
-                .cluster
-                .config_map(&self.settings.stack.judge)
-                .await?
-                .unwrap_or_default(),
-        ))
-    }
-
-    /// The refs a collection keeps: what runs, the release verified or being
-    /// applied, and the release running; and the previous good release's.
-    async fn kept(&self) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
-        let mut now = self
-            .keep(
-                self.record
-                    .release
-                    .as_ref()
-                    .map(|r| r.refs.clone())
-                    .unwrap_or_default(),
-            )
-            .await?;
-        if let Some(r) = self.record.running(&self.unit.stack_tag) {
-            now.extend(r.refs.iter().cloned());
-        }
-        let previous = self
-            .record
-            .history
-            .iter()
-            .filter_map(|e| e.release.as_ref())
-            .find(|r| !self.unit.previous.is_empty() && r.tag() == self.unit.previous)
-            .map(|r| r.refs.clone())
-            .unwrap_or_default();
-        Ok((now, previous))
-    }
-
+    /// What the image store holds, in bytes: what only the previous release
+    /// holds, and what neither it nor the running one does, which a collect
+    /// frees.
     pub async fn storage(&self) -> anyhow::Result<Storage> {
-        let (now, previous) = self.kept().await?;
-        let both: BTreeSet<String> = now.union(&previous).cloned().collect();
+        let (beyond_now, beyond_both) = (self.beyond(1).await?, self.beyond(2).await?);
         let registry = self.registry.clone();
         tokio::task::spawn_blocking(move || {
             let (held, free) = registry.usage()?;
-            let beyond_now = registry.reclaimable(&now)?;
-            let reclaimable = registry.reclaimable(&both)?;
+            let with_previous = registry.forgettable(&beyond_now)?;
+            let reclaimable = registry.forgettable(&beyond_both)?;
             anyhow::Ok(Storage {
                 held,
-                previous: beyond_now.saturating_sub(reclaimable),
+                previous: with_previous.saturating_sub(reclaimable),
                 reclaimable,
                 free,
             })
@@ -2325,41 +1593,10 @@ impl Engine {
     /// Drops what no kept release names; the previous one's too if asked.
     pub async fn collect(&mut self, previous: bool) -> anyhow::Result<u64> {
         anyhow::ensure!(self.idle(), "an update is in progress");
-        let (mut keep, prev) = self.kept().await?;
-        if !previous {
-            keep.extend(prev);
-        }
+        let drop = self.beyond(if previous { 1 } else { 2 }).await?;
         let registry = self.registry.clone();
-        tokio::task::spawn_blocking(move || registry.retain(&keep)).await?
+        tokio::task::spawn_blocking(move || registry.forget(&drop)).await?
     }
-}
-
-/// The stack trial the unit follows that nothing ends by itself: unhealthy,
-/// with no good release for its judge, or this engine, to roll back to.
-pub fn stuck_trial(r: &Record, on: &str, j: &Judge) -> Option<String> {
-    let trial = j.trial.as_str();
-    if trial.is_empty() || trial != on || !j.good.is_empty() {
-        return None;
-    }
-    match &r.phase {
-        Phase::Idle => {}
-        Phase::Judging { .. } => {
-            let back = r.before.as_ref().map_or("", |b| b.tag.as_str());
-            let ours = r.release.as_ref().is_some_and(|rel| rel.tag() == trial);
-            if !ours || !(back.is_empty() || back == trial) {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    let failing = j.checks.iter().any(|c| c.state == CheckState::Fail);
-    failing.then(|| trial.to_string())
-}
-
-fn ended(trial: &str) -> String {
-    format!(
-        "{trial} failed its checks with no good release to roll back to; a new bundle took over"
-    )
 }
 
 fn from(by: &str) -> String {
@@ -2391,10 +1628,6 @@ fn phase_word(p: &Phase) -> &'static str {
         Phase::Rebooting { .. } => "rebooting",
         Phase::Trial => "the new OS is on trial",
         Phase::Settling => "the new OS is committed; waiting for the system to settle",
-        Phase::Seeding => "updating the judge",
-        Phase::AwaitingGood => "waiting for the judge",
-        Phase::Repointing { .. } => "moving the stack",
-        Phase::Judging { .. } => "the new stack is on trial",
         Phase::Collecting => "collecting old images",
     }
 }

@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::diff::{Change, Component, Diff};
 use crate::engine::{self, Entry, Outcome, Phase, Power, Record, Release, Storage, Unit};
-use crate::judge::{Check, CheckState};
+use crate::checks::{Check, CheckState};
 use crate::pb::edge::update::v1 as pb;
 use crate::steps::{self, State, Step, Taken};
 use crate::upload::{Upload, Uploads};
@@ -23,7 +23,6 @@ pub enum Command {
     /// The release's id, and who applies it.
     Apply(String, String, Reply<()>),
     Power(Power, Reply<String>),
-    Commit(String, String, Reply<()>),
     RollBack(String, String, Reply<String>),
     Storage(Reply<Storage>),
     /// From the storage provisioner, never the API.
@@ -60,12 +59,8 @@ impl Service {
         }
     }
 
-    /// Idle, or on a stack trial a new bundle may take over.
     fn idle(&self) -> Result<(), ConnectError> {
         let s = self.status.borrow();
-        if engine::stuck_trial(&s.record, &s.unit.stack_tag, &s.unit.judge).is_some() {
-            return Ok(());
-        }
         match s.record.phase {
             Phase::Idle => Ok(()),
             _ if s.record.by.is_empty() => Err(ConnectError::failed_precondition(
@@ -216,8 +211,8 @@ fn diff(d: &Diff) -> pb::Diff {
         talos_to: d.talos.1.clone(),
         installer_from: d.installer.0.clone(),
         installer_to: d.installer.1.clone(),
-        stack_from: d.stack.0.clone(),
-        stack_to: d.stack.1.clone(),
+        release_from: d.release.0.clone(),
+        release_to: d.release.1.clone(),
         reboot: d.reboot,
         config_changes: d.config_changes,
         downtime_secs: d.downtime_secs,
@@ -256,10 +251,6 @@ fn phase(r: &Record) -> pb::Phase {
         Phase::Installing => pb::Phase::PHASE_INSTALLING,
         Phase::Rebooting { .. } => pb::Phase::PHASE_REBOOTING,
         Phase::Trial | Phase::Settling => pb::Phase::PHASE_TRIAL,
-        Phase::Seeding => pb::Phase::PHASE_SEEDING,
-        Phase::AwaitingGood => pb::Phase::PHASE_AWAITING_GOOD,
-        Phase::Repointing { .. } => pb::Phase::PHASE_REPOINTING,
-        Phase::Judging { .. } => pb::Phase::PHASE_JUDGING,
         Phase::Collecting => pb::Phase::PHASE_COLLECTING,
     }
 }
@@ -267,14 +258,8 @@ fn phase(r: &Record) -> pb::Phase {
 fn unit(u: &Unit) -> pb::Unit {
     pb::Unit {
         talos_version: u.talos_version.clone(),
-        stack_tag: u.stack_tag.clone(),
-        good: u.good.clone(),
-        previous: u.previous.clone(),
-        trial: u.trial.clone(),
-        rolled_back: u.rolled_back.clone(),
         os_trial: u.os_trial,
         installer: u.installer.clone(),
-        flux_version: u.flux_version.clone(),
         components: u.components.iter().map(component).collect(),
         manifest: u
             .manifest
@@ -294,8 +279,6 @@ fn step(t: &Taken) -> pb::Step {
             Step::Install => pb::StepKind::STEP_KIND_INSTALL,
             Step::Reboot => pb::StepKind::STEP_KIND_REBOOT,
             Step::OsTrial => pb::StepKind::STEP_KIND_OS_TRIAL,
-            Step::Stack => pb::StepKind::STEP_KIND_STACK,
-            Step::Trial => pb::StepKind::STEP_KIND_TRIAL,
             Step::Commit => pb::StepKind::STEP_KIND_COMMIT,
         }
         .into(),
@@ -349,46 +332,22 @@ fn steps(s: &Snapshot, up: Option<&Upload>) -> Vec<Taken> {
     steps::merged(&r.steps, &steps::plan(os))
 }
 
-/// The trial running: the OS's, which the unit commits by itself, or the
-/// stack's, which its judge holds.
+/// The trial running: the OS's, which the unit blesses by itself.
 fn trial(s: &Snapshot) -> Option<pb::Trial> {
-    let (r, u) = (&s.record, &s.unit);
-    let tag = r
-        .release
-        .as_ref()
-        .map(|r| r.tag().to_string())
-        .unwrap_or_default();
-    let started = |k: Step| {
-        r.steps
-            .iter()
-            .rev()
-            .find(|t| t.step == k)
-            .map_or(0, |t| t.started)
-    };
-    let j = &u.judge;
-    let stack = |tag: String, started: i64| pb::Trial {
-        kind: pb::TrialKind::TRIAL_KIND_STACK.into(),
-        stack_tag: tag,
+    let r = &s.record;
+    let release = r.release.as_ref()?.tag().to_string();
+    let started = r
+        .steps
+        .iter()
+        .rev()
+        .find(|t| t.step == Step::OsTrial)
+        .map_or(0, |t| t.started);
+    matches!(r.phase, Phase::Trial | Phase::Settling).then(|| pb::Trial {
+        kind: pb::TrialKind::TRIAL_KIND_OS.into(),
+        release,
         started_unix: started,
-        checks: j.checks.iter().map(check).collect(),
-        can_commit: j.takes("commit"),
         can_roll_back: true,
         ..Default::default()
-    };
-    Some(match r.phase {
-        Phase::Trial | Phase::Settling | Phase::Seeding | Phase::AwaitingGood => pb::Trial {
-            kind: pb::TrialKind::TRIAL_KIND_OS.into(),
-            stack_tag: tag,
-            started_unix: started(Step::OsTrial),
-            can_roll_back: true,
-            ..Default::default()
-        },
-        Phase::Judging { .. } => stack(tag, started(Step::Trial)),
-        Phase::Idle if !u.trial.is_empty() && u.trial == u.stack_tag => pb::Trial {
-            can_roll_back: j.takes("rollback"),
-            ..stack(u.trial.clone(), 0)
-        },
-        _ => return None,
     })
 }
 
@@ -624,27 +583,12 @@ impl pb::UpdateService for Service {
         })
     }
 
-    async fn commit_trial(
-        &self,
-        _: RequestContext,
-        request: ServiceRequest<'_, pb::CommitTrialRequest>,
-    ) -> ServiceResult<pb::CommitTrialResponse> {
-        let (tag, by) = (request.stack_tag.to_string(), request.by.to_string());
-        Response::ok(pb::CommitTrialResponse {
-            status: self
-                .command(|tx| Command::Commit(tag, by, tx))
-                .await?
-                .into(),
-            ..Default::default()
-        })
-    }
-
     async fn roll_back(
         &self,
         _: RequestContext,
         request: ServiceRequest<'_, pb::RollBackRequest>,
     ) -> ServiceResult<pb::RollBackResponse> {
-        let (tag, by) = (request.stack_tag.to_string(), request.by.to_string());
+        let (tag, by) = (request.release.to_string(), request.by.to_string());
         Response::ok(pb::RollBackResponse {
             status: self
                 .command(|tx| Command::RollBack(tag, by, tx))
@@ -780,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploads_wait_for_an_update_unless_its_trial_is_stuck() {
+    async fn uploads_wait_for_an_update() {
         let d = tempfile::tempdir().unwrap();
         let (c, publish, _rx) = serve(d.path()).await;
         let begin = pb::BeginUploadRequest {
@@ -788,33 +732,12 @@ mod tests {
             sha256: vec![1; 32],
             ..Default::default()
         };
-        let judging = |checks: &str, good: &str| {
-            let mut s = Snapshot::default();
-            s.record.phase = Phase::Judging {
-                rolled_back: String::new(),
-            };
-            s.record.release = Some(Release {
-                id: "s1".into(),
-                ..Release::default()
-            });
-            s.unit.stack_tag = "s1".into();
-            s.unit.judge = crate::judge::Judge::read(
-                &[("trial", "s1"), ("good", good), ("checks", checks)]
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            );
-            s
-        };
-        for (checks, good) in [("pass ready", ""), ("fail ready: x", "s0")] {
-            publish.send_replace(judging(checks, good));
-            let e = c.begin_upload(begin.clone()).await.unwrap_err();
-            assert!(
-                e.to_string().contains("in progress"),
-                "{checks} {good}: {e}"
-            );
-        }
-        publish.send_replace(judging("fail ready: x", ""));
+        let mut s = Snapshot::default();
+        s.record.phase = Phase::Trial;
+        publish.send_replace(s);
+        let e = c.begin_upload(begin.clone()).await.unwrap_err();
+        assert!(e.to_string().contains("in progress"), "{e}");
+        publish.send_replace(Snapshot::default());
         c.begin_upload(begin).await.unwrap();
     }
 
@@ -875,11 +798,7 @@ mod tests {
         publish.send_replace(Snapshot {
             unit: Unit {
                 talos_version: "v1.14.1".into(),
-                stack_tag: "s2".into(),
-                good: "s2".into(),
-                previous: "s1".into(),
-                trial: "s3".into(),
-                rolled_back: "s0 2026-09-01T00:00:00Z".into(),
+                installer: "r/i:1@sha256:aa".into(),
                 os_trial: true,
                 ..Unit::default()
             },
@@ -894,24 +813,8 @@ mod tests {
             .unit
             .clone();
         assert_eq!(
-            (
-                u.talos_version.as_str(),
-                u.stack_tag.as_str(),
-                u.good.as_str(),
-                u.previous.as_str(),
-                u.trial.as_str(),
-                u.rolled_back.as_str(),
-                u.os_trial
-            ),
-            (
-                "v1.14.1",
-                "s2",
-                "s2",
-                "s1",
-                "s3",
-                "s0 2026-09-01T00:00:00Z",
-                true
-            )
+            (u.talos_version.as_str(), u.installer.as_str(), u.os_trial),
+            ("v1.14.1", "r/i:1@sha256:aa", true)
         );
     }
 
@@ -992,21 +895,19 @@ mod tests {
         };
         use State::{Pending, Running};
         // Unknown until the head arrives: every step.
-        assert_eq!(kinds(&s, Some(&uploading(None))).len(), 9);
+        assert_eq!(kinds(&s, Some(&uploading(None))).len(), 7);
         assert_eq!(
             kinds(&s, Some(&uploading(Some("r/i:2@sha256:aa")))),
             [
                 (Step::Upload, Running),
                 (Step::Verify, Pending),
                 (Step::Stage, Pending),
-                (Step::Stack, Pending),
-                (Step::Trial, Pending),
                 (Step::Commit, Pending),
             ]
         );
         assert_eq!(
             kinds(&s, Some(&uploading(Some("r/i:2@sha256:bb")))).len(),
-            9
+            7
         );
         let mut refused = uploading(None);
         refused.refused = "not ours".into();
@@ -1030,66 +931,32 @@ mod tests {
             Some(&(Step::Commit, State::Pending)),
             "no reboot: no OS steps"
         );
-        assert_eq!(kinds(&s, None).len(), 6);
+        assert_eq!(kinds(&s, None).len(), 4);
         steps::close(&mut s.record.steps, State::Failed, 2);
         s.record.phase = Phase::Idle;
         assert_eq!(kinds(&s, None).last(), Some(&(Step::Stage, State::Failed)));
     }
 
     #[test]
-    fn a_trial_says_its_checks() {
+    fn a_trial_is_the_new_os_until_the_workloads_settle() {
         let mut s = Snapshot::default();
-        s.record.phase = Phase::Judging {
-            rolled_back: String::new(),
-        };
         s.record.release = Some(Release {
             id: "s2".into(),
             ..Release::default()
         });
-        steps::enter(&mut s.record.steps, Step::Trial, 500);
-        s.unit.judge = crate::judge::Judge::read(
-            &[
-                ("checks", "pass applied\nfail ready: no"),
-                ("requests", "rollback"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        );
-        let t = trial(&s).unwrap();
-        assert_eq!(
-            t.kind,
-            buffa::EnumValue::from(pb::TrialKind::TRIAL_KIND_STACK)
-        );
-        assert_eq!((t.stack_tag.as_str(), t.started_unix), ("s2", 500));
-        assert_eq!(t.checks.len(), 2);
-        assert!(!t.can_commit && t.can_roll_back);
-        s.unit.judge.requests.insert("commit".into());
-        assert!(trial(&s).unwrap().can_commit);
-
         s.record.phase = Phase::Trial;
         steps::enter(&mut s.record.steps, Step::OsTrial, 700);
         let t = trial(&s).unwrap();
         assert_eq!(t.kind, buffa::EnumValue::from(pb::TrialKind::TRIAL_KIND_OS));
-        assert_eq!((t.stack_tag.as_str(), t.started_unix), ("s2", 700));
-        assert!(t.can_roll_back && !t.can_commit);
+        assert_eq!((t.release.as_str(), t.started_unix), ("s2", 700));
+        assert!(t.can_roll_back);
         s.record.phase = Phase::Settling;
         assert!(
             trial(&s).unwrap().can_roll_back,
-            "the previous OS boots again until the stack moves"
+            "the previous OS boots again until the update commits"
         );
-
         s.record.phase = Phase::Idle;
         assert!(trial(&s).is_none());
-        // A rollback to the previous release puts it on trial, engine idle.
-        (s.unit.trial, s.unit.stack_tag) = ("s1".into(), "s1".into());
-        let t = trial(&s).unwrap();
-        assert_eq!((t.stack_tag.as_str(), t.can_roll_back), ("s1", true));
-        s.unit.judge.requests.clear();
-        assert!(
-            !trial(&s).unwrap().can_roll_back,
-            "the judge takes no rollback"
-        );
     }
 
     #[test]
@@ -1226,7 +1093,7 @@ mod tests {
                 }],
                 talos: ("v1.14.1".into(), "v1.15.0".into()),
                 installer: ("i@sha256:1".into(), "i@sha256:2".into()),
-                stack: ("s1".into(), "s2".into()),
+                release: ("s1".into(), "s2".into()),
                 reboot: true,
                 config_changes: true,
                 downtime_secs: 120,
@@ -1267,8 +1134,8 @@ mod tests {
                 d.talos_to.as_str(),
                 d.installer_from.as_str(),
                 d.installer_to.as_str(),
-                d.stack_from.as_str(),
-                d.stack_to.as_str()
+                d.release_from.as_str(),
+                d.release_to.as_str()
             ),
             ("v1.14.1", "v1.15.0", "i@sha256:1", "i@sha256:2", "s1", "s2")
         );
@@ -1328,7 +1195,6 @@ mod tests {
     fn the_unit_and_an_entry_say_everything_they_hold() {
         let u = unit(&Unit {
             installer: "i@sha256:1".into(),
-            flux_version: "v2.6.4".into(),
             components: vec![Component {
                 name: "app".into(),
                 ..Component::default()
@@ -1339,14 +1205,13 @@ mod tests {
         assert_eq!(
             (
                 u.installer.as_str(),
-                u.flux_version.as_str(),
                 u.components[0].name.as_str(),
                 u.manifest["GIT_REV"].as_str()
             ),
-            ("i@sha256:1", "v2.6.4", "app", "abc")
+            ("i@sha256:1", "app", "abc")
         );
         let mut steps = Vec::new();
-        steps::enter(&mut steps, Step::Trial, 5);
+        steps::enter(&mut steps, Step::OsTrial, 5);
         steps::close(&mut steps, State::Failed, 9);
         let e = entry(&Entry {
             release: None,
@@ -1376,7 +1241,7 @@ mod tests {
         assert_eq!(
             (s.kind, s.state, s.started_unix, s.finished_unix),
             (
-                pb::StepKind::STEP_KIND_TRIAL.into(),
+                pb::StepKind::STEP_KIND_OS_TRIAL.into(),
                 pb::StepState::STEP_STATE_FAILED.into(),
                 5,
                 9
@@ -1389,8 +1254,6 @@ mod tests {
             Step::Install,
             Step::Reboot,
             Step::OsTrial,
-            Step::Stack,
-            Step::Trial,
             Step::Commit,
         ]
         .into_iter()
@@ -1405,7 +1268,7 @@ mod tests {
             .to_i32()
         })
         .collect();
-        assert_eq!(kinds, (1..=9).collect::<Vec<_>>());
+        assert_eq!(kinds, [1, 2, 3, 4, 5, 6, 9]);
         let states: Vec<_> = [
             State::Pending,
             State::Running,
@@ -1447,9 +1310,7 @@ mod tests {
     #[test]
     fn the_status_carries_every_part() {
         let mut s = Snapshot::default();
-        s.record.phase = Phase::Judging {
-            rolled_back: String::new(),
-        };
+        s.record.phase = Phase::Trial;
         s.record.release = Some(Release {
             id: "s2".into(),
             ..Release::default()
@@ -1457,7 +1318,7 @@ mod tests {
         s.record.error = "last one failed".into();
         s.record.since = 321;
         s.record.by = "ann".into();
-        steps::enter(&mut s.record.steps, Step::Trial, 300);
+        steps::enter(&mut s.record.steps, Step::OsTrial, 300);
         let up = uploading(None);
         let st = status(&s, Some(&up), 1000);
         assert_eq!(st.release.as_option().map(|r| r.id.as_str()), Some("s2"));
@@ -1466,9 +1327,9 @@ mod tests {
             ("last one failed", 321)
         );
         assert_eq!(st.upload.as_option().map(|u| u.by.as_str()), Some("ann"));
-        assert_eq!(st.steps.len(), 9, "the trial running, the rest planned");
+        assert_eq!(st.steps.len(), 7, "the trial running, the rest planned");
         assert_eq!(
-            st.trial.as_option().map(|t| t.stack_tag.as_str()),
+            st.trial.as_option().map(|t| t.release.as_str()),
             Some("s2")
         );
         assert_eq!(st.lock.as_option().map(|l| l.by.as_str()), Some("ann"));
@@ -1511,7 +1372,7 @@ mod tests {
                     ..Snapshot::default()
                 };
                 match cmd {
-                    Command::Apply(_, by, reply) | Command::Commit(_, by, reply) => {
+                    Command::Apply(_, by, reply) => {
                         publish.send_replace(busy(by));
                         let _ = reply.send(Ok(()));
                     }
@@ -1550,19 +1411,8 @@ mod tests {
             Some("ann")
         );
         let s = c
-            .commit_trial(pb::CommitTrialRequest {
-                stack_tag: "s2".into(),
-                by: "bob".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .into_owned()
-            .status;
-        assert_eq!(s.lock.as_option().map(|l| l.by.as_str()), Some("bob"));
-        let s = c
             .roll_back(pb::RollBackRequest {
-                stack_tag: "s2".into(),
+                release: "s2".into(),
                 by: "cy".into(),
                 ..Default::default()
             })

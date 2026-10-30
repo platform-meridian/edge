@@ -20,14 +20,20 @@ impl crate::unit::Registry for Registry {
         Ok(())
     }
 
-    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
-        let swept = self.0.retain(&refs(keep))?;
-        tracing::info!(?swept, "collected what no kept release names");
+    fn import_apps(&self, layout: &Path, host: &str) -> anyhow::Result<()> {
+        let tagged = self.0.import_apps(layout, host)?;
+        tracing::info!(apps = tagged.len(), "imported the bundle's apps");
+        Ok(())
+    }
+
+    fn forget(&self, drop: &BTreeSet<String>) -> anyhow::Result<u64> {
+        let swept = self.0.forget(&refs(drop))?;
+        tracing::info!(?swept, "collected what only releases no longer kept named");
         Ok(swept.bytes)
     }
 
-    fn reclaimable(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
-        Ok(self.0.reclaimable(&refs(keep))?.bytes)
+    fn forgettable(&self, drop: &BTreeSet<String>) -> anyhow::Result<u64> {
+        Ok(self.0.forgettable(&refs(drop))?.bytes)
     }
 
     fn usage(&self) -> anyhow::Result<(u64, u64)> {
@@ -140,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn releases_import_and_only_the_kept_ones_stay() {
+    fn releases_import_and_only_what_is_forgotten_goes() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("store");
         let r = Registry::open(&root).unwrap();
@@ -170,16 +176,10 @@ mod tests {
             .collect();
         // Its empty config the store holds already.
         assert_eq!(r.missing(&fresh).unwrap(), blobs.iter().sum::<u64>() - 2);
-        let keep = [
-            "127.0.0.1:5999/app:t2",
-            "127.0.0.1:5999/app:t3",
-            "not a ref!",
-        ]
-        .map(String::from)
-        .into();
-        let would = r.reclaimable(&keep).unwrap();
+        let drop = ["127.0.0.1:5999/app:t1", "not a ref!"].map(String::from).into();
+        let would = r.forgettable(&drop).unwrap();
         assert!(would > 0);
-        assert_eq!(r.retain(&keep).unwrap(), would);
+        assert_eq!(r.forget(&drop).unwrap(), would);
         let held = held(&root);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held.iter().all(|h| !h.contains(":t1")), "{held:?}");

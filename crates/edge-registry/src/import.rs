@@ -24,6 +24,19 @@ impl Store {
         self.import(layout, Blobs::Carried)
     }
 
+    /// Every manifest and blob of a layout, naming none: the caller names them.
+    pub(crate) fn import_layout_untagged(&self, layout: &Path) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
+        let index = std::fs::read(layout.join("index.json")).context("reading index.json")?;
+        let index = Manifest::parse(&index)
+            .map_err(anyhow::Error::msg)
+            .context("parsing index.json")?;
+        for desc in &index.children {
+            self.import_manifest(layout, desc, true, Blobs::Every)?;
+        }
+        Ok(())
+    }
+
     fn import(&self, layout: &Path, blobs: Blobs) -> anyhow::Result<Vec<ImageRef>> {
         let _lock = self.lock()?;
         let marker: serde_json::Value = serde_json::from_slice(

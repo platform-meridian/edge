@@ -13,7 +13,7 @@ mod capabilities;
 mod cluster;
 mod diff;
 mod engine;
-mod judge;
+mod checks;
 mod registry;
 mod steps;
 mod talos;
@@ -288,11 +288,6 @@ async fn run(
                         Some(Command::Power(p, reply)) => {
                             let _ = reply.send(engine.power(p).await);
                         }
-                        Some(Command::Commit(tag, by, reply)) => {
-                            let r = engine.request_commit(&tag, &by).await;
-                            publish.send_replace(snap(engine));
-                            let _ = reply.send(r);
-                        }
                         Some(Command::RollBack(tag, by, reply)) => {
                             let r = engine.request_rollback(&tag, &by).await;
                             unit.reset_immediately();
@@ -330,7 +325,7 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tests::{Harness, OLD_TAG, Spec};
+    use crate::engine::tests::{Harness, Spec};
 
     #[tokio::test]
     async fn grpc_health_answers_until_shutdown() {
@@ -382,18 +377,17 @@ mod tests {
         let (publish, mut status) = watch::channel(Snapshot::default());
         tokio::spawn(async move { run(&mut engine, rx, publish, std::future::pending()).await });
 
-        status.wait_for(|s| s.unit.good == OLD_TAG).await.unwrap();
+        status
+            .wait_for(|s| s.unit.talos_version == "v1.14.1")
+            .await
+            .unwrap();
         tokio::time::sleep(UNIT_EVERY + Duration::from_secs(1)).await;
         assert!(!status.has_changed().unwrap(), "sent with nothing changed");
 
-        h.world
-            .lock()
-            .unwrap()
-            .judge
-            .insert("good".into(), "update-new".into());
+        h.world.lock().unwrap().version = "v1.14.2".into();
         let asked = tokio::time::Instant::now();
         status
-            .wait_for(|s| s.unit.good == "update-new")
+            .wait_for(|s| s.unit.talos_version == "v1.14.2")
             .await
             .unwrap();
         assert!(
@@ -412,7 +406,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let (publish, mut status) = watch::channel(Snapshot::default());
         tokio::spawn(async move { run(&mut engine, rx, publish, std::future::pending()).await });
-        status.wait_for(|s| s.unit.good == OLD_TAG).await.unwrap();
+        status
+            .wait_for(|s| !s.unit.talos_version.is_empty())
+            .await
+            .unwrap();
 
         let (reply, applied) = tokio::sync::oneshot::channel();
         tx.send(Command::Apply("update-new".into(), String::new(), reply))

@@ -1,5 +1,5 @@
 //! The engine against a simulated unit: Talos with sd-boot's trial and
-//! boot-commit, Flux with the stack judge, and a registry. Every run is
+//! boot-commit, the cluster's workloads, and a registry. Every run is
 //! interrupted everywhere it can be: a restart after each recorded phase, a
 //! power cut after each, and a crash straight after each change to the unit.
 
@@ -13,10 +13,8 @@ use async_trait::async_trait;
 use super::*;
 use crate::bundle::components::Components;
 use crate::bundle::testkit;
-use crate::judge::CheckState;
-use crate::unit::{Ref, Stack};
+use crate::checks::CheckState;
 
-pub(crate) const OLD_TAG: &str = "update-old";
 const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 const UNIT_CONFIG: &str = "version: v1alpha1
@@ -39,15 +37,8 @@ fn patch(tag: &str) -> String {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Verdict {
-    Good,
-    Bad,
-    WrongDigest,
-}
-
 pub(crate) struct World {
-    version: String,
+    pub(crate) version: String,
     /// sd-boot's entries by id: version, and boot tries left while counted.
     entries: BTreeMap<String, (String, Option<u32>)>,
     default: String,
@@ -66,18 +57,7 @@ pub(crate) struct World {
     trial_ticks: u32,
     trial_fails: bool,
 
-    url: String,
-    tag: String,
-    lock: BTreeMap<String, String>,
-    /// The running stack's record of its modules.
-    modules: BTreeMap<String, String>,
-    pub(crate) judge: BTreeMap<String, String>,
-    judge_ticks: u32,
-    verdict: Verdict,
-    seeded: bool,
-    /// What the seeded judge runs; it pulls only what the registry holds.
-    judge_image: String,
-    /// Images other workloads run.
+    /// Images the workloads run.
     running: BTreeSet<String>,
 
     held: BTreeSet<String>,
@@ -103,15 +83,13 @@ pub(crate) struct World {
     /// The crash is a power cut too.
     cut_on_crash: bool,
     never_ready: bool,
-    seed_stuck: bool,
-    judge_idle: bool,
     apid_down: bool,
     apiserver_down: bool,
     registry_free: u64,
     /// Every config staged for a boot.
     staged_configs: Vec<String>,
-    /// The FluxInstance applied, and the stack it applied on.
-    instance: Option<(String, String)>,
+    /// The apps layouts imported, and the name they were relocated under.
+    apps: Vec<(BTreeSet<String>, String)>,
     /// The host's boot signing directory: a reboot signs what is staged there.
     boot_signing: Option<PathBuf>,
     /// The boot refuses what is staged, saying why.
@@ -135,18 +113,6 @@ impl World {
             store: b"store log".to_vec(),
             trial_ticks: 0,
             trial_fails: false,
-            url: "oci://127.0.0.1:3172/stack".into(),
-            tag: OLD_TAG.into(),
-            lock: BTreeMap::from([
-                ("built_epoch".into(), "1000".into()),
-                ("PROFILE".into(), "edge".into()),
-            ]),
-            modules: BTreeMap::from([("MODULES".into(), String::new())]),
-            judge: BTreeMap::from([("good".into(), OLD_TAG.into())]),
-            judge_ticks: 0,
-            verdict: Verdict::Good,
-            seeded: false,
-            judge_image: String::new(),
             running: BTreeSet::new(),
             held: BTreeSet::new(),
             digests: BTreeMap::new(),
@@ -158,7 +124,7 @@ impl World {
             install_fails: false,
             log: Vec::new(),
             staged_configs: Vec::new(),
-            instance: None,
+            apps: Vec::new(),
             boot_signing: None,
             sign_refuses: None,
             calls: 0,
@@ -166,8 +132,6 @@ impl World {
             crash_at: None,
             cut_on_crash: false,
             never_ready: false,
-            seed_stuck: false,
-            judge_idle: false,
             apid_down: false,
             apiserver_down: false,
             registry_free: 1 << 40,
@@ -189,10 +153,6 @@ impl World {
 
     fn on_trial(&self) -> bool {
         !self.count_path.is_empty() && self.blessed_boot != Some(self.boot_id)
-    }
-
-    fn judge_pulls(&self) -> bool {
-        self.judge_image.is_empty() || self.held.contains(&self.judge_image)
     }
 
     fn committed_new(&self) -> bool {
@@ -256,46 +216,6 @@ impl World {
         self.blessed_boot = Some(self.boot_id);
     }
 
-    /// The stack judge: a new ref is committed or rolled back after a few
-    /// looks, or at once when asked.
-    fn tick_judge(&mut self) {
-        let good = self.judge.get("good").cloned().unwrap_or_default();
-        let asked = self.judge.insert("request".into(), String::new());
-        match asked.as_deref().and_then(|r| r.split_once(' ')) {
-            Some((what, tag)) if tag == self.tag && tag != good => {
-                if what == "commit" {
-                    self.judge.insert("previous".into(), good);
-                    self.judge.insert("good".into(), self.tag.clone());
-                } else {
-                    self.judge
-                        .insert("rolled_back".into(), format!("{} 12:00", self.tag));
-                    self.tag = good;
-                }
-                return;
-            }
-            _ => {}
-        }
-        if self.tag == good || self.judge_idle {
-            return;
-        }
-        self.judge_ticks += 1;
-        if self.judge_ticks < 3 {
-            return;
-        }
-        self.judge_ticks = 0;
-        match self.verdict {
-            Verdict::Good | Verdict::WrongDigest => {
-                self.judge.insert("previous".into(), good);
-                self.judge.insert("good".into(), self.tag.clone());
-                self.lock.insert("built_epoch".into(), "2000".into());
-            }
-            Verdict::Bad => {
-                self.judge
-                    .insert("rolled_back".into(), format!("{} 12:00", self.tag));
-                self.tag = good;
-            }
-        }
-    }
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -404,7 +324,6 @@ impl Talos for FakeTalos {
             .insert(entry.to_lowercase(), ("v1.14.1".into(), Some(3)));
         w.default = entry.clone();
         w.last_installed = entry;
-        w.seeded = false;
         w.change("install".into())
     }
     async fn reboot(&self) -> anyhow::Result<()> {
@@ -448,131 +367,20 @@ impl Talos for FakeTalos {
 
 #[async_trait]
 impl Cluster for FakeCluster {
-    async fn config_map(&self, at: &Ref) -> anyhow::Result<Option<BTreeMap<String, String>>> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        Ok(match at.name.as_str() {
-            "lock" => Some(w.lock.clone()),
-            "modules" => Some(w.modules.clone()),
-            "judge" => {
-                w.tick_judge();
-                Some(w.judge.clone())
-            }
-            _ => None,
-        })
-    }
-    async fn set_key(&self, at: &Ref, key: &str, value: &str) -> anyhow::Result<()> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        assert_eq!(at.name, "judge");
-        w.judge.insert(key.into(), value.into());
-        w.change(format!("judge {key}={value}"))
-    }
-    async fn flux_version(&self, _: &Ref) -> anyhow::Result<String> {
-        Ok("v2.6.4".into())
-    }
-    async fn flux_components(&self, _: &Ref) -> anyhow::Result<BTreeSet<String>> {
-        Ok(["source-controller", "kustomize-controller"]
-            .map(String::from)
-            .into())
-    }
-    async fn kubernetes_version(&self) -> anyhow::Result<String> {
-        Ok("v1.35.2".into())
-    }
-    async fn sync(&self, _: &Ref) -> anyhow::Result<(String, String)> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        anyhow::ensure!(!w.apiserver_down, "the apiserver is not answering");
-        Ok((w.url.clone(), w.tag.clone()))
-    }
-    async fn repoint(&self, _: &Ref, url: &str, tag: &str, _: Option<&str>) -> anyhow::Result<()> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        if tag != w.judge["good"] && tag != w.tag {
-            assert!(
-                w.committed_new(),
-                "the stack moved before the OS was committed"
-            );
-            assert!(w.seeded, "the stack moved before the judge was updated");
-            // Off a trial that cannot pass and has nothing to return to, nothing is lost.
-            let stuck = w.judge["good"].is_empty()
-                && w.judge.get("checks").is_some_and(|c| c.starts_with("fail"));
-            assert!(
-                w.judge["good"] == w.tag || stuck,
-                "the stack moved with nothing to roll back to"
-            );
-        }
-        w.url = url.into();
-        w.tag = tag.into();
-        w.judge_ticks = 0;
-        w.change(format!("repoint {tag}"))
-    }
-    async fn reconcile(&self, _: &Ref) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn applied(&self, _: &Ref) -> anyhow::Result<Option<String>> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        let composed = w.digests.get(&stack_ref(&w.tag));
-        let digest = if w.verdict == Verdict::WrongDigest && w.tag != OLD_TAG {
-            "sha256:evil"
-        } else {
-            composed.map_or(DIGEST, String::as_str)
-        };
-        Ok(Some(format!("{}@{digest}", w.tag)))
-    }
-    async fn apply(&self, manifests: &str) -> anyhow::Result<()> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        if manifests.contains("kind: FluxInstance") {
-            let on = w.tag.clone();
-            w.instance = Some((manifests.into(), on));
-            return w.change("instance".into());
-        }
-        assert!(
-            w.committed_new(),
-            "the judge was updated before the OS was committed"
-        );
-        w.judge_image = manifests
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("image: "))
-            .expect("the seed names the judge's image")
-            .into();
-        w.seeded = true;
-        w.change("seed".into())
-    }
-    async fn not_rolled_out(&self, _: &str) -> anyhow::Result<Vec<String>> {
-        let mut w = self.0.lock().unwrap();
-        w.calls += 1;
-        Ok(if w.seeded && !w.seed_stuck && w.judge_pulls() {
-            vec![]
-        } else {
-            vec!["judge".into()]
-        })
-    }
     async fn not_ready(&self) -> anyhow::Result<Vec<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
-        let mut waiting = Vec::new();
-        if w.never_ready {
-            waiting.push("deployment app/web".into());
-        }
-        if !w.judge_pulls() {
-            waiting.push("deployment flux-system/stack-commit".into());
-        }
-        Ok(waiting)
+        anyhow::ensure!(!w.apiserver_down, "the apiserver is not answering");
+        Ok(match w.never_ready {
+            true => vec!["deployment app/web".into()],
+            false => Vec::new(),
+        })
     }
     async fn images_in_use(&self) -> anyhow::Result<BTreeSet<String>> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
         anyhow::ensure!(!w.apiserver_down, "the apiserver is not answering");
-        let mut images = w.running.clone();
-        images.extend(
-            [w.judge_image.clone()]
-                .into_iter()
-                .filter(|i| !i.is_empty()),
-        );
-        Ok(images)
+        Ok(w.running.clone())
     }
 }
 
@@ -594,20 +402,27 @@ impl Registry for FakeRegistry {
         }
         w.change("import".into())
     }
-    fn retain(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
+    fn import_apps(&self, layout: &Path, host: &str) -> anyhow::Result<()> {
+        let refs = crate::bundle::layout_refs(layout)?;
+        let mut w = self.0.lock().unwrap();
+        w.calls += 1;
+        w.apps.push((refs, host.into()));
+        w.change("import apps".into())
+    }
+    fn forget(&self, drop: &BTreeSet<String>) -> anyhow::Result<u64> {
         let mut w = self.0.lock().unwrap();
         w.calls += 1;
         let before = w.held.len();
-        w.held.retain(|r| keep.contains(r));
-        w.digests.retain(|r, _| keep.contains(r));
+        w.held.retain(|r| !drop.contains(r));
+        w.digests.retain(|r, _| !drop.contains(r));
         if w.held.len() != before {
             w.change("collect".into())?;
         }
         Ok(((before - w.held.len()) * 100) as u64)
     }
-    fn reclaimable(&self, keep: &BTreeSet<String>) -> anyhow::Result<u64> {
+    fn forgettable(&self, drop: &BTreeSet<String>) -> anyhow::Result<u64> {
         let w = self.0.lock().unwrap();
-        Ok((w.held.iter().filter(|r| !keep.contains(*r)).count() * 100) as u64)
+        Ok((w.held.iter().filter(|r| drop.contains(*r)).count() * 100) as u64)
     }
     fn usage(&self) -> anyhow::Result<(u64, u64)> {
         let w = self.0.lock().unwrap();
@@ -655,48 +470,39 @@ pub(crate) struct Spec {
     format: &'static str,
     carried: Vec<String>,
     notes: Option<String>,
-    instance: Option<String>,
-    /// The base's refs, a real stack artifact `reg/stack:<tag>` among them.
+    /// An apps layout it carries, by the refs its index names.
+    apps: Vec<String>,
+    /// The OS's refs.
     components: Components,
     /// `components.json` as written, in place of `components`.
     raw_components: Option<String>,
 }
 
 impl Spec {
-    /// A base, without modules, running its app and judge and a shared base.
+    /// An OS running its own image and a shared one.
     pub(crate) fn new(tag: &str) -> Self {
-        let carried = vec![
-            format!("reg/app:{tag}"),
-            format!("reg/judge:{tag}"),
-            BASE.into(),
-        ];
-        let mut runs: BTreeSet<String> = carried.iter().cloned().collect();
-        runs.insert(stack_ref(tag));
+        let carried = vec![format!("reg/app:{tag}"), format!("reg/cni:{tag}"), BASE.into()];
+        let runs: BTreeSet<String> = carried.iter().cloned().collect();
         Self {
             tag: tag.into(),
             epoch: 2000,
             talos: "v1.14.1".into(),
             secureboot: "1",
-            extra: "LOCK_PROFILE=edge\nSTACK_PATH=./base\n".into(),
+            extra: "LOCK_PROFILE=edge\n".into(),
             patch: patch(tag),
             format: crate::bundle::FORMAT,
             carried,
             notes: None,
-            instance: None,
+            apps: Vec::new(),
             components: Components { base: runs },
             raw_components: None,
         }
     }
 
-    /// The base, naming its installer.
+    /// The OS, naming its installer.
     fn base(tag: &str) -> Self {
         let c = Components {
-            base: [
-                format!("reg/app:{tag}"),
-                format!("reg/judge:{tag}"),
-                stack_ref(tag),
-            ]
-            .into(),
+            base: [format!("reg/app:{tag}"), format!("reg/cni:{tag}")].into(),
         };
         Self {
             carried: c.refs().into_iter().collect(),
@@ -710,10 +516,10 @@ impl Spec {
         }
     }
 
-    /// Carries its app and judge, and relies on the shared base it lists.
+    /// Carries its own images, and relies on the shared one it lists.
     fn partial(tag: &str) -> Self {
         Self {
-            carried: vec![format!("reg/app:{tag}"), format!("reg/judge:{tag}")],
+            carried: vec![format!("reg/app:{tag}"), format!("reg/cni:{tag}")],
             ..Self::new(tag)
         }
     }
@@ -721,122 +527,15 @@ impl Spec {
 
 const BASE: &str = "reg/base@sha256:shared";
 
-fn stack_ref(tag: &str) -> String {
-    format!("reg/stack:{tag}")
-}
-
-fn module(name: &str) -> crate::bundle::components::Module {
-    crate::bundle::components::Module {
-        version: "1".into(),
-        epoch: 1,
-        requires: Default::default(),
-        manifest: [(
-            format!("MODULE_{}", name.to_uppercase()),
-            format!("reg/modules/{name}:1@sha256:{name}"),
-        )]
-        .into(),
-        refs: [format!("reg/{name}:1")].into(),
-        flux: format!("kind: Kustomization\nmetadata: {{name: module-{name}}}\n"),
-        machine: format!("apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: {name}-data\n"),
-    }
-}
-
-fn gzip_tar(files: &[(&str, &str)]) -> Vec<u8> {
-    use std::io::Write;
-    let mut b = tar::Builder::new(Vec::new());
-    for (name, body) in files {
-        let mut h = tar::Header::new_gnu();
-        h.set_size(body.len() as u64);
-        h.set_mode(0o644);
-        b.append_data(&mut h, name, body.as_bytes()).unwrap();
-    }
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gz.write_all(&b.into_inner().unwrap()).unwrap();
-    gz.finish().unwrap()
-}
-
-/// A Flux artifact in `blobs`; its index entry.
-fn stack_artifact(blobs: &Path, tag: &str) -> serde_json::Value {
-    use sha2::Digest;
-    let put = |b: &[u8]| {
-        let h = hex::encode(sha2::Sha256::digest(b));
-        std::fs::write(blobs.join(&h), b).unwrap();
-        format!("sha256:{h}")
-    };
-    let layer = gzip_tar(&[
-        ("base/kustomization.yaml", "components:\n  - ../modules\n"),
-        ("base/tag", tag),
-        ("modules/kustomization.yaml", "resources: []\n"),
-    ]);
-    let config = b"{}";
-    let m = serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {"mediaType": "application/vnd.cncf.flux.config.v1+json", "digest": put(config), "size": 2},
-        "layers": [{"mediaType": "application/vnd.cncf.flux.content.v1.tar+gzip", "digest": put(&layer), "size": layer.len()}],
-    });
-    let bytes = serde_json::to_vec(&m).unwrap();
-    serde_json::json!({
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "digest": put(&bytes),
-        "size": bytes.len(),
-        "annotations": {"io.containerd.image.name": stack_ref(tag)},
-    })
-}
-
-/// The files of the stack the registry holds at `tag`, composed by the unit.
-fn composed_stack(h: &Harness, tag: &str) -> BTreeMap<String, String> {
-    use std::io::Read;
-    let w = h.w();
-    let d = &w.digests[&stack_ref(tag)];
-    let m: serde_json::Value = serde_json::from_slice(&w.blobs[d]).unwrap();
-    let layer = &w.blobs[m["layers"][0]["digest"].as_str().unwrap()];
-    let mut a = tar::Archive::new(flate2::read::GzDecoder::new(layer.as_slice()));
-    let mut out = BTreeMap::new();
-    for e in a.entries().unwrap() {
-        let mut e = e.unwrap();
-        if e.header().entry_type().is_file() {
-            let mut t = String::new();
-            e.read_to_string(&mut t).unwrap();
-            out.insert(e.path().unwrap().display().to_string(), t);
-        }
-    }
-    out
-}
-
-fn seed(tag: &str) -> String {
-    format!(
-        "apiVersion: apps/v1
-kind: Deployment
-metadata: {{name: stack-commit, namespace: flux-system}}
-spec:
-  template:
-    spec:
-      containers:
-        - name: judge
-          image: reg/judge:{tag}
-"
-    )
-}
-
 const BLESS: &str = "/var/mnt/edge-evidence/boot-commit/blessed";
 
 fn settings() -> Settings {
-    let r = |n: &str| Ref::try_from(format!("flux-system/{n}")).unwrap();
     Settings {
         trusted_root: "/etc/edge-update/trusted_root.json".into(),
         trust_policy: Default::default(),
         store: "/var/lib/etcd/state.log".into(),
         bless: BLESS.into(),
-        stack: Stack {
-            url: "oci://127.0.0.1:5000/stack".into(),
-            flux_instance: r("flux"),
-            kustomization: r("stack"),
-            source: r("stack"),
-            lock: r("lock"),
-            judge: r("judge"),
-            modules: Some(r("modules")),
-        },
+        registry: "127.0.0.1:5000".into(),
         boot_signing: None,
     }
 }
@@ -923,11 +622,8 @@ impl Harness {
         let c = &s.components;
         let mut manifests: Vec<serde_json::Value> = Vec::new();
         let mut mf = format!("FORMAT={}\n", s.format);
-        let e = stack_artifact(&src.join("images/blobs/sha256"), &s.tag);
-        let stack = e["digest"].as_str().unwrap().to_string();
-        manifests.push(e);
         mf.push_str(&format!(
-            "STACK_DIGEST={stack}\nINSTALLER_REF=reg/installer:{}@{DIGEST}\n\
+            "INSTALLER_REF=reg/installer:{}@{DIGEST}\n\
              TALOS_VERSION={}\nBUILT_EPOCH={}\nSECUREBOOT={}\n{}",
             s.tag, s.talos, s.epoch, s.secureboot, s.extra
         ));
@@ -938,18 +634,24 @@ impl Harness {
         std::fs::write(src.join(crate::bundle::components::COMPONENTS), components).unwrap();
         std::fs::write(src.join("MANIFEST"), mf).unwrap();
         std::fs::write(src.join("config-patch.yaml"), &s.patch).unwrap();
-        std::fs::write(src.join("seed.yaml"), seed(&s.tag)).unwrap();
         if let Some(n) = &s.notes {
             std::fs::write(src.join(crate::bundle::NOTES), n).unwrap();
         }
-        if let Some(i) = &s.instance {
-            std::fs::write(src.join(crate::bundle::INSTANCE), i).unwrap();
+        if !s.apps.is_empty() {
+            let apps = src.join(crate::bundle::APPS);
+            std::fs::create_dir_all(apps.join("blobs/sha256")).unwrap();
+            std::fs::write(apps.join("oci-layout"), "{}").unwrap();
+            let named: Vec<_> = s
+                .apps
+                .iter()
+                .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}}))
+                .collect();
+            std::fs::write(apps.join("index.json"), serde_json::json!({ "manifests": named }).to_string()).unwrap();
         }
         std::fs::write(src.join("images/oci-layout"), "{}").unwrap();
         manifests.extend(
             s.carried
                 .iter()
-                .filter(|r| **r != stack_ref(&s.tag))
                 .map(|r| serde_json::json!({"annotations": {"io.containerd.image.name": r}})),
         );
         let index = serde_json::json!({ "manifests": manifests });
@@ -1027,9 +729,6 @@ impl Harness {
             w.active.contains("unit-machine-token"),
             "the unit's secrets were lost"
         );
-        assert_eq!(w.tag, tag);
-        assert_eq!(w.url, "oci://127.0.0.1:5000/stack");
-        assert_eq!(w.judge["good"], tag);
         assert!(w.held.contains(&format!("reg/app:{tag}")));
     }
 }
@@ -1094,14 +793,11 @@ async fn a_new_os_is_signed_at_a_reboot_then_installed_with_the_signed_files() {
         h.w().log,
         [
             "import",
-            "import",
             "reboot",
             "stage",
             "import",
             "install",
             "reboot",
-            "seed",
-            "repoint update-new",
             "collect"
         ]
     );
@@ -1138,11 +834,8 @@ async fn the_os_the_unit_runs_is_not_installed_again() {
         w.log,
         [
             "import",
-            "import",
             "stage",
-            "apply",
-            "seed",
-            "repoint update-new"
+            "apply"
         ]
     );
     assert_eq!(w.boot_id, 1, "rebooted");
@@ -1189,12 +882,9 @@ async fn the_os_is_installed_unless_the_unit_runs_it_already() {
             h.w().log,
             [
                 "import",
-                "import",
                 "stage",
                 "install",
-                "reboot",
-                "seed",
-                "repoint update-new"
+                "reboot"
             ],
             "{installer} {version}"
         );
@@ -1219,12 +909,9 @@ async fn an_update_commits_in_order() {
         w.log,
         [
             "import",
-            "import",
             "stage",
             "install",
-            "reboot",
-            "seed",
-            "repoint update-new"
+            "reboot"
         ]
     );
     let e = &h.engine.as_ref().unwrap().record.history[0];
@@ -1300,7 +987,6 @@ async fn a_power_cut_after_any_phase_converges() {
                 "cut after phase {k}: {}",
                 e.detail
             );
-            assert_eq!(h.w().tag, OLD_TAG, "cut after phase {k}");
             assert_eq!(h.w().active, UNIT_CONFIG, "cut after phase {k}");
             assert!(!h.w().committed_new());
             h.e().request_apply("update-new", "").await.unwrap();
@@ -1336,9 +1022,6 @@ async fn a_new_os_that_does_not_stay_up_stops_the_update() {
         (w.active.as_str(), w.staged.as_deref()),
         (UNIT_CONFIG, None)
     );
-    assert_eq!(w.tag, OLD_TAG);
-    assert!(!w.seeded);
-    assert!(!w.log.iter().any(|l| l.starts_with("repoint")));
 }
 
 #[tokio::test]
@@ -1412,38 +1095,11 @@ async fn commit_deletes_saved_config() {
 }
 
 #[tokio::test]
-async fn a_stack_the_judge_rolls_back_fails_the_update() {
-    let mut h = Harness::new();
-    h.w().verdict = Verdict::Bad;
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::RolledBack);
-    assert!(e.detail.contains("rolled the stack back"), "{}", e.detail);
-    assert_eq!(h.w().tag, OLD_TAG);
-    assert!(
-        h.e().record.release.is_some(),
-        "a failed update stays applicable"
-    );
-}
-
-#[tokio::test]
-async fn a_stack_with_another_digest_is_rolled_back() {
-    let mut h = Harness::new();
-    h.w().verdict = Verdict::WrongDigest;
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Failed);
-    assert!(e.detail.contains("not the signed"), "{}", e.detail);
-    assert_eq!(h.w().tag, OLD_TAG);
-}
-
-#[tokio::test]
 async fn registry_keeps_two_releases_and_what_runs() {
     let mut h = Harness::new();
     for (i, tag) in ["update-a", "update-b", "update-c"].into_iter().enumerate() {
         let mut s = Spec::new(tag);
         s.epoch = 2000 + i as i64 * 10;
-        h.w()
-            .lock
-            .insert("built_epoch".into(), (s.epoch - 1).to_string());
         let e = h.update(&s, |_, _| {}).await;
         assert_eq!(e.outcome, Outcome::Committed, "{tag}: {}", e.detail);
         if i == 0 {
@@ -1458,10 +1114,8 @@ async fn registry_keeps_two_releases_and_what_runs() {
             "reg/app:update-b",
             "reg/app:update-c",
             "reg/base@sha256:shared",
-            "reg/judge:update-b",
-            "reg/judge:update-c",
-            "reg/stack:update-b",
-            "reg/stack:update-c",
+            "reg/cni:update-b",
+            "reg/cni:update-c",
         ]
         .into_iter()
         .map(String::from)
@@ -1482,9 +1136,6 @@ async fn partial_bundles_keep_what_they_rely_on() {
     {
         let mut s = s;
         s.epoch = 2000 + i as i64 * 10;
-        h.w()
-            .lock
-            .insert("built_epoch".into(), (s.epoch - 1).to_string());
         let e = h.update(&s, |_, _| {}).await;
         assert_eq!(e.outcome, Outcome::Committed, "{}: {}", s.tag, e.detail);
         assert!(h.w().held.contains(BASE), "{} collected the base", s.tag);
@@ -1513,12 +1164,12 @@ async fn a_partial_bundle_needs_what_it_does_not_carry() {
 #[tokio::test]
 async fn a_partial_bundle_keeps_what_a_failed_release_left_it() {
     let mut h = Harness::new();
-    h.w().verdict = Verdict::Bad;
+    h.w().trial_fails = true;
     let e = h.update(&Spec::new("update-a"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert!(h.w().held.contains(BASE));
 
-    h.w().verdict = Verdict::Good;
+    h.w().trial_fails = false;
     let mut s = Spec::partial("update-b");
     s.epoch = 2010;
     let e = h.update(&s, |_, _| {}).await;
@@ -1532,50 +1183,16 @@ async fn a_partial_bundle_keeps_what_a_failed_release_left_it() {
 #[tokio::test]
 async fn a_bundle_of_an_old_format_is_refused_as_it_arrives() {
     let mut h = Harness::new();
-    for f in ["3", "4"] {
+    for f in ["4", "5"] {
         let mut s = Spec::new("update-new");
         s.format = f;
         let sha = h.upload(&s);
         let up = h.e().uploads().current().unwrap();
-        let want = format!("the bundle is format {f}, and only format 5 is read: rebuild it");
+        let want = format!("the bundle is format {f}, and only format 6 is read: rebuild it");
         assert!(up.refused.contains(&want), "{}", up.refused);
         assert!(h.e().request_verify(&sha).await.is_err());
         assert!(h.w().log.is_empty());
     }
-}
-
-#[tokio::test]
-async fn failed_update_keeps_its_judge_image() {
-    let mut h = Harness::new();
-    h.w().verdict = Verdict::Bad;
-    let e = h.update(&Spec::new("update-a"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
-    assert_eq!(h.w().judge_image, "reg/judge:update-a");
-
-    h.w().verdict = Verdict::Good;
-    let mut next = Spec::new("update-b");
-    next.epoch = 2010;
-    let mut kept = None;
-    let e = h
-        .update(&next, |h, _| {
-            if h.e().record.phase == Phase::Snapshotting {
-                kept = Some(h.w().held.contains("reg/judge:update-a"));
-            }
-        })
-        .await;
-    assert_eq!(kept, Some(true), "the import collected the running judge");
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-b");
-}
-
-#[tokio::test]
-async fn broken_judge_is_replaced_not_awaited() {
-    let mut h = Harness::new();
-    h.w().judge_image = "reg/judge:gone".into();
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-    assert_eq!(h.w().judge_image, "reg/judge:update-new");
 }
 
 async fn refused(h: &mut Harness, s: &Spec, why: &str) {
@@ -1592,7 +1209,9 @@ async fn refused(h: &mut Harness, s: &Spec, why: &str) {
 
 #[tokio::test]
 async fn refusals_change_nothing() {
-    let mut h = Harness::new();
+    // The release the unit runs is what a bundle is checked against.
+    let (mut h, _, _) = happy().await;
+    h.w().log.clear();
     let mut s = Spec::new("update-new");
     s.epoch = 1000;
     refused(&mut h, &s, "REFUSING A DOWNGRADE").await;
@@ -1616,9 +1235,29 @@ async fn refusals_change_nothing() {
     h.w().no_store = true;
     refused(&mut h, &Spec::new("update-new"), "no store").await;
     h.w().no_store = false;
+}
 
-    h.w().lock.remove("built_epoch");
-    refused(&mut h, &Spec::new("update-new"), "built_epoch").await;
+#[tokio::test]
+async fn a_unit_that_has_run_no_release_takes_the_one_it_is_provisioned_with() {
+    let mut h = Harness::new();
+    let mut s = Spec::new("update-first");
+    s.epoch = 1;
+    s.extra = "LOCK_PROFILE=any\n".into();
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+}
+
+#[tokio::test]
+async fn a_bundles_apps_are_imported_under_the_registrys_name() {
+    let mut h = Harness::new();
+    let mut s = Spec::new("update-new");
+    s.apps = vec!["127.0.0.1:5999/platform-meridian/platform-core/app:v1".into()];
+    let e = h.update(&s, |_, _| {}).await;
+    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
+    let w = h.w();
+    assert_eq!(w.apps.len(), 1);
+    assert_eq!(w.apps[0].1, "127.0.0.1:5000");
+    assert!(w.apps[0].0.contains("127.0.0.1:5999/platform-meridian/platform-core/app:v1"));
 }
 
 #[tokio::test]
@@ -1790,7 +1429,7 @@ fn trial_is_read_as_boot_commit_reads_it() {
 }
 
 /// Waits in `phase` however long, saying `why`, until a person rolls it back:
-/// then the unit runs what it ran before, the stack unmoved.
+/// then the unit runs what it ran before.
 async fn waits_until_rolled_back(set: impl FnOnce(&mut World), phase: Phase, why: &str) {
     let mut h = Harness::new();
     set(&mut h.w());
@@ -1810,7 +1449,6 @@ async fn waits_until_rolled_back(set: impl FnOnce(&mut World), phase: Phase, why
     h.run(|_, _| {}).await;
     let e = h.e().record.history[0].clone();
     assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
-    assert_eq!(h.w().tag, OLD_TAG, "the stack moved");
     assert_eq!(
         h.w().default.to_lowercase(),
         "talos-v1.14.1.efi",
@@ -1825,7 +1463,6 @@ async fn an_installer_that_fails_stops_it() {
     let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Failed, "{}", e.detail);
     assert!(e.detail.contains("did not install"), "{}", e.detail);
-    assert_eq!(h.w().tag, OLD_TAG, "the stack moved");
     {
         let w = h.w();
         assert_eq!(w.staged.as_deref().unwrap_or(&w.active), w.active);
@@ -1849,47 +1486,11 @@ async fn an_installer_that_fails_stops_it() {
 }
 
 #[tokio::test]
-async fn an_operator_moving_the_stack_ends_the_judging() {
-    let mut h = Harness::new();
-    h.w().judge_idle = true;
-    applied(&mut h, &Spec::new("update-new")).await;
-    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
-    h.w().tag = OLD_TAG.into();
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Failed);
-    assert!(
-        e.detail
-            .contains("an operator moved the stack to update-old"),
-        "{}",
-        e.detail
-    );
-}
-
-#[tokio::test]
 async fn workloads_that_never_settle_wait_until_rolled_back() {
     waits_until_rolled_back(
         |w| w.never_ready = true,
         Phase::Settling,
         "waiting for deployment app/web",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_judge_that_never_rolls_out_waits_until_rolled_back() {
-    waits_until_rolled_back(|w| w.seed_stuck = true, Phase::Seeding, "rolling out").await;
-}
-
-#[tokio::test]
-async fn a_judge_with_nothing_to_roll_back_to_waits_until_rolled_back() {
-    waits_until_rolled_back(
-        |w| {
-            w.judge_idle = true;
-            w.judge.insert("good".into(), "update-older".into());
-        },
-        Phase::AwaitingGood,
-        "to record",
     )
     .await;
 }
@@ -1974,27 +1575,6 @@ async fn revert_while_away_restores_config() {
     assert_eq!(h.w().active, UNIT_CONFIG);
 }
 
-#[tokio::test]
-async fn a_stack_rolled_back_once_can_be_applied_again() {
-    let mut h = Harness::new();
-    h.w().verdict = Verdict::Bad;
-    let e = h.update(&Spec::new("update-new"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::RolledBack);
-    assert!(e.detail.contains("rolled the stack back"), "{}", e.detail);
-    assert_eq!(h.w().tag, OLD_TAG);
-    h.w().verdict = Verdict::Good;
-    h.e().request_apply("update-new", "").await.unwrap();
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-    assert_eq!(
-        h.w().log.iter().filter(|l| *l == "install").count(),
-        1,
-        "the committed OS was installed again"
-    );
-}
-
 /// Steps until `phase` is reached, waiting as the engine asks.
 async fn step_until(h: &mut Harness, at: impl Fn(&Phase) -> bool) {
     for _ in 0..500 {
@@ -2044,49 +1624,22 @@ async fn applied(h: &mut Harness, s: &Spec) {
 #[tokio::test]
 async fn the_unit_is_read_whatever_the_engine_does() {
     let mut h = Harness::new();
-    {
-        let mut w = h.w();
-        w.judge.insert("previous".into(), "update-older".into());
-        w.judge.insert("trial".into(), "update-next".into());
-        w.judge.insert(
-            "rolled_back".into(),
-            "update-bad 2026-09-01T00:00:00Z".into(),
-        );
-    }
+    h.w().running.insert("reg/app:running".into());
     assert!(h.e().refresh_unit().await);
-    let read = Unit {
-        talos_version: "v1.14.1".into(),
-        stack_tag: OLD_TAG.into(),
-        good: OLD_TAG.into(),
-        previous: "update-older".into(),
-        trial: "update-next".into(),
-        rolled_back: "update-bad 2026-09-01T00:00:00Z".into(),
-        os_trial: false,
-        ..h.e().unit.clone()
-    };
-    assert_eq!(h.e().unit, read);
-    let u = &h.e().unit;
-    assert_eq!(
-        (
-            u.flux_version.as_str(),
-            u.judge.trial.as_str(),
-            u.components.len()
-        ),
-        ("v2.6.4", "update-next", 0)
-    );
+    let u = h.e().unit.clone();
+    assert_eq!((u.talos_version.as_str(), u.os_trial), ("v1.14.1", false));
     assert!(!h.e().refresh_unit().await, "nothing changed");
 
     {
         let mut w = h.w();
         w.count_path = "\\EFI\\Linux\\Talos-v1.14.1~9+2-1.efi".into();
-        w.tag = "update-next".into();
         w.apiserver_down = true;
     }
     assert!(h.e().refresh_unit().await);
     assert!(h.e().unit.os_trial);
     assert_eq!(
-        h.e().unit.stack_tag,
-        OLD_TAG,
+        h.e().unit.components,
+        u.components,
         "an unread part keeps its reading"
     );
 
@@ -2094,10 +1647,10 @@ async fn the_unit_is_read_whatever_the_engine_does() {
         let mut w = h.w();
         w.apiserver_down = false;
         w.apid_down = true;
+        w.version = "v1.14.2".into();
     }
-    assert!(h.e().refresh_unit().await);
+    h.e().refresh_unit().await;
     let u = h.e().unit.clone();
-    assert_eq!(u.stack_tag, "update-next");
     assert_eq!(
         (u.talos_version.as_str(), u.os_trial),
         ("v1.14.1", true),
@@ -2162,12 +1715,6 @@ async fn power_when_idle_says_what_boots_next() {
     assert!(h.e().record.before.is_none());
 }
 
-fn judge_takes_requests(h: &Harness) {
-    let mut w = h.w();
-    w.judge_idle = true;
-    w.judge.insert("requests".into(), "commit rollback".into());
-}
-
 fn newer() -> Spec {
     let mut s = Spec::new("update-newer");
     s.epoch = 3000;
@@ -2192,8 +1739,6 @@ async fn steps_and_a_log_are_kept_as_the_update_goes() {
             (Step::Install, Done),
             (Step::Reboot, Done),
             (Step::OsTrial, Done),
-            (Step::Stack, Done),
-            (Step::Trial, Done),
             (Step::Commit, Done),
         ]
     );
@@ -2228,8 +1773,6 @@ async fn an_update_without_a_new_os_skips_its_steps() {
             (Step::Verify, Done),
             (Step::Stage, Done),
             (Step::Install, Skipped),
-            (Step::Stack, Done),
-            (Step::Trial, Done),
             (Step::Commit, Done),
         ]
     );
@@ -2261,7 +1804,7 @@ async fn verification_says_what_applying_changes() {
     assert_eq!(r.signer, testkit::SIGNER);
     let d = r.diff.unwrap();
     assert_eq!(
-        d.stack,
+        d.release,
         ("update-new".to_string(), "update-newer".to_string())
     );
     assert!(d.removals_known && d.reboot && d.config_changes);
@@ -2284,8 +1827,7 @@ async fn verification_says_what_applying_changes() {
         [
             ("reg/app", diff::Change::Changed),
             ("reg/base", diff::Change::Unchanged),
-            ("reg/judge", diff::Change::Changed),
-            ("reg/stack", diff::Change::Changed),
+            ("reg/cni", diff::Change::Changed),
         ]
     );
     assert_eq!(
@@ -2308,67 +1850,6 @@ async fn images_that_will_not_fit_are_refused() {
 }
 
 #[tokio::test]
-async fn a_stack_on_trial_commits_when_asked() {
-    let mut h = Harness::new();
-    judge_takes_requests(&h);
-    applied(&mut h, &Spec::new("update-new")).await;
-    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
-    assert!(h.e().request_commit("update-other", "ann").await.is_err());
-    h.e().request_commit("update-new", "ann").await.unwrap();
-    assert_eq!(h.w().judge["request"], "commit update-new");
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-    assert!(
-        e.log
-            .iter()
-            .any(|l| l.text == "ann asked to commit update-new")
-    );
-}
-
-#[tokio::test]
-async fn a_judge_that_takes_no_requests_is_not_asked() {
-    let mut h = Harness::new();
-    h.w().judge_idle = true;
-    applied(&mut h, &Spec::new("update-new")).await;
-    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
-    let e = h.e().request_commit("update-new", "ann").await.unwrap_err();
-    assert!(e.to_string().contains("takes no commit"), "{e}");
-    assert!(h.w().judge.get("request").is_none_or(String::is_empty));
-}
-
-#[tokio::test]
-async fn a_stack_on_trial_rolls_back_when_asked() {
-    let mut h = Harness::new();
-    judge_takes_requests(&h);
-    applied(&mut h, &Spec::new("update-new")).await;
-    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
-    h.e().request_rollback("update-new", "ann").await.unwrap();
-    assert_eq!(h.w().judge["request"], "rollback update-new");
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
-    assert_eq!(e.rollback_reason, "ann asked");
-    assert_eq!(h.w().tag, OLD_TAG);
-    assert!(h.e().record.release.is_some(), "it can be applied again");
-}
-
-#[tokio::test]
-async fn without_the_judge_a_rollback_moves_the_stack_itself() {
-    let mut h = Harness::new();
-    h.w().judge_idle = true;
-    applied(&mut h, &Spec::new("update-new")).await;
-    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
-    h.e().request_rollback("update-new", "ann").await.unwrap();
-    assert_eq!(h.w().tag, OLD_TAG);
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
-    assert_eq!(e.rollback_reason, "ann asked");
-}
-
-#[tokio::test]
 async fn the_new_os_rolls_back_when_asked() {
     let mut h = Harness::new();
     applied(&mut h, &Spec::new("update-new")).await;
@@ -2388,24 +1869,7 @@ async fn the_new_os_rolls_back_when_asked() {
     assert_eq!(e.rollback_reason, "ann asked");
     let w = h.w();
     assert_eq!(w.active, UNIT_CONFIG);
-    assert_eq!(
-        (w.tag.as_str(), w.selected.as_str()),
-        (OLD_TAG, "talos-v1.14.1.efi")
-    );
-}
-
-#[tokio::test]
-async fn after_a_commit_the_previous_good_release_is_a_rollback_away() {
-    let (mut h, _, _) = happy().await;
-    assert!(h.e().request_rollback("update-older", "ann").await.is_err());
-    let said = h.e().request_rollback(OLD_TAG, "ann").await.unwrap();
-    assert_eq!(said, format!("update-new rolled back to {OLD_TAG}"));
-    assert_eq!(h.w().tag, OLD_TAG);
-    assert_eq!(h.w().url, "oci://127.0.0.1:5000/stack");
-    let e = h.e().record.history[0].clone();
-    assert_eq!((e.outcome, e.by.as_str()), (Outcome::RolledBack, "ann"));
-    // Now on trial of the judge's, not its good release: no further back.
-    assert!(h.e().request_rollback(OLD_TAG, "ann").await.is_err());
+    assert_eq!(w.selected, "talos-v1.14.1.efi");
 }
 
 #[tokio::test]
@@ -2413,22 +1877,24 @@ async fn storage_counts_what_a_collection_frees() {
     let (mut h, _, _) = happy().await;
     let e = h.update(&newer(), |_, _| {}).await;
     assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.w().held.insert("reg/app:stale".into());
+    // What no release of this engine named is another writer's: an app core uploaded.
+    h.w().held.insert("reg/app:uploaded".into());
     h.e().refresh_unit().await;
     let s = h.e().storage().await.unwrap();
-    // The fake holds 100 bytes an image: the previous release's app, judge and stack.
-    assert_eq!((s.reclaimable, s.previous), (100, 300));
-    assert_eq!(h.e().collect(false).await.unwrap(), 100);
+    // The fake holds 100 bytes an image: the previous release's own two.
+    assert_eq!((s.reclaimable, s.previous), (0, 200));
+    assert_eq!(h.e().collect(false).await.unwrap(), 0);
     assert!(h.w().held.contains("reg/app:update-new"));
-    assert_eq!(h.e().collect(true).await.unwrap(), 300);
+    assert_eq!(h.e().collect(true).await.unwrap(), 200);
     assert!(!h.w().held.contains("reg/app:update-new"));
     assert!(h.w().held.contains("reg/app:update-newer"));
+    assert!(h.w().held.contains("reg/app:uploaded"));
     let e = h
         .e()
         .request_rollback("update-new", "ann")
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("were collected"), "{e}");
+    assert!(e.to_string().contains("nothing is on trial"), "{e}");
 }
 
 #[tokio::test]
@@ -2447,7 +1913,7 @@ async fn only_a_whole_upload_of_that_bundle_is_verified() {
 async fn an_update_refused_at_apply_is_dated_from_the_apply() {
     let mut h = Harness::new();
     assert!(h.verify(&Spec::new("update-new")).await.is_none());
-    h.w().lock.insert("built_epoch".into(), "5000".into());
+    h.w().no_store = true;
     let at = h.clock.fetch_add(3, Ordering::SeqCst) + 3;
     h.e().request_apply("update-new", "").await.unwrap();
     h.clock.fetch_add(7, Ordering::SeqCst);
@@ -2471,32 +1937,6 @@ fn progress_is_counted_only_while_started() {
 }
 
 #[tokio::test]
-async fn a_trial_the_judge_holds_with_the_engine_idle_is_asked_of_it() {
-    let (mut h, _, _) = happy().await;
-    judge_takes_requests(&h);
-    h.e().refresh_unit().await;
-    let e = h.e().request_commit("update-new", "ann").await.unwrap_err();
-    assert!(e.to_string().contains("no stack is on trial"), "{e}");
-    {
-        let mut w = h.w();
-        w.judge.insert("trial".into(), "update-other".into());
-        w.tag = "update-new".into();
-    }
-    h.e().refresh_unit().await;
-    assert!(
-        h.e().request_commit("update-other", "ann").await.is_err(),
-        "the unit runs another"
-    );
-    h.w().tag = "update-other".into();
-    h.e().refresh_unit().await;
-    h.e().request_commit("update-other", "ann").await.unwrap();
-    assert_eq!(h.w().judge["request"], "commit update-other");
-    h.w().judge.insert("request".into(), String::new());
-    h.e().request_rollback("update-other", "ann").await.unwrap();
-    assert_eq!(h.w().judge["request"], "rollback update-other");
-}
-
-#[tokio::test]
 async fn the_same_release_again_changes_no_config() {
     let (mut h, _, _) = happy().await;
     assert!(h.verify(&Spec::new("update-new")).await.is_none());
@@ -2509,38 +1949,8 @@ async fn the_same_release_again_changes_no_config() {
     );
 }
 
-const INSTANCE: &str = "apiVersion: fluxcd.controlplane.io/v1\nkind: FluxInstance\nmetadata: {name: flux, namespace: flux-system}\nspec:\n  distribution: {version: 2.9.6}\n";
-
 #[tokio::test]
-async fn the_bundles_flux_instance_is_applied_once_its_stack_is() {
-    let mut h = Harness::new();
-    let s = Spec {
-        instance: Some(INSTANCE.into()),
-        ..Spec::new("update-new")
-    };
-    let e = h.update(&s, |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    let w = h.w();
-    assert_eq!(w.instance, Some((INSTANCE.into(), "update-new".into())));
-    let at = |what: &str| w.log.iter().position(|l| l == what).unwrap();
-    assert!(at("repoint update-new") < at("instance"), "{:?}", w.log);
-}
-
-#[tokio::test]
-async fn a_flux_instance_waits_for_the_signed_stack() {
-    let mut h = Harness::new();
-    h.w().verdict = Verdict::WrongDigest;
-    let s = Spec {
-        instance: Some(INSTANCE.into()),
-        ..Spec::new("update-new")
-    };
-    let e = h.update(&s, |_, _| {}).await;
-    assert_ne!(e.outcome, Outcome::Committed);
-    assert_eq!(h.w().instance, None);
-}
-
-#[tokio::test]
-async fn serving_rotation_is_turned_on_once_the_stack_is_committed() {
+async fn serving_rotation_is_turned_on_once_the_workloads_settle() {
     let mut h = Harness::new();
     let s = Spec {
         patch: format!(
@@ -2561,304 +1971,7 @@ async fn serving_rotation_is_turned_on_once_the_stack_is_committed() {
     );
     assert!(w.active.contains("serverTLSBootstrap: true"));
     let at = |what: &str| w.log.iter().rposition(|l| l == what).unwrap();
-    assert!(at("repoint update-new") < at("apply"), "{:?}", w.log);
-}
-
-/// A unit given a base without an OS step, then, as one installed before
-/// apps were MeridianApps, running the module `a` its installed set records.
-async fn with_a() -> Harness {
-    with_module(module("a")).await
-}
-
-async fn with_module(m: crate::bundle::components::Module) -> Harness {
-    let mut h = Harness::new();
-    running_installer(&h, &format!("reg/installer:provisioned@{DIGEST}"));
-    let e = h.update(&Spec::base("update-a"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    let p = h.state().join("installed").join("update-a.json");
-    let mut set: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-    set["installed"]["modules"]["a"] = serde_json::to_value(m).unwrap();
-    std::fs::write(&p, serde_json::to_vec(&set).unwrap()).unwrap();
-    let run = &mut h.e().record.history[0].release.as_mut().unwrap().manifest;
-    run.insert("MODULES".into(), "a".into());
-    h.e().save().unwrap();
-    h.w().held.insert("reg/a:1".into());
-    h.reopen();
-    h
-}
-
-fn manifest_of(e: &Entry) -> Manifest {
-    e.release.as_ref().unwrap().manifest.clone()
-}
-
-/// A newer base than [`with_a`]'s.
-fn next_base(tag: &str) -> Spec {
-    Spec {
-        epoch: 3000,
-        ..Spec::base(tag)
-    }
-}
-
-#[tokio::test]
-async fn a_base_carries_the_modules_the_unit_runs_as_they_are() {
-    let mut h = with_a().await;
-    let e = h.update(&next_base("update-b"), |h, _| h.reopen()).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    let m = manifest_of(&e);
-    assert_eq!(m["MODULES"], "a");
-    assert_eq!(m["MODULE_A"], "reg/modules/a:1@sha256:a");
-    let stack = composed_stack(&h, "update-b");
-    assert_eq!(stack["base/tag"], "update-b");
-    assert!(stack["modules/kustomization.yaml"].contains("  - a.yaml\n"));
-    let record: serde_json::Value =
-        serde_saphyr::from_str(&stack["modules/installed.yaml"]).unwrap();
-    assert_eq!(record["metadata"]["name"], "modules");
-    assert_eq!(record["data"]["MODULES"], "a");
-    let w = h.w();
-    assert!(w.active.contains("store:update-b") && w.active.contains("name: a-data"));
-    assert!(w.held.contains("reg/a:1") && w.held.contains("reg/app:update-b"));
-}
-
-#[tokio::test]
-async fn a_bundle_bringing_more_than_a_base_is_refused() {
-    let mut h = with_a().await;
-    h.w().log.clear();
-    for raw in [
-        r#"{"base": [], "modules": {"b": {"epoch": 1, "flux": "kind: Kustomization\n"}}}"#,
-        r#"{"base": [], "remove": ["a"]}"#,
-    ] {
-        let s = Spec {
-            raw_components: Some(raw.into()),
-            ..next_base("update-b")
-        };
-        refused(&mut h, &s, "a bundle brings the base alone").await;
-    }
-}
-
-#[tokio::test]
-async fn a_rolled_back_base_leaves_the_set_it_was_composed_on() {
-    let mut h = with_a().await;
-    h.w().verdict = Verdict::Bad;
-    let e = h.update(&next_base("update-b"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
-    assert_eq!(h.w().tag, "update-a");
-
-    h.w().verdict = Verdict::Good;
-    let s = Spec {
-        epoch: 4000,
-        ..Spec::base("update-c")
-    };
-    let e = h.update(&s, |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    assert_eq!(manifest_of(&e)["MODULES"], "a");
-}
-
-#[tokio::test]
-async fn a_set_composed_on_another_stack_is_verified_again() {
-    let mut h = with_a().await;
-    assert!(h.verify(&next_base("update-b")).await.is_none());
-    h.w().tag = OLD_TAG.into();
-    h.e().request_apply("update-b", "").await.unwrap();
-    h.run(|_, _| {}).await;
-    let e = &h.e().record.history[0];
-    assert_eq!(e.outcome, Outcome::Refused);
-    assert!(e.detail.contains("verify it again"), "{}", e.detail);
-}
-
-#[tokio::test]
-async fn with_no_recorded_set_a_base_is_taken_only_by_a_unit_running_no_module() {
-    let mut h = with_a().await;
-    // As an engine before installed sets leaves the unit: no record of its set.
-    std::fs::remove_dir_all(h.state().join("installed")).unwrap();
-    h.reopen();
-    h.w().log.clear();
-    refused(
-        &mut h,
-        &next_base("update-b"),
-        "this unit runs modules (a) its installed set does not record",
-    )
-    .await;
-
-    let mut h = Harness::new();
-    h.w().modules.clear();
-    refused(
-        &mut h,
-        &Spec::base("update-a"),
-        "this unit's installed modules are unknown",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_base_the_modules_it_carries_cannot_run_on_is_refused() {
-    for (set, why) in [
-        (
-            (|r: &mut crate::bundle::components::Requires| r.talos = "v1.15.0".into())
-                as fn(&mut crate::bundle::components::Requires),
-            "a requires Talos v1.15.0 and the unit would run v1.14.1",
-        ),
-        (
-            |r| r.kubernetes = "v1.36.0".into(),
-            "a requires Kubernetes v1.36.0 and the unit runs v1.35.2",
-        ),
-        (
-            |r| r.flux = ["helm-controller".to_string()].into(),
-            "a requires Flux's helm-controller",
-        ),
-    ] {
-        let mut m = module("a");
-        set(&mut m.requires);
-        let mut h = with_module(m).await;
-        h.w().log.clear();
-        refused(&mut h, &next_base("update-b"), why).await;
-    }
-    let mut m = module("a");
-    m.requires.talos = "v1.14.0".into();
-    m.requires.kubernetes = "v1.35.2".into();
-    m.requires.flux = ["source-controller".to_string()].into();
-    let mut h = with_module(m).await;
-    let e = h.update(&next_base("update-b"), |_, _| {}).await;
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-}
-
-/// The judge's trial of the stack the unit runs, unhealthy, and `good` its last good release.
-fn stuck_on(h: &Harness, tag: &str, good: &str) {
-    let mut w = h.w();
-    w.judge_idle = true;
-    w.tag = tag.into();
-    for (k, v) in [
-        ("good", good),
-        ("trial", tag),
-        ("checks", "fail workloads: deployment app/web"),
-    ] {
-        w.judge.insert(k.into(), v.into());
-    }
-}
-
-/// A unit's first release, by this engine, on trial: there is nothing before it.
-async fn first_on_trial(h: &mut Harness) {
-    {
-        let mut w = h.w();
-        w.tag = String::new();
-        w.judge = BTreeMap::from([("good".into(), String::new())]);
-        w.judge_idle = true;
-    }
-    applied(h, &Spec::new("update-new")).await;
-    step_until(h, |p| matches!(p, Phase::Judging { .. })).await;
-}
-
-fn ended_entries(h: &mut Harness, tag: &str) -> usize {
-    h.e()
-        .record
-        .history
-        .iter()
-        .filter(|e| e.outcome == Outcome::Failed && e.detail == ended(tag))
-        .count()
-}
-
-#[tokio::test]
-async fn a_first_trial_that_cannot_pass_is_taken_over_by_a_new_bundle() {
-    let mut h = Harness::new();
-    first_on_trial(&mut h).await;
-    stuck_on(&h, "update-new", "");
-    let sha = h.upload(&newer());
-    h.e().request_verify(&sha).await.unwrap();
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Failed);
-    assert_eq!(e.release.unwrap().tag(), "update-new");
-    assert_eq!(e.detail, ended("update-new"));
-    assert!(
-        e.detail
-            .starts_with("update-new failed its checks with no good release to roll back to"),
-        "{}",
-        e.detail
-    );
-    h.run(|_, _| {}).await;
-    assert_eq!(h.e().release().unwrap().tag(), "update-newer");
-
-    h.e().request_apply("update-newer", "ann").await.unwrap();
-    assert_eq!(ended_entries(&mut h, "update-new"), 1, "ended twice");
-    h.w().judge_idle = false;
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-newer");
-    assert!(h.e().record.took_over.is_empty());
-}
-
-#[tokio::test]
-async fn a_stuck_trial_the_engine_did_not_start_is_ended_by_an_apply() {
-    let mut h = Harness::new();
-    stuck_on(&h, "update-first", "");
-    assert!(h.verify(&Spec::new("update-new")).await.is_none());
-    h.e().request_apply("update-new", "ann").await.unwrap();
-    let e = h.e().record.history[0].clone();
-    assert_eq!(
-        (e.outcome, e.release.unwrap().tag(), e.by.as_str()),
-        (Outcome::Failed, "update-first", "ann")
-    );
-    assert_eq!(e.detail, ended("update-first"));
-    h.w().judge_idle = false;
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
-}
-
-#[tokio::test]
-async fn a_trial_that_can_pass_or_roll_back_is_not_taken_over() {
-    // Healthy, with nothing to return to.
-    let mut h = Harness::new();
-    first_on_trial(&mut h).await;
-    {
-        let mut w = h.w();
-        w.judge.insert("trial".into(), "update-new".into());
-        w.judge.insert("checks".into(), "pass workloads".into());
-    }
-    let sha = h.upload(&newer());
-    let e = h.e().request_verify(&sha).await.unwrap_err();
-    assert!(e.to_string().contains("in progress"), "{e}");
-    assert!(matches!(h.e().record.phase, Phase::Judging { .. }));
-    assert!(h.e().record.history.is_empty());
-
-    // Unhealthy, with a good release to roll back to.
-    let mut h = Harness::new();
-    h.w().judge_idle = true;
-    applied(&mut h, &Spec::new("update-new")).await;
-    step_until(&mut h, |p| matches!(p, Phase::Judging { .. })).await;
-    stuck_on(&h, "update-new", OLD_TAG);
-    let sha = h.upload(&newer());
-    assert!(h.e().request_verify(&sha).await.is_err());
-    assert!(matches!(h.e().record.phase, Phase::Judging { .. }));
-    assert!(h.e().record.history.is_empty());
-}
-
-#[tokio::test]
-async fn an_apply_onto_a_trial_that_can_pass_waits_for_it() {
-    let mut h = Harness::new();
-    stuck_on(&h, "update-first", "");
-    h.w().judge.insert("checks".into(), "pass workloads".into());
-    assert!(h.verify(&Spec::new("update-new")).await.is_none());
-    h.e().request_apply("update-new", "ann").await.unwrap();
-    assert!(h.e().record.history.is_empty());
-    step_until(&mut h, |p| *p == Phase::AwaitingGood).await;
-    for _ in 0..50 {
-        let Tick::Wait(d) = h.e().step().await.unwrap() else {
-            panic!("the wait ended by itself")
-        };
-        h.clock.fetch_add(d.as_secs() as i64 * 10, Ordering::SeqCst);
-    }
-    assert_eq!(h.w().tag, "update-first");
-    {
-        let mut w = h.w();
-        w.judge_idle = false;
-        w.judge.insert("good".into(), "update-first".into());
-        w.judge.insert("trial".into(), String::new());
-    }
-    h.run(|_, _| {}).await;
-    let e = h.e().record.history[0].clone();
-    assert_eq!(e.outcome, Outcome::Committed, "{}", e.detail);
-    h.committed("update-new");
+    assert!(at("reboot") < at("apply"), "{:?}", w.log);
 }
 
 #[tokio::test]

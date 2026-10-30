@@ -187,7 +187,8 @@ pub struct Diff {
     pub components: Vec<ComponentChange>,
     pub talos: (String, String),
     pub installer: (String, String),
-    pub stack: (String, String),
+    /// The release the unit ran, as this engine minted it, and the new one.
+    pub release: (String, String),
     pub reboot: bool,
     pub config_changes: bool,
     pub downtime_secs: i64,

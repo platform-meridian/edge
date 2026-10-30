@@ -14,20 +14,16 @@ pub enum Step {
     Install,
     Reboot,
     OsTrial,
-    Stack,
-    Trial,
     Commit,
 }
 
-const ALL: [Step; 9] = [
+const ALL: [Step; 7] = [
     Step::Upload,
     Step::Verify,
     Step::Stage,
     Step::Install,
     Step::Reboot,
     Step::OsTrial,
-    Step::Stack,
-    Step::Trial,
     Step::Commit,
 ];
 
@@ -62,8 +58,6 @@ pub fn of(phase: &Phase) -> Option<Step> {
         Phase::Installing => Step::Install,
         Phase::Rebooting { .. } => Step::Reboot,
         Phase::Trial | Phase::Settling => Step::OsTrial,
-        Phase::Seeding | Phase::AwaitingGood | Phase::Repointing { .. } => Step::Stack,
-        Phase::Judging { .. } => Step::Trial,
         Phase::Collecting => Step::Commit,
     })
 }
@@ -133,12 +127,10 @@ mod tests {
                 Step::Upload,
                 Step::Verify,
                 Step::Stage,
-                Step::Stack,
-                Step::Trial,
                 Step::Commit
             ]
         );
-        assert_eq!(plan(true).len(), 9);
+        assert_eq!(plan(true).len(), 7);
     }
 
     #[test]
@@ -180,8 +172,6 @@ mod tests {
                 (Step::Upload, State::Pending),
                 (Step::Verify, State::Done),
                 (Step::Stage, State::Running),
-                (Step::Stack, State::Pending),
-                (Step::Trial, State::Pending),
                 (Step::Commit, State::Pending),
             ]
         );
@@ -211,12 +201,6 @@ mod tests {
         assert_eq!(of(&Phase::Idle), None);
         assert_eq!(of(&Phase::Snapshotting), Some(Step::Stage));
         assert_eq!(of(&Phase::Settling), Some(Step::OsTrial));
-        assert_eq!(
-            of(&Phase::Judging {
-                rolled_back: String::new()
-            }),
-            Some(Step::Trial)
-        );
         assert_eq!(of(&Phase::Collecting), Some(Step::Commit));
     }
 }
