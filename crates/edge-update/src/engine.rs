@@ -211,6 +211,15 @@ impl Record {
         self.committed().next()
     }
 
+    /// The release the unit has booted: the one on trial while its OS is,
+    /// else the last committed.
+    pub fn booted(&self) -> Option<&Release> {
+        match self.phase {
+            Phase::Trial | Phase::Settling => self.release.as_ref(),
+            _ => self.running(),
+        }
+    }
+
     /// Each release this engine committed, the newest first.
     fn committed(&self) -> impl Iterator<Item = &Release> {
         self.history
@@ -382,12 +391,35 @@ enum Next {
     Wait(Duration, String),
     Fail(String),
     Refuse(String),
-    /// The unit went back: what happened, and why, in short.
-    Back(String, String),
+    /// The unit went back: what happened, and why.
+    Back(String, Cause),
     Done,
 }
 
 use Next::{Back, Done, Fail, Go, Refuse, Wait};
+
+/// Why the unit went back to its previous OS: a person asked, which ends the
+/// update's steps aborted, or the new OS did not hold, which fails them.
+enum Cause {
+    Asked { by: String },
+    Fell(&'static str),
+}
+
+impl Cause {
+    fn reason(&self) -> String {
+        match self {
+            Cause::Asked { by } => asked(by),
+            Cause::Fell(why) => (*why).into(),
+        }
+    }
+
+    fn closes(&self) -> State {
+        match self {
+            Cause::Asked { .. } => State::Aborted,
+            Cause::Fell(_) => State::Failed,
+        }
+    }
+}
 
 fn poll(secs: u64, why: impl Into<String>) -> anyhow::Result<Next> {
     Ok(Wait(Duration::from_secs(secs), why.into()))
@@ -581,7 +613,7 @@ impl Engine {
             }
             Err(e) => tracing::debug!(error = format!("{e:#}"), "could not read the unit's OS"),
         }
-        match self.record.running() {
+        match self.record.booted() {
             Some(r) => {
                 let u = &mut self.unit;
                 (u.components, u.manifest, u.release) =
@@ -690,8 +722,8 @@ impl Engine {
                 self.finish(Outcome::Refused, why)?;
                 Ok(Tick::Moved)
             }
-            Back(why, reason) => {
-                self.finish_back(why, reason)?;
+            Back(why, cause) => {
+                self.finish_back(why, cause)?;
                 Ok(Tick::Moved)
             }
             Done => {
@@ -717,11 +749,16 @@ impl Engine {
     }
 
     fn finish(&mut self, outcome: Outcome, detail: String) -> anyhow::Result<()> {
-        self.finish_as(outcome, detail, String::new())
+        let closes = if outcome == Outcome::Committed {
+            State::Done
+        } else {
+            State::Failed
+        };
+        self.finish_as(outcome, detail, String::new(), closes)
     }
 
-    fn finish_back(&mut self, detail: String, reason: String) -> anyhow::Result<()> {
-        self.finish_as(Outcome::RolledBack, detail, reason)
+    fn finish_back(&mut self, detail: String, cause: Cause) -> anyhow::Result<()> {
+        self.finish_as(Outcome::RolledBack, detail, cause.reason(), cause.closes())
     }
 
     fn finish_as(
@@ -729,14 +766,11 @@ impl Engine {
         outcome: Outcome,
         detail: String,
         reason: String,
+        closes: State,
     ) -> anyhow::Result<()> {
         let now = (self.now)();
         let ok = outcome == Outcome::Committed;
-        steps::close(
-            &mut self.record.steps,
-            if ok { State::Done } else { State::Failed },
-            now,
-        );
+        steps::close(&mut self.record.steps, closes, now);
         self.note(detail.clone());
         self.progress.stop();
         let b = self.record.before.take();
@@ -859,11 +893,7 @@ impl Engine {
         refusal: Option<&str>,
     ) -> (Vec<Check>, Diff, Option<String>) {
         let u = &self.unit;
-        let mut checks = vec![Check::new(
-            "signature",
-            CheckState::Pass,
-            rel.signer.clone(),
-        )];
+        let mut checks = vec![signature(&rel.signer)];
         checks.push(match refusal {
             None => Check::new("compatible", CheckState::Pass, ""),
             Some(why) => Check::new("compatible", CheckState::Fail, why),
@@ -977,7 +1007,7 @@ impl Engine {
             .context("read the unit's Talos version")?;
         ensure!(
             version_ge(rel.get("TALOS_VERSION"), &running),
-            "REFUSING A DOWNGRADE: the unit runs Talos {running} and the bundle installs {}",
+            "Downgrade: Talos {running} to {}",
             rel.get("TALOS_VERSION")
         );
         let sb = self
@@ -1010,7 +1040,9 @@ impl Engine {
             );
             ensure!(
                 epoch >= unit,
-                "REFUSING A DOWNGRADE: the unit runs a base built at {unit} and the bundle's is {epoch}"
+                "Downgrade: a base built {} to one built {}",
+                built(unit),
+                built(epoch)
             );
         }
         ensure!(
@@ -1437,7 +1469,7 @@ impl Engine {
                  {}. Nothing else changed; applying again repeats the upgrade",
                 self.restore().await?
             ),
-            "the new OS did not boot".into(),
+            Cause::Fell("the new OS did not boot"),
         ))
     }
 
@@ -1474,15 +1506,17 @@ impl Engine {
         if !b.running().eq_ignore_ascii_case(&b.default)
             || b.default.eq_ignore_ascii_case(&before.default_entry)
         {
-            let (why, reason) = if before.backed_out {
+            let (why, cause) = if before.backed_out {
                 (
                     "an operator rolled the update back on its trial",
-                    asked(&before.rollback_by),
+                    Cause::Asked {
+                        by: before.rollback_by.clone(),
+                    },
                 )
             } else {
                 (
                     "the new OS did not stay up, and the unit went back to its previous OS by itself",
-                    "the new OS did not stay up".into(),
+                    Cause::Fell("the new OS did not stay up"),
                 )
             };
             return Ok(Back(
@@ -1490,7 +1524,7 @@ impl Engine {
                     "{why}; {}. Applying again repeats the upgrade",
                     self.restore().await?
                 ),
-                reason,
+                cause,
             ));
         }
         let want = self.release()?.get("TALOS_VERSION").to_string();
@@ -1636,6 +1670,37 @@ fn from(by: &str) -> String {
 
 fn who(by: &str) -> &str {
     if by.is_empty() { "an operator" } else { by }
+}
+
+/// The signature's check, from the trust's verdict: a bundle the policy takes
+/// unsigned is taken, not passed, so it is a note for a person to weigh.
+fn signature(signer: &str) -> Check {
+    let state = if signer == bundle::UNSIGNED {
+        CheckState::Note
+    } else {
+        CheckState::Pass
+    };
+    Check::new("signature", state, signer)
+}
+
+/// A base's build instant as a person reads it, in UTC: `2026-10-30 22:59Z`.
+fn built(epoch: i64) -> String {
+    let (days, secs) = (epoch.div_euclid(86_400), epoch.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year}-{month:02}-{day:02} {:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60
+    )
 }
 
 fn asked(by: &str) -> String {

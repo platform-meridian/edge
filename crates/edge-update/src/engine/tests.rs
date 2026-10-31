@@ -1179,11 +1179,11 @@ async fn refusals_change_nothing() {
     h.w().log.clear();
     let mut s = Spec::new("update-new");
     s.epoch = 1000;
-    refused(&mut h, &s, "REFUSING A DOWNGRADE").await;
+    refused(&mut h, &s, "Downgrade:").await;
 
     let mut s = Spec::new("update-new");
     s.talos = "v1.13.9".into();
-    refused(&mut h, &s, "REFUSING A DOWNGRADE").await;
+    refused(&mut h, &s, "Downgrade:").await;
 
     let mut s = Spec::new("update-new");
     s.secureboot = "0";
@@ -1836,6 +1836,11 @@ async fn the_new_os_rolls_back_when_asked() {
     assert_eq!(e.outcome, Outcome::RolledBack, "{}", e.detail);
     assert!(e.detail.contains("an operator rolled"), "{}", e.detail);
     assert_eq!(e.rollback_reason, "ann asked");
+    assert_eq!(
+        e.steps.last().map(|t| (t.step, t.state)),
+        Some((Step::OsTrial, State::Aborted)),
+        "a rollback a person asked for aborts the trial, never fails it"
+    );
     let w = h.w();
     assert_eq!(w.active, UNIT_CONFIG);
     assert_eq!(w.selected, "talos-v1.14.1.efi");
@@ -1998,4 +2003,54 @@ async fn a_provisioned_volume_is_added_while_idle_and_kept_by_every_update() {
         .unwrap();
     assert!(!h.w().active.contains(v.name()));
     h.e().edit_volume(VolumeEdit::Remove(v)).await.unwrap();
+}
+
+#[test]
+fn an_unsigned_bundle_is_a_note_never_a_pass() {
+    assert_eq!(signature(bundle::UNSIGNED).state, CheckState::Note);
+    assert_eq!(signature(testkit::SIGNER).state, CheckState::Pass);
+}
+
+#[test]
+fn a_build_instant_reads_as_a_utc_date() {
+    assert_eq!(built(0), "1970-01-01 00:00Z");
+    assert_eq!(built(1_793_401_338), "2026-10-30 23:02Z");
+}
+
+#[test]
+fn the_release_booted_is_the_one_on_trial_while_it_is() {
+    let committed = Release {
+        id: "s1".into(),
+        ..Release::default()
+    };
+    let mut r = Record {
+        history: vec![Entry {
+            release: Some(committed),
+            outcome: Outcome::Committed,
+            detail: String::new(),
+            started: 0,
+            finished: 0,
+            snapshot: None,
+            steps: Vec::new(),
+            log: Vec::new(),
+            by: String::new(),
+            rollback_reason: String::new(),
+        }],
+        release: Some(Release {
+            id: "s2".into(),
+            ..Release::default()
+        }),
+        ..Record::default()
+    };
+    r.phase = Phase::Rebooting {
+        boot_id: String::new(),
+        asked: None,
+    };
+    assert_eq!(r.booted().map(|r| r.id.as_str()), Some("s1"));
+    for p in [Phase::Trial, Phase::Settling] {
+        r.phase = p;
+        assert_eq!(r.booted().map(|r| r.id.as_str()), Some("s2"));
+    }
+    r.phase = Phase::Idle;
+    assert_eq!(r.booted().map(|r| r.id.as_str()), Some("s1"));
 }

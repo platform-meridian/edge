@@ -253,6 +253,8 @@ enum StepState {
   STEP_STATE_FAILED = 4;
   // Taken, but with nothing to do: the OS already runs, say.
   STEP_STATE_SKIPPED = 5;
+  // A person ended the update here: its trial rolled back as asked.
+  STEP_STATE_ABORTED = 6;
 }
 
 message Step {

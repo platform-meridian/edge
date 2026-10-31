@@ -35,6 +35,8 @@ pub enum State {
     Done,
     Failed,
     Skipped,
+    /// A person ended the update here: its trial rolled back as asked.
+    Aborted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

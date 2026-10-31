@@ -294,6 +294,7 @@ fn step(t: &Taken) -> pb::Step {
             State::Done => pb::StepState::STEP_STATE_DONE,
             State::Failed => pb::StepState::STEP_STATE_FAILED,
             State::Skipped => pb::StepState::STEP_STATE_SKIPPED,
+            State::Aborted => pb::StepState::STEP_STATE_ABORTED,
         }
         .into(),
         started_unix: t.started,
@@ -302,12 +303,19 @@ fn step(t: &Taken) -> pb::Step {
     }
 }
 
-/// The update's steps: an upload's, with the plan its head implies; else the
-/// record's, the plan filled in while the update is still to come or under way.
+/// The update's steps: an upload's not yet verified, with the plan its head
+/// implies; else the record's, the plan filled in while the update is still
+/// to come or under way. An upload the record has taken is the record's, so
+/// a verification that refused it still says so.
 fn steps(s: &Snapshot, up: Option<&Upload>) -> Vec<Taken> {
     let r = &s.record;
     let u = &s.unit;
-    if let (Phase::Idle, None, Some(up)) = (&r.phase, &r.release, up) {
+    let recorded = |up: &Upload| {
+        r.steps
+            .first()
+            .is_some_and(|t| t.step == Step::Upload && t.started == up.started)
+    };
+    if let (Phase::Idle, None, Some(up)) = (&r.phase, &r.release, up.filter(|u| !recorded(u))) {
         let state = match (up.complete, up.refused.is_empty()) {
             (_, false) => State::Failed,
             (true, true) => State::Done,
@@ -325,7 +333,10 @@ fn steps(s: &Snapshot, up: Option<&Upload>) -> Vec<Taken> {
             .is_none_or(|h| engine::os_changes(&h.manifest, &u.talos_version, &u.installer));
         return steps::merged(&taken, &steps::plan(os));
     }
-    let ended = r.steps.iter().any(|t| t.state == State::Failed)
+    let ended = r
+        .steps
+        .iter()
+        .any(|t| matches!(t.state, State::Failed | State::Aborted))
         || (r.phase == Phase::Idle && r.steps.iter().any(|t| t.step > Step::Verify));
     if ended || r.steps.is_empty() {
         return r.steps.clone();
@@ -968,6 +979,36 @@ mod tests {
         steps::close(&mut s.record.steps, State::Failed, 2);
         s.record.phase = Phase::Idle;
         assert_eq!(kinds(&s, None).last(), Some(&(Step::Stage, State::Failed)));
+    }
+
+    #[test]
+    fn a_verification_that_refused_an_upload_keeps_saying_so() {
+        let up = Upload {
+            complete: true,
+            started: 5,
+            ..uploading(None)
+        };
+        let mut s = Snapshot::default();
+        s.record.steps = vec![Taken {
+            step: Step::Upload,
+            state: State::Done,
+            started: 5,
+            finished: 6,
+        }];
+        steps::enter(&mut s.record.steps, Step::Verify, 7);
+        steps::close(&mut s.record.steps, State::Failed, 8);
+        assert_eq!(
+            kinds(&s, Some(&up)),
+            [(Step::Upload, State::Done), (Step::Verify, State::Failed)],
+            "the refused upload is the record's, not a fresh one's"
+        );
+        let next = Upload { started: 9, ..up };
+        assert_eq!(
+            kinds(&s, Some(&next))[0],
+            (Step::Upload, State::Done),
+            "a new upload starts its own steps"
+        );
+        assert_eq!(kinds(&s, Some(&next))[1], (Step::Verify, State::Pending));
     }
 
     #[test]
