@@ -18,7 +18,7 @@ jobs:
   check:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - run: kubectl kustomize deploy > /dev/null
       - run: sudo apt-get install -y dhcpcd-base uidmap
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -34,12 +34,12 @@ jobs:
           max-size: 4GiB
           cache-key-prefix: kache-check
           pr-comment: false
-      - uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143 # v1.1.2
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: actions-rust-lang/rustfmt@v1
+      - uses: taiki-e/install-action@v2
         with:
           tool: bpf-linker@0.11.1,cargo-nextest
       # aws-lc-rs's FIPS module (edge_common::tls) is built with CMake and Go.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
@@ -52,11 +52,11 @@ jobs:
   deny:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
       # Every dependency audited, by an imported set (Mozilla's, Google's, the
       # Bytecode Alliance's) or our own, or exempted on the record.
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-vet
       - run: cargo vet --locked
@@ -68,7 +68,7 @@ jobs:
       matrix:
         gate: [TestAPIServer, TestRobustness/edge-state, TestReplay]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           cache: false
@@ -78,7 +78,7 @@ jobs:
           max-size: 4GiB
           cache-key-prefix: kache-conformance
           pr-comment: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7
         with:
           go-version-file: conformance/go.mod
           cache-dependency-path: "**/go.sum"
@@ -101,7 +101,7 @@ jobs:
           - { dir: crates/edge-cni/crates/cni, target: nft_dump }
           - { dir: crates/edge-cni/crates/cni, target: rtnl_message }
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rust-src-dir: ${{ matrix.dir }}/fuzz
@@ -112,11 +112,11 @@ jobs:
           max-size: 4GiB
           cache-key-prefix: kache-fuzz-${{ matrix.dir }}
           pr-comment: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@v2
         with:
           tool: bpf-linker@0.11.1,cargo-fuzz
       # aws-lc-rs's FIPS module (edge_common::tls) is built with CMake and Go.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
@@ -135,7 +135,7 @@ jobs:
       matrix:
         name: [edge-cni, edge-dhcp, edge-dns, edge-gateway, edge-idle, edge-layers, edge-registry, edge-scope, edge-signer, edge-state, edge-update, edge-watch]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: sudo apt-get install -y musl-tools
@@ -148,17 +148,17 @@ jobs:
           max-size: 4GiB
           cache-key-prefix: kache-publish-${{ matrix.name }}
           pr-comment: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@v2
         with:
           tool: bpf-linker@0.11.1,cargo-auditable
       # aws-lc-rs's FIPS module (edge_common::tls) is built with CMake and Go.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
       - run: cargo auditable build --release --locked --target x86_64-unknown-linux-musl --bin ${{ matrix.name }}
       - run: install -Dm755 -t dist/amd64 target/x86_64-unknown-linux-musl/release/${{ matrix.name }}
-      - uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
+      - uses: redhat-actions/buildah-build@v3
         with:
           image: ${{ matrix.name }}
           tags: ${{ github.sha }} ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -169,12 +169,12 @@ jobs:
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
             VCS_REF=${{ github.sha }}
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
-      - uses: redhat-actions/podman-login@50c2d9a331bb67c8fdab99b86455fad05e2e3252 # v2.0
+      - uses: redhat-actions/podman-login@v2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37 # v3.0.0
+      - uses: redhat-actions/push-to-registry@v3
         id: push
         with:
           image: ${{ matrix.name }}
@@ -187,7 +187,7 @@ jobs:
       # cyclonedx|slsaprovenance1` checks either.
       # cosign and syft as release binaries, checked by install-action (the
       # runners' image has no envsubst, which cosign-installer needs).
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@v2
         with:
           tool: cosign,syft
       - name: The image's SBOM
