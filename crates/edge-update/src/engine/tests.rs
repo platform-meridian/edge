@@ -1770,7 +1770,10 @@ async fn verification_says_what_applying_changes() {
             ("downtime", CheckState::Note),
         ]
     );
-    assert_eq!(r.signer, testkit::SIGNER);
+    assert_eq!(
+        r.signature,
+        bundle::Signature::Signed(testkit::SIGNER.into())
+    );
     let d = r.diff.unwrap();
     assert_eq!(
         d.release,
@@ -2007,8 +2010,14 @@ async fn a_provisioned_volume_is_added_while_idle_and_kept_by_every_update() {
 
 #[test]
 fn an_unsigned_bundle_is_a_note_never_a_pass() {
-    assert_eq!(signature(bundle::UNSIGNED).state, CheckState::Note);
-    assert_eq!(signature(testkit::SIGNER).state, CheckState::Pass);
+    assert_eq!(
+        signature(&bundle::Signature::Unsigned).state,
+        CheckState::Note
+    );
+    assert_eq!(
+        signature(&bundle::Signature::Signed(testkit::SIGNER.into())).state,
+        CheckState::Pass
+    );
 }
 
 #[test]

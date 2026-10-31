@@ -156,11 +156,22 @@ fn upload(u: &Upload) -> pb::Upload {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 notes: h.notes.clone().unwrap_or_default(),
-                signer: h.signer.clone(),
+                signature: Some(signature(&h.signature)).into(),
                 ..Default::default()
             })
             .into(),
         refused: u.refused.clone(),
+        ..Default::default()
+    }
+}
+
+fn signature(s: &crate::bundle::Signature) -> pb::Signature {
+    use pb::__buffa::oneof::signature::Of;
+    pb::Signature {
+        of: Some(match s {
+            crate::bundle::Signature::Signed(by) => Of::Signed(by.clone()),
+            crate::bundle::Signature::Unsigned => Of::Unsigned(Box::default()),
+        }),
         ..Default::default()
     }
 }
@@ -237,7 +248,7 @@ fn release(r: &Release) -> pb::Release {
             .collect(),
         sha256: hex::decode(&r.sha256).unwrap_or_default(),
         notes: r.notes.clone().unwrap_or_default(),
-        signer: r.signer.clone(),
+        signature: Some(signature(&r.signature)).into(),
         checks: r.checks.iter().map(check).collect(),
         diff: r.diff.as_ref().map(diff).into(),
         components: r.components().iter().map(component).collect(),
@@ -921,7 +932,7 @@ mod tests {
                 ]
                 .into(),
                 notes: None,
-                signer: String::new(),
+                signature: crate::bundle::Signature::Unsigned,
             }),
             refused: String::new(),
         }
@@ -1091,8 +1102,9 @@ mod tests {
         u.finished = 200;
         u.refused = "not ours".into();
         u.head.as_mut().unwrap().notes = Some("# 2".into());
-        u.head.as_mut().unwrap().signer =
-            "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1".into();
+        u.head.as_mut().unwrap().signature = crate::bundle::Signature::Signed(
+            "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1".into(),
+        );
         let p = upload(&u);
         assert_eq!(
             (
@@ -1119,12 +1131,14 @@ mod tests {
             (
                 h.manifest["TALOS_VERSION"].as_str(),
                 h.notes.as_str(),
-                h.signer.as_str()
+                h.signature.as_option().and_then(|s| s.of.clone())
             ),
             (
                 "v1.14.1",
                 "# 2",
-                "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1"
+                Some(pb::__buffa::oneof::signature::Of::Signed(
+                    "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1".into()
+                ))
             )
         );
     }
@@ -1151,7 +1165,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
             notes: Some("notes".into()),
-            signer: "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v2".into(),
+            signature: crate::bundle::Signature::Unsigned,
             images: [("r.io/app:2".to_string(), "sha256:2".to_string())].into(),
             checks: vec![
                 Check::new("space", CheckState::Fail, "full"),
@@ -1181,10 +1195,13 @@ mod tests {
             ("s2", "v1.15.0", vec![0xbb; 32])
         );
         assert_eq!(
-            (p.notes.as_str(), p.signer.as_str()),
+            (
+                p.notes.as_str(),
+                p.signature.as_option().and_then(|s| s.of.clone())
+            ),
             (
                 "notes",
-                "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v2"
+                Some(pb::__buffa::oneof::signature::Of::Unsigned(Box::default()))
             )
         );
         assert_eq!(p.manifest.len(), 2);

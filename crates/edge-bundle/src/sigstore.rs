@@ -11,11 +11,18 @@ use sigstore_verify::{VerificationPolicy, Verifier};
 
 /// Checks a signature over a bundle's sums, or its absence; says who signed.
 pub trait Trust: Send + Sync {
-    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String>;
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<Signature>;
 }
 
-/// The signer of a bundle without a signature.
-pub const UNSIGNED: &str = "unsigned";
+/// A bundle's verdict: who signed it, or that it carries no signature and the
+/// trust policy takes it so.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signature {
+    /// The signing certificate's workflow identity, `<workflow>@<ref>`.
+    Signed(String),
+    Unsigned,
+}
 
 /// Who a unit takes bundles from.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,13 +96,13 @@ impl Sigstore {
 }
 
 impl Trust for Sigstore {
-    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String> {
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<Signature> {
         let Some(signature) = signature else {
             ensure!(
                 self.policy.allow_unsigned,
                 "the bundle is unsigned, and the trust policy does not allow unsigned bundles"
             );
-            return Ok(UNSIGNED.into());
+            return Ok(Signature::Unsigned);
         };
         let bundle = std::str::from_utf8(signature)
             .ok()
@@ -123,7 +130,7 @@ impl Trust for Sigstore {
             "{identity} ({issuer}, on {}) is not a signer this unit trusts",
             claims.source_repository_ref.as_deref().unwrap_or("no ref")
         );
-        Ok(identity.into())
+        Ok(Signature::Signed(identity.into()))
     }
 }
 
@@ -168,7 +175,7 @@ mod tests {
         let t = trust(&[signer(GHA, WORKFLOW, "refs/tags/*")]);
         assert_eq!(
             t.verify(SUMS, Some(SIGNED)).unwrap(),
-            format!("{WORKFLOW}@refs/tags/v2.18.3")
+            Signature::Signed(format!("{WORKFLOW}@refs/tags/v2.18.3"))
         );
         let exact = trust(&[signer(GHA, WORKFLOW, "refs/tags/v2.18.3")]);
         exact.verify(SUMS, Some(SIGNED)).unwrap();
@@ -249,7 +256,7 @@ mod tests {
             ..Policy::default()
         };
         let t = Sigstore::new(ROOT, dev).unwrap();
-        assert_eq!(t.verify(SUMS, None).unwrap(), UNSIGNED);
+        assert_eq!(t.verify(SUMS, None).unwrap(), Signature::Unsigned);
         refused(&t, SUMS, b"not json", "not a Sigstore bundle");
     }
 }

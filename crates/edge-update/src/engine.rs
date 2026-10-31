@@ -77,7 +77,7 @@ pub enum VolumeEdit {
     Remove(machineconfig::Provisioned),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Release {
     /// Minted by the unit.
     pub id: String,
@@ -89,8 +89,7 @@ pub struct Release {
     pub os_done: bool,
     #[serde(default)]
     pub notes: Option<String>,
-    #[serde(default)]
-    pub signer: String,
+    pub signature: bundle::Signature,
     /// The OS step left the kubelet's serving rotation as the unit ran it:
     /// its approver, edge-signer, is an app's, which settles after.
     #[serde(default)]
@@ -103,6 +102,27 @@ pub struct Release {
     pub checks: Vec<Check>,
     #[serde(default)]
     pub diff: Option<Diff>,
+}
+
+// Tests build releases field by field over this; a unit never makes one
+// without the verdict its bundle earned.
+#[cfg(test)]
+impl Default for Release {
+    fn default() -> Self {
+        Release {
+            id: String::new(),
+            sha256: String::new(),
+            manifest: Manifest::default(),
+            refs: BTreeSet::new(),
+            os_done: false,
+            notes: None,
+            signature: bundle::Signature::Signed(bundle::testkit::SIGNER.into()),
+            rotation_held: false,
+            images: BTreeMap::new(),
+            checks: Vec::new(),
+            diff: None,
+        }
+    }
 }
 
 impl Release {
@@ -846,9 +866,12 @@ impl Engine {
                 manifest: u.manifest,
                 refs: components.refs(),
                 notes: bundle::notes(&dir),
-                signer: u.signer,
+                signature: u.signature,
                 images,
-                ..Release::default()
+                os_done: false,
+                rotation_held: false,
+                checks: Vec::new(),
+                diff: None,
             })
         }) {
             Ok(r) => r,
@@ -893,7 +916,7 @@ impl Engine {
         refusal: Option<&str>,
     ) -> (Vec<Check>, Diff, Option<String>) {
         let u = &self.unit;
-        let mut checks = vec![signature(&rel.signer)];
+        let mut checks = vec![signature(&rel.signature)];
         checks.push(match refusal {
             None => Check::new("compatible", CheckState::Pass, ""),
             Some(why) => Check::new("compatible", CheckState::Fail, why),
@@ -1674,13 +1697,11 @@ fn who(by: &str) -> &str {
 
 /// The signature's check, from the trust's verdict: a bundle the policy takes
 /// unsigned is taken, not passed, so it is a note for a person to weigh.
-fn signature(signer: &str) -> Check {
-    let state = if signer == bundle::UNSIGNED {
-        CheckState::Note
-    } else {
-        CheckState::Pass
-    };
-    Check::new("signature", state, signer)
+fn signature(s: &bundle::Signature) -> Check {
+    match s {
+        bundle::Signature::Signed(by) => Check::new("signature", CheckState::Pass, by.as_str()),
+        bundle::Signature::Unsigned => Check::new("signature", CheckState::Note, ""),
+    }
 }
 
 /// A base's build instant as a person reads it, in UTC: `2026-10-30 22:59Z`.

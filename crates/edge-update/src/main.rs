@@ -93,7 +93,10 @@ fn check_bundle(a: &[String]) -> anyhow::Result<()> {
             "the registry tagged {} of the layout's {named} tagged images",
             tagged.len()
         );
-        println!("SIGNER={}", u.signer);
+        match &u.signature {
+            bundle::Signature::Signed(by) => println!("SIGNED_BY={by}"),
+            bundle::Signature::Unsigned => println!("UNSIGNED=1"),
+        }
         for (k, v) in &u.manifest {
             println!("{k}={v}");
         }

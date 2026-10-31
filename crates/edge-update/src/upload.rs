@@ -49,7 +49,7 @@ pub struct Upload {
 pub struct Head {
     pub manifest: Manifest,
     pub notes: Option<String>,
-    pub signer: String,
+    pub signature: crate::bundle::Signature,
 }
 
 impl Upload {
@@ -244,7 +244,7 @@ impl Uploads {
                     u.head = Some(Head {
                         manifest: h.manifest,
                         notes: h.notes,
-                        signer: h.signer,
+                        signature: h.signature,
                     })
                 }
                 Err(e) => u.refused = format!("{e:#}"),
@@ -436,7 +436,7 @@ mod tests {
         let u = put_one(&up, &data, 0).unwrap();
         let h = u.head.unwrap();
         assert_eq!(h.manifest["BUILT_EPOCH"], "2000");
-        assert_eq!(h.signer, SIGNER);
+        assert_eq!(h.signature, crate::bundle::Signature::Signed(SIGNER.into()));
         let u = put_one(&up, &data, 1).unwrap();
         assert!(u.complete && u.finished == 50 && u.refused.is_empty());
     }

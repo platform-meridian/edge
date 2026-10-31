@@ -73,12 +73,25 @@ message Upload {
 
 // What a bundle says of itself, signed.
 message Head {
+  reserved 3;
+  reserved "signer";
+
   map<string, string> manifest = 1;
   // Release notes, Markdown, if the bundle carries any.
   string notes = 2;
-  // The workflow identity its Sigstore certificate names, "<workflow>@<ref>",
-  // or "unsigned" for a bundle without a signature.
-  string signer = 3;
+  Signature signature = 4;
+}
+
+// A bundle's verdict: who signed it, or that it carries no signature, which
+// the unit's trust policy takes.
+message Signature {
+  message Unsigned {}
+
+  oneof of {
+    // The workflow identity its Sigstore certificate names, "<workflow>@<ref>".
+    string signed = 1;
+    Unsigned unsigned = 2;
+  }
 }
 
 message PutChunkRequest {
@@ -393,8 +406,10 @@ message Release {
   map<string, string> manifest = 3;
   bytes sha256 = 4;
   string notes = 5;
-  // Head.signer.
-  string signer = 6;
+  reserved 6;
+  reserved "signer";
+  // Head.signature.
+  Signature signature = 10;
   // What verification found, passed or not.
   repeated Check checks = 7;
   Diff diff = 8;

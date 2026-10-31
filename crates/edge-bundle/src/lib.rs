@@ -50,7 +50,7 @@ use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
 
 pub use oci::{layout_images, layout_refs};
-pub use sigstore::{Policy, Signer, Sigstore, Trust, UNSIGNED};
+pub use sigstore::{Policy, Signature, Signer, Sigstore, Trust};
 
 pub const SUMS: &str = "SHA256SUMS";
 pub const SIGNATURE: &str = "SHA256SUMS.sigstore.json";
@@ -156,8 +156,8 @@ pub fn unpack(tar: &Path, dest: &Path, trust: &dyn Trust) -> anyhow::Result<Unpa
 #[derive(Clone, Debug, PartialEq)]
 pub struct Unpacked {
     pub manifest: Manifest,
-    /// [`Trust::verify`]'s signer.
-    pub signer: String,
+    /// [`Trust::verify`]'s verdict.
+    pub signature: Signature,
 }
 
 /// [`unpack`], adding to `read` each byte of the bundle as it is read.
@@ -181,7 +181,7 @@ type Sums = BTreeMap<PathBuf, [u8; 32]>;
 /// A bundle's sums and any signature over them, verified, as it carries them.
 struct Signed {
     sums: Sums,
-    signer: String,
+    verdict: Signature,
     raw: Vec<u8>,
     signature: Option<Vec<u8>>,
 }
@@ -214,7 +214,7 @@ fn signed_sums<'a, R: Read>(
         Some((_, e)) => (None, e),
         None => (None, None),
     };
-    let signer = trust.verify(&sums_bytes, sig.as_deref())?;
+    let verdict = trust.verify(&sums_bytes, sig.as_deref())?;
     let sums = parse_sums(std::str::from_utf8(&sums_bytes).context("the sums are not text")?)?;
     ensure!(
         sums.contains_key(Path::new(MANIFEST)),
@@ -223,7 +223,7 @@ fn signed_sums<'a, R: Read>(
     Ok((
         Signed {
             sums,
-            signer,
+            verdict,
             raw: sums_bytes,
             signature: sig,
         },
@@ -232,12 +232,12 @@ fn signed_sums<'a, R: Read>(
 }
 
 /// What a bundle says of itself, signed: readable before the rest has arrived.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Head {
     pub manifest: Manifest,
     pub notes: Option<String>,
-    /// [`Trust::verify`]'s signer.
-    pub signer: String,
+    /// [`Trust::verify`]'s verdict.
+    pub signature: Signature,
 }
 
 /// The signed head of a bundle from as much of its start as is at hand:
@@ -273,11 +273,12 @@ impl<R: Read> Read for Start<R> {
 fn head_of(start: &mut impl Read, trust: &dyn Trust) -> anyhow::Result<Head> {
     let mut archive = tar::Archive::new(start);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
-    let (Signed { sums, signer, .. }, next) = signed_sums(&mut entries, trust)?;
+    let (Signed { sums, verdict, .. }, next) = signed_sums(&mut entries, trust)?;
     let mut entries = next.map(Ok).into_iter().chain(entries);
     let mut head = Head {
-        signer,
-        ..Head::default()
+        manifest: Manifest::default(),
+        notes: None,
+        signature: verdict,
     };
     let (mut manifest, want_notes) = (None, sums.contains_key(Path::new(NOTES)));
     while manifest.is_none() || (want_notes && head.notes.is_none()) {
@@ -347,7 +348,7 @@ fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result
     let mut archive = tar::Archive::new(tar);
     let mut entries = archive.entries().context("the bundle is not a tar")?;
     let (signed, next) = signed_sums(&mut entries, trust)?;
-    let Signed { sums, signer, .. } = &signed;
+    let Signed { sums, verdict, .. } = &signed;
 
     // Kept as signed: the unit's boot verifies a base again.
     std::fs::create_dir_all(dest)?;
@@ -404,7 +405,7 @@ fn unpack_into(tar: impl Read, dest: &Path, trust: &dyn Trust) -> anyhow::Result
     signed_format(sums, &manifest)?;
     Ok(Unpacked {
         manifest,
-        signer: signer.clone(),
+        signature: verdict.clone(),
     })
 }
 
@@ -744,7 +745,7 @@ mod tests {
     fn a_signed_bundle_unpacks() {
         let c = Case::new();
         let u = unpack(&c.tar(HEAD), &c.out(), &trust()).unwrap();
-        assert_eq!(u.signer, SIGNER);
+        assert_eq!(u.signature, Signature::Signed(SIGNER.into()));
         assert_eq!(u.manifest["BUILT_EPOCH"], "2");
         assert_eq!(
             std::fs::read(c.out().join("images/blobs/sha256/aa")).unwrap(),
@@ -789,8 +790,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            (h.signer.as_str(), h.manifest["BUILT_EPOCH"].as_str()),
-            (UNSIGNED, "2")
+            (&h.signature, h.manifest["BUILT_EPOCH"].as_str()),
+            (&Signature::Unsigned, "2")
         );
 
         std::fs::write(c.src().join(PATCH), "kind: Evil\n").unwrap();
@@ -936,7 +937,7 @@ mod tests {
                 std::fs::read(&written).unwrap()
             );
             let u = unpack(&sealed, &d.join("unpacked"), &trust()).unwrap();
-            assert_eq!(u.signer, SIGNER);
+            assert_eq!(u.signature, Signature::Signed(SIGNER.into()));
 
             let unsigned = d.join("unsigned.tar");
             seal(&staged, None, 7, &unsigned).unwrap();
@@ -982,8 +983,8 @@ mod tests {
         let c = Case::new();
         let h = c.head().unwrap().unwrap();
         assert_eq!(
-            (h.signer.as_str(), h.manifest["BUILT_EPOCH"].as_str()),
-            (SIGNER, "2")
+            (&h.signature, h.manifest["BUILT_EPOCH"].as_str()),
+            (&Signature::Signed(SIGNER.into()), "2")
         );
     }
 

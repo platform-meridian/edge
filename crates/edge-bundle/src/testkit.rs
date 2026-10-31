@@ -25,13 +25,13 @@ pub fn trust() -> Trusted {
 }
 
 impl Trust for Trusted {
-    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String> {
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<crate::Signature> {
         let Some(signature) = signature else {
             ensure!(
                 self.allow_unsigned,
                 "the bundle is unsigned, and the trust policy does not allow unsigned bundles"
             );
-            return Ok(crate::UNSIGNED.into());
+            return Ok(crate::Signature::Unsigned);
         };
         let (who, sha) = std::str::from_utf8(signature)
             .ok()
@@ -45,7 +45,7 @@ impl Trust for Trusted {
             self.signers.iter().any(|s| s == who),
             "{who} is not a signer this unit trusts"
         );
-        Ok(who.into())
+        Ok(crate::Signature::Signed(who.into()))
     }
 }
 

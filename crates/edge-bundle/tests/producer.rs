@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use edge_bundle::components::Components;
-use edge_bundle::{Contents, Manifest, Trust, check, machineconfig, oci, read_head, unpack, write};
+use edge_bundle::{
+    Contents, Manifest, Signature, Trust, check, machineconfig, oci, read_head, unpack, write,
+};
 use sha2::{Digest, Sha256};
 
 const UNIT: &str = include_str!("fixtures/controlplane.yaml");
@@ -13,7 +15,7 @@ const SIGNER: &str = "https://github.com/test/talos/.github/workflows/release.ym
 struct Signed;
 
 impl Trust for Signed {
-    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<String> {
+    fn verify(&self, sums: &[u8], signature: Option<&[u8]>) -> anyhow::Result<Signature> {
         let signature = signature.ok_or_else(|| anyhow::anyhow!("the bundle is unsigned"))?;
         let (who, sha) = std::str::from_utf8(signature)?
             .trim()
@@ -21,7 +23,7 @@ impl Trust for Signed {
             .ok_or_else(|| anyhow::anyhow!("the signature is not a Sigstore bundle"))?;
         anyhow::ensure!(sha == self::sha(sums), "the signature does not verify");
         anyhow::ensure!(who == SIGNER, "{who} is not a signer this unit trusts");
-        Ok(who.into())
+        Ok(Signature::Signed(who.into()))
     }
 }
 
@@ -194,7 +196,7 @@ fn notes_ride_signed_and_the_head_reads_from_the_start_alone() {
     let head = read_head(bytes.as_slice(), &v).unwrap().unwrap();
     assert_eq!(head.manifest, b.manifest);
     assert_eq!(head.notes.as_deref(), c.notes);
-    assert_eq!(head.signer, SIGNER);
+    assert_eq!(head.signature, Signature::Signed(SIGNER.into()));
     // The head is whole well before the images.
     let whole = (0..bytes.len())
         .step_by(512)
