@@ -314,6 +314,7 @@ pub fn hook_veth(
 ) -> anyhow::Result<Hooked> {
     std::fs::create_dir_all(pin_dir(vdir)).context("create the link pin directory")?;
     let vdir = std::path::Path::new(vdir);
+    let iface = std::ffi::CString::new(ifname).context("an interface name holds no NUL")?;
     let mut hooked = Hooked::default();
     for (name, at, suffix) in HOOKS {
         let rel = format!("np/{ifname}-{suffix}");
@@ -333,7 +334,7 @@ pub fn hook_veth(
             let id = match old {
                 Some(old) => p.attach_to_link(SchedClassifierLink::try_from(old)?)?,
                 None => p
-                    .attach(ifname, at)
+                    .attach(iface.as_c_str(), at)
                     .with_context(|| format!("attach {name} to {ifname}"))?,
             };
             p.take_link(id)?

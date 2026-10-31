@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const etcdTestsModule = "go.etcd.io/etcd/tests/v3@v3.7.2"
+const etcdTestsModule = "go.etcd.io/etcd/tests/v3@v3.7.3"
 
 var (
 	robustnessRuns  = flag.Int("runs", 100, "robustness runs per store, each on a fresh data directory and validated alone")
@@ -31,7 +31,7 @@ func TestRobustness(t *testing.T) {
 	run(t, tests, nil, "git", "apply", "-p1", filepath.Join(harness, "tests-v3.patch"))
 	gowork := filepath.Join(work, "go.work")
 	path, version, _ := strings.Cut(etcdTestsModule, "@")
-	if err := os.WriteFile(gowork, fmt.Appendf(nil, "go 1.26\n\nuse %s\n\nreplace %s %s => %s\n", harness, path, version, tests), 0o644); err != nil {
+	if err := os.WriteFile(gowork, fmt.Appendf(nil, "go 1.27\n\nuse %s\n\nreplace %s %s => %s\n", harness, path, version, tests), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	env := []string{"GOWORK=" + gowork}

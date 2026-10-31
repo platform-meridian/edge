@@ -5,7 +5,8 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::BPF_F_NO_PREALLOC,
+    EbpfContext as _,
+    bindings::{BPF_F_NO_PREALLOC, __sk_buff},
     helpers::{
         bpf_get_netns_cookie, bpf_get_prandom_u32, bpf_get_socket_cookie, bpf_ktime_get_boot_ns,
         bpf_set_retval,
@@ -20,6 +21,11 @@ use edge_cni_common::{
     IPPROTO_ICMP, IPPROTO_SCTP, IPPROTO_TCP, IPPROTO_UDP, MAX_RANGES, PodVal, RevNat, RevNatKey,
     ServiceKey, ServiceVal, set_v4_mapped, v4_mapped,
 };
+
+/// The packet's `__sk_buff`, which aya-ebpf keeps behind its context.
+fn skb(ctx: &TcContext) -> *const __sk_buff {
+    ctx.as_ptr().cast()
+}
 
 // NO_PREALLOC: only userspace writes these, so entries are allocated on insert.
 // LRU maps cannot be NO_PREALLOC (ENOTSUPP).
@@ -80,7 +86,7 @@ fn resolve(ctx: &SockAddrContext, addr: u32, proto: u8, sticky: bool) -> Resolve
     };
     let found = match target(&key) {
         Some(t) => Some(t),
-        None if unsafe { NODE_ADDRS.get(key.addr) }.is_some() => target(&ServiceKey {
+        None if unsafe { NODE_ADDRS.get(&key.addr) }.is_some() => target(&ServiceKey {
             addr: ANY_NODE_ADDR,
             ..key
         }),
@@ -120,21 +126,21 @@ fn pick(
     };
     let slot = (sel % svc.backend_count as u64) as u32;
     if svc.affinity_secs == 0 {
-        return unsafe { BACKENDS.get(BackendKey { id: svc.id, slot }) }.copied();
+        return unsafe { BACKENDS.get(&BackendKey { id: svc.id, slot }) }.copied();
     }
     let key = AffinityKey {
         netns: unsafe { bpf_get_netns_cookie(ctx.sock_addr as *mut _) },
         service: *svc_key,
     };
     let now = unsafe { bpf_ktime_get_boot_ns() };
-    if let Some(pinned) = AFFINITY.get_ptr_mut(key) {
+    if let Some(pinned) = AFFINITY.get_ptr_mut(&key) {
         let pinned = unsafe { &mut *pinned };
         let timeout_ns = svc.affinity_secs as u64 * 1_000_000_000;
         let fresh = now.wrapping_sub(pinned.last_used_ns) < timeout_ns;
         if fresh && pinned.slot < svc.backend_count {
             // Endpoint changes can move another backend into the pinned slot.
             let same = unsafe {
-                BACKENDS.get(BackendKey {
+                BACKENDS.get(&BackendKey {
                     id: svc.id,
                     slot: pinned.slot,
                 })
@@ -147,14 +153,14 @@ fn pick(
             }
         }
     }
-    let backend = *unsafe { BACKENDS.get(BackendKey { id: svc.id, slot }) }?;
+    let backend = *unsafe { BACKENDS.get(&BackendKey { id: svc.id, slot }) }?;
     let pinned = Affinity {
         last_used_ns: now,
         backend,
         slot,
         _pad: 0,
     };
-    let _ = AFFINITY.insert(key, pinned, 0);
+    let _ = AFFINITY.insert(&key, &pinned, 0);
     Some(backend)
 }
 
@@ -179,7 +185,7 @@ fn remember(ctx: &SockAddrContext, orig: &ServiceKey, backend: &BackendVal) {
         port: orig.port,
         _pad: 0,
     };
-    let _ = REVNAT.insert(key, rev, 0);
+    let _ = REVNAT.insert(&key, &rev, 0);
 }
 
 /// Returns the backend for the caller to write in, or None to pass the call.
@@ -254,7 +260,7 @@ fn reverse(ctx: &SockAddrContext, addr: u32) -> Option<u32> {
         port: (sock_addr.user_port & 0xffff) as u16,
         _pad: 0,
     };
-    let rev = unsafe { REVNAT.get(key) }?;
+    let rev = unsafe { REVNAT.get(&key) }?;
     sock_addr.user_port = rev.port as u32;
     Some(rev.addr)
 }
@@ -372,8 +378,8 @@ fn reverse_key(p: &Pkt) -> CtKey {
 #[inline(always)]
 fn ct_remember(p: &Pkt) {
     let k = forward_key(p);
-    if unsafe { NP_CT.get(k) }.is_none() {
-        let _ = NP_CT.insert(k, 1, 0);
+    if unsafe { NP_CT.get(&k) }.is_none() {
+        let _ = NP_CT.insert(&k, &1, 0);
     }
 }
 
@@ -416,8 +422,8 @@ fn np_decide(ctx: &TcContext, to_pod: bool) -> i32 {
     let Some(p) = parse(ctx) else {
         return TC_ACT_OK;
     };
-    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    let Some(pod) = (unsafe { NP_PODS.get(ifindex) }) else {
+    let ifindex = unsafe { (*skb(&ctx)).ifindex };
+    let Some(pod) = (unsafe { NP_PODS.get(&ifindex) }) else {
         return TC_ACT_OK;
     };
     if p.proto == IPPROTO_ICMP || p.later_fragment {
@@ -429,9 +435,9 @@ fn np_decide(ctx: &TcContext, to_pod: bool) -> i32 {
         if p.saddr != pod.ip {
             return TC_ACT_SHOT;
         }
-        let dst_is_pod = unsafe { NP_POD_IPS.get(p.daddr) }.is_some();
+        let dst_is_pod = unsafe { NP_POD_IPS.get(&p.daddr) }.is_some();
         if pod.flags & FLAG_EGRESS_ISOLATED != 0 {
-            let reply = unsafe { NP_CT.get(reverse_key(&p)) }.is_some();
+            let reply = unsafe { NP_CT.get(&reverse_key(&p)) }.is_some();
             if !reply && !allowed(pod.ip, DIR_EGRESS, p.daddr, p.proto, p.dport) {
                 return TC_ACT_SHOT;
             }
@@ -446,16 +452,16 @@ fn np_decide(ctx: &TcContext, to_pod: bool) -> i32 {
     }
 
     // Node-originated packets (kubelet probes) always pass.
-    let from_node = unsafe { (*ctx.skb.skb).ingress_ifindex } == 0;
+    let from_node = unsafe { (*skb(&ctx)).ingress_ifindex } == 0;
     if !from_node && pod.flags & FLAG_INGRESS_ISOLATED != 0 {
-        let reply = unsafe { NP_CT.get(reverse_key(&p)) }.is_some();
+        let reply = unsafe { NP_CT.get(&reverse_key(&p)) }.is_some();
         if !reply && !allowed(pod.ip, DIR_INGRESS, p.saddr, p.proto, p.dport) {
             return TC_ACT_SHOT;
         }
     }
     // Noted after ingress policy: this pod's egress hook needs every admitted flow,
     // whatever the peer (DNAT keeps an off-node client's address).
-    let src_ingress_isolated = match unsafe { NP_POD_IPS.get(p.saddr) } {
+    let src_ingress_isolated = match unsafe { NP_POD_IPS.get(&p.saddr) } {
         Some(src_ifindex) => match unsafe { NP_PODS.get(src_ifindex) } {
             Some(sp) => sp.flags & FLAG_INGRESS_ISOLATED != 0,
             None => false,

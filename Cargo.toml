@@ -34,8 +34,8 @@ http-body-util = "0.1"
 bytes = "1"
 serde_json = "1"
 rtnetlink = "0.23"
-aya = { git = "https://github.com/aya-rs/aya", rev = "c0f9940" }
-aya-obj = { git = "https://github.com/aya-rs/aya", rev = "c0f9940" }
+aya = "0.16"
+aya-obj = "0.6"
 netlink-packet-route = "0.33"
 nix = { version = "0.31", features = ["sched", "fs"] }
 serde = { version = "1", features = ["derive"] }
@@ -46,7 +46,7 @@ anyhow = "1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 prost = "0.14"
 envoy-types = "0.7"
 http = "1"

@@ -631,7 +631,15 @@ fn sums_of(files: &BTreeMap<String, Source>) -> anyhow::Result<String> {
     let mut sums = String::new();
     for (name, src) in files {
         let mut hash = Sha256::new();
-        std::io::copy(&mut src.open()?, &mut hash)?;
+        let mut file = src.open()?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+        }
         sums.push_str(&format!("{}  {name}\n", hex::encode(hash.finalize())));
     }
     Ok(sums)
