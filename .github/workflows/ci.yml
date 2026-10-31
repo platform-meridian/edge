@@ -24,7 +24,16 @@ jobs:
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache: false
+      # The compile cache, its store kept between jobs by the Actions cache;
+      # the same settings as platform-meridian/sdk's rust action, which this
+      # public repository cannot use.
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 1.2.2
+          max-size: 4GiB
+          cache-key-prefix: kache-check
+          pr-comment: false
       - uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143 # v1.1.2
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
@@ -62,7 +71,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache: false
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 1.2.2
+          max-size: 4GiB
+          cache-key-prefix: kache-conformance
+          pr-comment: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: conformance/go.mod
@@ -90,8 +105,13 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           rust-src-dir: ${{ matrix.dir }}/fuzz
-          cache-workspaces: ${{ matrix.dir }}/fuzz
-          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache: false
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 1.2.2
+          max-size: 4GiB
+          cache-key-prefix: kache-fuzz-${{ matrix.dir }}
+          pr-comment: false
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: bpf-linker@0.11.1,cargo-fuzz
@@ -121,7 +141,13 @@ jobs:
       - run: sudo apt-get install -y musl-tools
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache: false
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 1.2.2
+          max-size: 4GiB
+          cache-key-prefix: kache-publish
+          pr-comment: false
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: bpf-linker@0.11.1,cargo-auditable
